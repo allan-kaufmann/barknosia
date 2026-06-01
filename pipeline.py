@@ -20,12 +20,18 @@ def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
     print(f"--- Schritt 1: Starte Marker-OCR für {input_pdf_path} ---")
     os.makedirs(output_dir, exist_ok=True)
     
+    # Wir holen uns das aktuelle Environment deiner aktiven .venv
     env = os.environ.copy()
-    command = f"marker_single \"{input_pdf_path}\" --output_dir \"{output_dir}\""
     
-    print("Führe OCR via System-Shell aus (das kann einen Moment dauern)...")
+    # Anstatt die nackte Standard-Shell zu nehmen, nutzen wir deine aktive Bash
+    # Das zwingt Linux, die Pfade deiner virtuellen Umgebung korrekt zu verwenden.
+    inner_command = f"marker_single \"{input_pdf_path}\" --output_dir \"{output_dir}\""
+    command = ["/bin/bash", "-i", "-c", inner_command]
+    
+    print("Führe OCR via Benutzer-Shell aus (das kann einen Moment dauern)...")
     try:
-        subprocess.run(command, check=True, shell=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Hier nutzen wir shell=False, da wir den Shell-Interpreter (/bin/bash) bereits direkt als executable aufrufen
+        subprocess.run(command, check=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print("Marker erfolgreich ausgeführt.\n")
         
         pdf_stem = Path(input_pdf_path).stem
@@ -73,7 +79,6 @@ def split_text_by_headings(text: str, max_chars: int = 15000) -> list:
     current_length = 0
     
     for line in text.split('\n'):
-        # Wenn eine neue Hauptüberschrift kommt und der aktuelle Chunk groß genug ist, splitten wir
         if (line.startswith('# ') or line.startswith('## ')) and current_length > max_chars:
             chunks.append('\n'.join(current_chunk))
             current_chunk = []
@@ -89,31 +94,31 @@ def split_text_by_headings(text: str, max_chars: int = 15000) -> list:
 
 
 def translate_text(text: str) -> str:
-    """Schritt 2b: Übersetzt den Text abschnittsweise nach den strengen Regeln aus 01_b_text_uebersetzen.txt[cite: 5]."""
+    """Schritt 2b: Übersetzt den Text abschnittsweise nach den strengen Regeln aus 01_b_text_uebersetzen.txt."""
     print("--- Schritt 2b: Übersetze englischen Text ins Deutsche (via Gemini 2.5 Pro) ---")
     
     system_prompt = (
         "Übersetze den folgenden englischen wissenschaftlichen Text originalgetreu ins Deutsche.\n\n"
         "Ziel:\n"
-        "Eine vollständige, sinntreue Übersetzung, keine Zusammenfassung[cite: 5].\n\n"
+        "Eine vollständige, sinntreue Übersetzung, keine Zusammenfassung.\n\n"
         "Strenge Regeln:\n"
-        "- Nichts auslassen[cite: 5].\n"
-        "- Nichts ergänzen[cite: 6].\n"
-        "- Nichts interpretieren[cite: 6].\n"
-        "- Keine Inhalte glätten, kürzen oder zusammenfassen[cite: 6].\n"
-        "- Fachbegriffe konsistent übersetzen[cite: 6].\n"
-        "- Überschriften, Absatzstruktur, Listen und Tabellenstruktur beibehalten[cite: 7].\n"
-        "- Zitate, Autorennamen, Jahreszahlen, Variablennamen, Skalen, Hypothesen und statistische Angaben exakt erhalten[cite: 7].\n"
-        "- Unklare oder beschädigte Stellen mit [UNKLAR: Originalstelle] markieren, nicht erraten[cite: 8].\n"
-        "- Bildverweise, Tabellenverweise und Abbildungsbeschriftungen erhalten[cite: 8].\n"
-        "- Markdown-Struktur beibehalten[cite: 8].\n\n"
+        "- Nichts auslassen.\n"
+        "- Nichts ergänzen.\n"
+        "- Nichts interpretieren.\n"
+        "- Keine Inhalte glätten, kürzen oder zusammenfassen.\n"
+        "- Fachbegriffe konsistent übersetzen.\n"
+        "- Überschriften, Absatzstruktur, Listen und Tabellenstruktur beibehalten.\n"
+        "- Zitate, Autorennamen, Jahreszahlen, Variablennamen, Skalen, Hypothesen und statistische Angaben exakt erhalten.\n"
+        "- Unklare oder beschädigte Stellen mit [UNKLAR: Originalstelle] markieren, nicht erraten.\n"
+        "- Bildverweise, Tabellenverweise und Abbildungsbeschriftungen erhalten.\n"
+        "- Markdown-Struktur beibehalten.\n\n"
         "Ausgabeformat:\n"
-        "1. Nur die deutsche Übersetzung[cite: 9].\n"
-        "2. Danach eine kurze Kontrollliste[cite: 9]:\n"
-        "   - Anzahl erkannter Absätze im Original [cite: 9]\n"
-        "   - Anzahl übersetzter Absätze [cite: 9]\n"
-        "   - Hinweise auf unklare Stellen [cite: 9]\n"
-        "   - Hinweise auf mögliche fehlende Tabellen/Bildinhalte [cite: 9]"
+        "1. Nur die deutsche Übersetzung.\n"
+        "2. Danach eine kurze Kontrollliste:\n"
+        "   - Anzahl erkannter Absätze im Original\n"
+        "   - Anzahl übersetzter Absätze\n"
+        "   - Hinweise auf unklare Stellen\n"
+        "   - Hinweise auf mögliche fehlende Tabellen/Bildinhalte"
     )
     
     chunks = split_text_by_headings(text)
@@ -137,25 +142,25 @@ def translate_text(text: str) -> str:
 
 
 def generate_summary(text: str) -> str:
-    """Schritt 4: Erstellt eine lernorientierte Zusammenfassung nach 02_prompts-zusammenfassung.txt[cite: 12]."""
+    """Schritt 4: Erstellt eine lernorientierte Zusammenfassung nach 02_prompts-zusammenfassung.txt."""
     print("--- Schritt 4: Erstelle lernorientierte Zusammenfassung (via Gemini 2.5 Pro) ---")
     
     prompt = (
-        "Erstelle eine lernorientierte Zusammenfassung zum nachfolgenden Text, der nach 'Inhalt:' kommt[cite: 12].\n\n"
+        "Erstelle eine lernorientierte Zusammenfassung zum nachfolgenden Text, der nach 'Inhalt:' kommt.\n\n"
         "Anforderungen:\n"
-        "Alle zentralen Konzepte enthalten [cite: 13]\n"
-        "Keine Beispiele entfernen, wenn sie zum Verständnis nötig sind [cite: 13]\n"
-        "Definitionen vollständig übernehmen [cite: 13]\n"
-        "Studienergebnisse erhalten [cite: 13]\n"
-        "Keine neuen Informationen ergänzen [cite: 13]\n"
-        "Struktur des Originals beibehalten (wichtig! Auch alle Unterkapitel, es darf keines fehlen! Die Gliederungsstruktur muss 100% erhalten bleiben) [cite: 13]\n"
-        "Möglichst kurz und stichpunktartig[cite: 13]. Maximal 40 % der ursprünglichen Länge (wichtig!) [cite: 14]\n"
-        "Es darf aber nicht zu kurz sein, es muss alles vorhanden sein was in Prüfungsfragen dramkommen könnte (sehr wichtig!) [cite: 14]\n"
-        "Berücksichtige Abbildungen im Text und erläutere diese kurz[cite: 14].\n\n"
+        "Alle zentralen Konzepte enthalten\n"
+        "Keine Beispiele entfernen, wenn sie zum Verständnis nötig sind\n"
+        "Definitionen vollständig übernehmen\n"
+        "Studienergebnisse erhalten\n"
+        "Keine neuen Informationen ergänzen\n"
+        "Struktur des Originals beibehalten (wichtig! Auch alle Unterkapitel, es darf keines fehlen! Die Gliederungsstruktur muss 100% erhalten bleiben)\n"
+        "Möglichst kurz und stichpunktartig. Maximal 40 % der ursprünglichen Länge (wichtig!)\n"
+        "Es darf aber nicht zu kurz sein, es muss alles vorhanden sein was in Prüfungsfragen dramkommen könnte (sehr wichtig!)\n"
+        "Berücksichtige Abbildungen im Text und erläutere diese kurz.\n\n"
         "Prüfe:\n"
-        "Welche Informationen aus dem Original in der Zusammenfassung fehlen [cite: 15]\n"
-        "Welche Definitionen verloren gingen [cite: 15]\n"
-        "Welche Einschränkungen oder Bedingungen fehlen [cite: 15]\n\n"
+        "Welche Informationen aus dem Original in der Zusammenfassung fehlen\n"
+        "Welche Definitionen verloren gingen\n"
+        "Welche Einschränkungen oder Bedingungen fehlen\n\n"
         f"Inhalt:\n{text}"
     )
     try:
@@ -171,41 +176,41 @@ def generate_summary(text: str) -> str:
 
 
 def verify_with_questions(summary_text: str, questions_path: str) -> str:
-    """Schritt 5: Qualitätssicherung der Zusammenfassung anhand der Fragen aus 03_prompt_Fragen.txt[cite: 19, 20]."""
+    """Schritt 5: Qualitätssicherung der Zusammenfassung anhand der Fragen aus 03_prompt_Fragen.txt."""
     print(f"--- Schritt 5: Qualitätssicherung via Leitfragen aus {questions_path} ---")
     
     with open(questions_path, "r", encoding="utf-8") as f:
         questions = f.read()
         
     prompt = (
-        "Rolle:\nDu bist Lerncoach und Prüfer für Wirtschaftspsychologie[cite: 21].\n\n"
-        "Aufgabe:\nBeantworte die leseleitenden Fragen ultrakompakt und mit exakt einem Unterkapitelverweis[cite: 21]. "
-        "Nutze ausschließlich den hochgeladenen Text als Wissensbasis[cite: 22].\n\n"
+        "Rolle:\nDu bist Lerncoach und Prüfer für Wirtschaftspsychologie.\n\n"
+        "Aufgabe:\nBeantworte die leseleitenden Fragen ultrakompakt und mit exakt einem Unterkapitelverweis. "
+        "Nutze ausschließlich den hochgeladenen Text als Wissensbasis.\n\n"
         "Bevor du antwortest:\n"
-        "Schritt 1: Suche die relevanten Stellen im Dokument[cite: 22].\n"
-        "Schritt 2: Liste die Textstellen stichpunktartig auf[cite: 23].\n"
-        "Schritt 3: Erst danach beantworte die Frage[cite: 23].\n\n"
-        "Wenn keine passende Stelle existiert:\n'Im Dokument nicht enthalten'[cite: 23]. Nicht raten[cite: 24].\n\n"
+        "Schritt 1: Suche die relevanten Stellen im Dokument.\n"
+        "Schritt 2: Liste die Textstellen stichpunktartig auf.\n"
+        "Schritt 3: Erst danach beantworte die Frage.\n\n"
+        "Wenn keine passende Stelle existiert:\n'Im Dokument nicht enthalten'. Nicht raten.\n\n"
         "Antwortregeln:\n"
-        "- Maximal 3 Sätze pro Frage[cite: 24].\n"
-        "- Keine Einleitung[cite: 24].\n"
-        "- Keine Wiederholung der Frage[cite: 24].\n"
-        "- Keine ausführlichen Erklärungen[cite: 24].\n"
-        "- Nur prüfungsrelevante Kernaussage[cite: 25].\n"
-        "- Wenn Zahlen/Studienwerte relevant sind: nennen[cite: 25].\n"
-        "- Wenn die Antwort im Dokument nicht eindeutig steht: „Im Dokument nicht eindeutig beantwortbar.“ [cite: 26]\n\n"
+        "- Maximal 3 Sätze pro Frage.\n"
+        "- Keine Einleitung.\n"
+        "- Keine Wiederholung der Frage.\n"
+        "- Keine ausführlichen Erklärungen.\n"
+        "- Nur prüfungsrelevante Kernaussage.\n"
+        "- Wenn Zahlen/Studienwerte relevant sind: nennen.\n"
+        "- Wenn die Antwort im Dokument nicht eindeutig steht: „Im Dokument nicht eindeutig beantwortbar.“\n\n"
         "Quellenregeln:\n"
-        "- Verweise immer auf die genaueste vorhandene Überschrift[cite: 27].\n"
-        "- Nicht nur „Kapitel 6.4“, sondern z. B. „6.4.1.2 Eine umfassende Übersicht“[cite: 27].\n"
-        "- Wenn mehrere Unterkapitel nötig sind, maximal 3 nennen[cite: 28].\n"
-        "- Zusätzlich 1–3 Schlüsselbegriffe aus der Textstelle nennen[cite: 28].\n"
-        "- Keine groben Kapitelverweise, wenn Unterkapitel vorhanden sind[cite: 29].\n\n"
+        "- Verweise immer auf die genaueste vorhandene Überschrift.\n"
+        "- Nicht nur „Kapitel 6.4“, sondern z. B. „6.4.1.2 Eine umfassende Übersicht“.\n"
+        "- Wenn mehrere Unterkapitel nötig sind, maximal 3 nennen.\n"
+        "- Zusätzlich 1–3 Schlüsselbegriffe aus der Textstelle nennen.\n"
+        "- Keine groben Kapitelverweise, wenn Unterkapitel vorhanden sind.\n\n"
         "Ausgabeformat pro Frage:\n"
         "Frage X\n"
-        "Antwort: [max. 3 Sätze] [cite: 29, 30]\n"
-        "Textgrundlage: [genaues Unterkapitel] [cite: 30]\n"
-        "Schlüsselbegriffe: [1–3 Begriffe] [cite: 30]\n"
-        "Abdeckung: vollständig / teilweise / nicht enthalten [cite: 30]\n\n"
+        "Antwort: [max. 3 Sätze]\n"
+        "Textgrundlage: [genaues Unterkapitel]\n"
+        "Schlüsselbegriffe: [1–3 Begriffe]\n"
+        "Abdeckung: vollständig / teilweise / nicht enthalten\n\n"
         f"Wissensbasis (Zusammenfassung):\n{summary_text}\n\n"
         f"Fragen:\n{questions}"
     )
@@ -290,7 +295,7 @@ if __name__ == "__main__":
         if not os.path.exists(args.pdf_path):
             raise FileNotFoundError(f"Die Datei {args.pdf_path} wurde nicht gefunden.")
             
-        # 1. OCR mit Marker über Shell-Ebenen-Passthrough
+        # 1. OCR mit Marker über dedizierten interaktiven Bash-Passthrough
         md_file_path = run_marker_ocr(args.pdf_path, OUTPUT_BASE)
         
         with open(md_file_path, "r", encoding="utf-8") as f:
