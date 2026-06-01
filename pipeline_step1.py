@@ -4,89 +4,111 @@ from pathlib import Path
 from pypdf import PdfReader, PdfWriter
 
 
-def extract_pdf_pages(input_pdf_path: str, output_pdf_path: str, start_page: int, end_page: int):
+def extract_pdf_pages(input_pdf_path: str, output_pdf_path: str, start_page: int = None, end_page: int = None):
     """
-    Schritt 1a: Schneidet einen bestimmten Seitenbereich aus einem PDF heraus.
-    Nutzt 1-basierte Seitenzahlen (wie man sie im PDF-Reader sieht).
+    Schritt 1a: Schneidet optional einen Seitenbereich aus.
+    Wenn start_page oder end_page None sind, wird das komplette PDF genutzt.
     """
+    # Wenn keine Seiten angegeben sind, überspringen wir das Schneiden
+    if start_page is None and end_page is None:
+        print("--- Schritt 1a: Gesamtes PDF wird verwendet (keine Seitenbegrenzung) ---")
+        return input_pdf_path
+
     print(f"--- Schritt 1a: Extrahiere Seiten {start_page} bis {end_page} ---")
-    
     reader = PdfReader(input_pdf_path)
     writer = PdfWriter()
-    
-    # Gesamtseiten prüfen
     total_pages = len(reader.pages)
-    if start_page < 1 or end_page > total_pages or start_page > end_page:
+    
+    # Standardwerte setzen, falls nur eins von beiden angegeben wurde
+    s_page = start_page if start_page is not None else 1
+    e_page = end_page if end_page is not None else total_pages
+    
+    if s_page < 1 or e_page > total_pages or s_page > e_page:
         raise ValueError(f"Ungültiger Seitenbereich. Das PDF hat {total_pages} Seiten.")
     
-    # pypdf nutzt 0-basierte Indizes, daher (start_page - 1)
-    for page_num in range(start_page - 1, end_page):
+    for page_num in range(s_page - 1, e_page):
         writer.add_page(reader.pages[page_num])
         
     with open(output_pdf_path, "wb") as output_file:
         writer.write(output_file)
         
-    print(f"Erfolgreich extrahiert: {output_pdf_path}\n")
+    print(f"Teil-PDF erfolgreich extrahiert: {output_pdf_path}\n")
+    return output_pdf_path
 
 
-def run_marker_ocr(input_pdf_path: str, output_dir: str):
+def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
     """
-    Schritt 1b: Ruft das installierte 'marker'-Tool über die Konsole auf,
-    um das extrahierte PDF in sauberes Markdown umzuwandeln.
+    Schritt 1b: Ruft das 'marker'-Tool über die Konsole auf.
+    Gibt den Pfad zur generierten .md-Datei zurück.
     """
-    print(f"--- Schritt 1b: Starte Marker-OCR für {input_pdf_path} ---")
-    
-    # Sicherstellen, dass der Output-Ordner existiert
+    print(f"--- Schritt 1b: Starte Marker-OCR für {input_pdf_path} ---") [cite: 2]
     os.makedirs(output_dir, exist_ok=True)
     
-    # Befehlsaufruf für marker (analog zu deinem Befehl: marker_single)
-    # Wir nutzen subprocess, um den CLI-Befehl direkt auszuführen
+    # marker_single Befehl aufbauen
     command = [
         "marker_single",
         str(input_pdf_path),
         "--output_dir", str(output_dir)
-    ]
+    ] [cite: 2]
     
     try:
-        # Ausführen des Befehls und Live-Ausgabe im Terminal anzeigen
-        result = subprocess.run(command, check=True, text=True)
-        print(f"\nMarker erfolgreich ausgeführt. Output in: {output_dir}\n")
+        subprocess.run(command, check=True, text=True)
+        print(f"Marker erfolgreich ausgeführt.\n") [cite: 2]
+        
+        # Marker erstellt einen Unterordner mit dem Namen der PDF-Datei
+        # Wir suchen nach der erzeugten .md Datei in diesem Output-Verzeichnis
+        pdf_stem = Path(input_pdf_path).stem
+        expected_md_path = Path(output_dir) / pdf_stem / f"{pdf_stem}.md"
+        
+        if expected_md_path.exists():
+            return str(expected_md_path)
+        else:
+            # Fallback: Falls marker den Ordner anders benannt hat, suchen wir die .md Datei
+            found_md_files = list(Path(output_dir).glob("**/*.md"))
+            if found_md_files:
+                return str(found_md_files[0])
+            raise FileNotFoundError("Marker hat den Prozess beendet, aber es wurde keine .md Datei gefunden.")
+            
     except subprocess.CalledProcessError as e:
         print(f"\nFehler beim Ausführen von Marker: {e}")
         raise
     except FileNotFoundError:
-        print("\nFehler: Der Befehl 'marker_single' wurde nicht gefunden.")
-        print("Stelle sicher, dass marker in deiner virtuellen Umgebung (venv) aktiviert und installiert ist.")
+        print("\nFehler: Befehl 'marker_single' nicht gefunden. Ist deine venv aktiv?")
         raise
 
 
 if __name__ == "__main__":
-    # --- KONFIGURATION FÜR DEN ERSTEN TESTUNGLAUF ---
-    
-    # 1. Pfade definieren (Passe diese an deine Dateien an)
-    QUELL_PDF = "meineQuelle.pdf" 
-    GEKÜRZTES_PDF = "temp_extrahiert.pdf"
+    # --- KONFIGURATION ---
+    QUELL_PDF = "meineQuelle.pdf"  # Deine Testdatei hier eintragen
+    TEMPORÄRES_PDF = "temp_verarbeitung.pdf"
     MARKER_OUTPUT_ORDNER = "workspace/output"
     
-    # 2. Welche Kapitel/Seiten möchtest du bearbeiten? (1-basiert)
-    START_SEITE = 5
-    END_SEITE = 12
+    # SEITEN-BEGRENZUNG (Lass beide auf None für das komplette PDF!)
+    START_SEITE = None
+    END_SEITE = None
     
     try:
-        # Falls das Quell-PDF existiert, starten wir die Pipeline
         if os.path.exists(QUELL_PDF):
+            # 1. PDF-Vorbereitung (entweder komplett oder geschnitten)
+            pdf_zu_verarbeiten = extract_pdf_pages(QUELL_PDF, TEMPORÄRES_PDF, START_SEITE, END_SEITE) [cite: 1]
             
-            # A) PDF zuschneiden
-            extract_pdf_pages(QUELL_PDF, GEKÜRZTES_PDF, START_SEITE, END_SEITE)
+            # 2. Marker OCR laufen lassen
+            markdown_datei_pfad = run_marker_ocr(pdf_zu_verarbeiten, MARKER_OUTPUT_ORDNER) [cite: 2]
             
-            # B) Text mit Marker extrahieren
-            run_marker_ocr(GEKÜRZTES_PDF, MARKER_OUTPUT_ORDNER)
-            
+            # 3. Kontroll-Check: Haben wir den Text erfolgreich im Skript?
+            with open(markdown_datei_pfad, "r", encoding="utf-8") as f:
+                extrahierter_text = f.read()
+                
             print("=== Schritt 1 erfolgreich abgeschlossen! ===")
-            print(f"Deine Markdown-Datei liegt jetzt im Ordner: {MARKER_OUTPUT_ORDNER}")
+            print(f"Datei generiert: {markdown_datei_pfad}")
+            print(f"Gelesene Zeichenlänge für die nächsten Schritte: {len(extrahierter_text)} Zeichen.")
             
+            # Aufräumen: Wenn wir das komplette PDF genutzt haben, brauchen wir die temp-Datei nicht
+            if START_SEITE is None and END_SEITE is None and os.path.exists(TEMPORÄRES_PDF):
+                os.remove(TEMPORÄRES_PDF)
+                
         else:
-            print(f"Bitte lege eine Testdatei namens '{QUELL_PDF}' in diesen Ordner oder passe den Pfad im Skript an.")
+            print(f"Bitte lege eine Testdatei namens '{QUELL_PDF}' bereit.")
             
     except Exception as e:
         print(f"Pipeline abgebrochen wegen: {e}")
