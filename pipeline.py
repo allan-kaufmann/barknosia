@@ -1,8 +1,6 @@
 import os
 import argparse
-import subprocess
 from pathlib import Path
-from pypdf import PdfReader, PdfWriter
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -14,70 +12,6 @@ load_dotenv()
 
 # Gemini API-Client initialisieren
 client = genai.Client()
-
-def extract_pdf_pages(input_pdf_path: str, output_pdf_path: str, start_page: int = None, end_page: int = None):
-    """Schritt 1a: Schneidet optional einen Seitenbereich aus."""
-    if start_page is None and end_page is None:
-        print("--- Schritt 1a: Gesamtes PDF wird verwendet (keine Seitenbegrenzung) ---")
-        return input_pdf_path
-
-    print(f"--- Schritt 1a: Extrahiere Seiten {start_page} bis {end_page} ---")
-    reader = PdfReader(input_pdf_path)
-    writer = PdfWriter()
-    total_pages = len(reader.pages)
-    
-    s_page = start_page if start_page is not None else 1
-    e_page = end_page if end_page is not None else total_pages
-    
-    if s_page < 1 or e_page > total_pages or s_page > e_page:
-        raise ValueError(f"Ungültiger Seitenbereich. Das PDF hat {total_pages} Seiten.")
-    
-    for page_num in range(s_page - 1, e_page):
-        writer.add_page(reader.pages[page_num])
-        
-    with open(output_pdf_path, "wb") as output_file:
-        writer.write(output_file)
-    return output_pdf_path
-
-
-def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
-    """Schritt 1b: Ruft das 'marker'-Tool direkt aus der virtuellen Umgebung auf."""
-    print(f"--- Schritt 1b: Starte Marker-OCR für {input_pdf_path} ---")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Pfad zur ausführbaren Datei in deiner virtuellen Umgebung unter WSL/Linux
-    local_marker = "./.venv/bin/marker_single"
-    
-    if os.path.exists(local_marker):
-        marker_path = local_marker
-        print(f"Nutze venv-lokalen Marker: {marker_path}")
-        use_shell = False
-    else:
-        marker_path = "marker_single"
-        print("Warnung: Lokaler venv-Marker nicht gefunden. Weiche auf globalen Aufruf aus.")
-        use_shell = True
-
-    command = [marker_path, str(input_pdf_path), "--output_dir", str(output_dir)]
-    
-    try:
-        # Führt marker aus; shell=False sorgt bei direkten Pfaden für stabile Rechte unter WSL
-        subprocess.run(command, check=True, text=True, stdout=subprocess.DEVNULL, shell=use_shell)
-        print(f"Marker erfolgreich ausgeführt.\n")
-        
-        pdf_stem = Path(input_pdf_path).stem
-        expected_md_path = Path(output_dir) / pdf_stem / f"{pdf_stem}.md"
-        
-        if expected_md_path.exists():
-            return str(expected_md_path)
-        else:
-            found_md_files = list(Path(output_dir).glob("**/*.md"))
-            if found_md_files:
-                return str(found_md_files[0])
-            raise FileNotFoundError("Keine .md Datei von Marker gefunden.")
-    except Exception as e:
-        print(f"Fehler bei Marker OCR: {e}")
-        raise
-
 
 def check_if_english(text: str) -> bool:
     """Prüft per schnellem KI-Aufruf via gemini-2.5-flash, ob der Text englisch ist."""
@@ -150,10 +84,7 @@ def translate_text(text: str) -> str:
 
 
 def create_word_document(markdown_text: str, output_docx_path: str, hide_original: bool = True):
-    """
-    Schritt 3: Konvertiert den strukturierten Markdown-Text in ein Word-Dokument.
-    Falls hide_original=True, wird der Quelltext in einem sehr hellen Grau formatiert.
-    """
+    """Schritt 3: Konvertiert den strukturierten Markdown-Text in ein Word-Dokument."""
     print(f"--- Schritt 3: Generiere strukturiertes Word-Dokument -> {output_docx_path} ---")
     
     doc = Document()
@@ -191,56 +122,49 @@ def create_word_document(markdown_text: str, output_docx_path: str, hide_origina
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="KI-gestützte PDF-Übersetzungs- und Zusammenfassungs-Pipeline")
-    parser.add_argument("pdf_path", type=str, help="Pfad zur Quell-PDF-Datei")
-    parser.add_argument("--start", type=int, default=None, help="Startseite (optional)")
-    parser.add_argument("--end", type=int, default=None, help="Endseite (optional)")
+    parser = argparse.ArgumentParser(description="KI-gestützte Übersetzungs- und Zusammenfassungs-Pipeline ab Markdown")
+    
+    # Jetzt wird direkt die von Marker erzeugte .md Datei übergeben
+    parser.add_argument("md_path", type=str, help="Pfad zur Quell-Markdown-Datei (.md)")
     
     args = parser.parse_args()
-    
-    TEMPORÄRES_PDF = "temp_verarbeitung.pdf"
-    MARKER_OUTPUT_ORDNER = "workspace/output"
     
     try:
         if not os.getenv("GEMINI_API_KEY"):
             raise ValueError("Kein GEMINI_API_KEY in der .env-Datei gefunden!")
 
-        if os.path.exists(args.pdf_path):
-            # 1. PDF-Vorbereitung und Marker OCR
-            pdf_zu_verarbeiten = extract_pdf_pages(args.pdf_path, TEMPORÄRES_PDF, args.start, args.end)
-            markdown_datei_pfad = run_marker_ocr(pdf_zu_verarbeiten, MARKER_OUTPUT_ORDNER)
-            
-            with open(markdown_datei_pfad, "r", encoding="utf-8") as f:
+        if os.path.exists(args.md_path):
+            # 1. Existierende Markdown-Datei einlesen
+            print(f"--- Schritt 1: Lese extrahierte Markdown-Datei {args.md_path} ---")
+            with open(args.md_path, "r", encoding="utf-8") as f:
                 aktueller_text = f.read()
             
-            # Temp-Datei aufräumen
-            if args.start is None and args.end is None and os.path.exists(TEMPORÄRES_PDF):
-                os.remove(TEMPORÄRES_PDF)
-
-            # 2. Sprache prüfen & ggfls. übersetzen
+            # 2. Sprache prüfen & ggfls. übersetzen 
             is_english = check_if_english(aktueller_text)
             
             if is_english:
-                print("Text ist Englisch. Starte Übersetzung...")
-                aktueller_text = translate_text(aktueller_text)
+                print("Text ist Englisch. Starte Übersetzung...") [cite: 5]
+                aktueller_text = translate_text(aktueller_text) [cite: 5]
                 
-                output_md_pfad = Path(markdown_datei_pfad).parent / "de_uebersetzung.md"
+                # Speichere die rohe Übersetzung als Backup ab
+                output_md_pfad = Path(args.md_path).parent / "de_uebersetzung.md"
                 with open(output_md_pfad, "w", encoding="utf-8") as f:
                     f.write(aktueller_text)
+                print(f"Übersetztes Markdown gesichert unter: {output_md_pfad}")
             else:
                 print("Text ist bereits Deutsch. Keine Übersetzung notwendig.")
             
-            # 3. Word-Dokument erstellen
-            pdf_stem = Path(args.pdf_path).stem
-            output_docx = Path(MARKER_OUTPUT_ORDNER) / pdf_stem / f"{pdf_stem}_studienbasis.docx"
+            # 3. Word-Dokument erstellen 
+            md_path_obj = Path(args.md_path)
+            output_docx = md_path_obj.parent / f"{md_path_obj.stem}_studienbasis.docx"
             
-            create_word_document(aktueller_text, str(output_docx), hide_original=True)
+            create_word_document(aktueller_text, str(output_docx), hide_original=True) [cite: 7]
             
             print(f"=== Pipeline-Etappe erfolgreich! ===")
-            print(f"Word-Basis liegt in: {output_docx}")
+            print(f"Word-Basis liegt bereit in: {output_docx}")
                 
         else:
-            print(f"Fehler: Die Datei '{args.pdf_path}' wurde nicht gefunden.")
+            print(f"Fehler: Die Datei '{args.md_path}' wurde nicht gefunden.")
             
     except Exception as e:
         print(f"Pipeline abgebrochen wegen: {e}")
