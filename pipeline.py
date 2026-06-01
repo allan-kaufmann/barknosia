@@ -39,14 +39,26 @@ def extract_pdf_pages(input_pdf_path: str, output_pdf_path: str, start_page: int
 
 
 def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
-    """Schritt 1b: Ruft das 'marker'-Tool über die Konsole auf."""
+    """Schritt 1b: Ruft das 'marker'-Tool über den absoluten Systempfad auf."""
     print(f"--- Schritt 1b: Starte Marker-OCR für {input_pdf_path} ---")
     os.makedirs(output_dir, exist_ok=True)
     
-    command = ["marker_single", str(input_pdf_path), "--output_dir", str(output_dir)]
+    # Ermittle den absoluten Pfad von marker_single im System
+    try:
+        marker_path = subprocess.check_output(["which", "marker_single"], text=True).strip()
+        print(f"Marker-Pfad gefunden: {marker_path}")
+    except subprocess.CalledProcessError:
+        marker_path = "marker_single"
+        print("Warnung: Konnte absoluten Pfad für 'marker_single' nicht ermitteln. Nutze Standard-Aufruf.")
+
+    # Befehl aufbauen
+    command = [marker_path, str(input_pdf_path), "--output_dir", str(output_dir)]
     
     try:
-        subprocess.run(command, check=True, text=True, stdout=subprocess.DEVNULL)
+        # shell=True und String-Aufruf für korrekte Rechte- und Pfadauflösung unter WSL/Linux
+        cmd_string = " ".join(command)
+        subprocess.run(cmd_string, check=True, text=True, stdout=subprocess.DEVNULL, shell=True)
+        print(f"Marker erfolgreich ausgeführt.\n")
         
         pdf_stem = Path(input_pdf_path).stem
         expected_md_path = Path(output_dir) / pdf_stem / f"{pdf_stem}.md"
@@ -134,13 +146,8 @@ def translate_text(text: str) -> str:
 
 
 if __name__ == "__main__":
-    # Argument Parser für Terminal-Parameter einrichten
     parser = argparse.ArgumentParser(description="KI-gestützte PDF-Übersetzungs- und Zusammenfassungs-Pipeline")
-    
-    # Pflicht-Argument: Der Pfad zur PDF-Datei
     parser.add_argument("pdf_path", type=str, help="Pfad zur Quell-PDF-Datei")
-    
-    # Optionale Argumente für Seitenbereiche
     parser.add_argument("--start", type=int, default=None, help="Startseite (optional)")
     parser.add_argument("--end", type=int, default=None, help="Endseite (optional)")
     
@@ -172,7 +179,6 @@ if __name__ == "__main__":
                 print("Text ist Englisch. Starte Übersetzung...")
                 uebersetzter_text = translate_text(original_text)
                 
-                # Speichere die Übersetzung im selben Ordner wie die originale .md
                 output_md_pfad = Path(markdown_datei_pfad).parent / "de_uebersetzung.md"
                 with open(output_md_pfad, "w", encoding="utf-8") as f:
                     f.write(uebersetzter_text)
