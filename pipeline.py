@@ -3,11 +3,12 @@ import argparse
 import subprocess
 import sys
 import time
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from google.genai.errors import APIError  # Für das Abfangen von Serverfehlern
+from google.genai.errors import APIError
 from docx import Document
 from docx.shared import Pt, RGBColor
 
@@ -28,11 +29,10 @@ def call_gemini_with_retry(model_name: str, contents, config, max_retries: int =
             )
             return response
         except APIError as e:
-            # Wenn der Server überlastet (503) oder blockiert (429) ist, warten wir
             if e.code in [503, 429] and attempt < max_retries:
                 print(f"      [Server ausgelastet] Fehler {e.code}. Warte {delay} Sekunden (Versuch {attempt}/{max_retries})...")
                 time.sleep(delay)
-                delay *= 2  # Exponentielles Backoff: Wartezeit verdoppeln
+                delay *= 2
             else:
                 raise e
     raise APIError("Maximale Anzahl an Wiederholungsversuchen erreicht.")
@@ -55,7 +55,7 @@ def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
     
     print("Führe OCR via Benutzer-Shell aus (das kann einen Moment dauern)...")
     try:
-        subprocess.run(command, check=True, env=env, stdout=subprocess.DEVNULL, stderr=sys.stderr)
+        subprocess.run(command, check=True, shell=True, env=env, stdout=subprocess.DEVNULL, stderr=sys.stderr)
         print("Marker erfolgreich ausgeführt.\n")
         
     except subprocess.CalledProcessError:
@@ -128,31 +128,31 @@ def split_text_by_headings(text: str, max_chars: int = 15000) -> list:
 
 
 def translate_text(text: str) -> str:
-    """Schritt 2b: Übersetzt den Text abschnittsweise nach den strengen Regeln aus 01_b_text_uebersetzen.txt[cite: 5]."""
+    """Schritt 2b: Übersetzt den Text abschnittsweise nach den strengen Regeln aus 01_b_text_uebersetzen.txt."""
     print("--- Schritt 2b: Übersetze englischen Text ins Deutsche (via Gemini 2.5 Pro) ---")
     
     system_prompt = (
         "Übersetze den folgenden englischen wissenschaftlichen Text originalgetreu ins Deutsche.\n\n"
         "Ziel:\n"
-        "Eine vollständige, sinntreue Übersetzung, keine Zusammenfassung[cite: 5].\n\n"
+        "Eine vollständige, sinntreue Übersetzung, keine Zusammenfassung.\n\n"
         "Strenge Regeln:\n"
-        "- Nichts auslassen[cite: 5].\n"
-        "- Nichts ergänzen[cite: 6].\n"
-        "- Nichts interpretieren[cite: 6].\n"
-        "- Keine Inhalte glätten, kürzen oder zusammenfassen[cite: 6].\n"
-        "- Fachbegriffe konsistent übersetzen[cite: 6].\n"
-        "- Überschriften, Absatzstruktur, Listen und Tabellenstruktur beibehalten[cite: 7].\n"
-        "- Zitate, Autorennamen, Jahreszahlen, Variablennamen, Skalen, Hypothesen und statistische Angaben exakt erhalten[cite: 7].\n"
-        "- Unklare oder beschädigte Stellen mit [UNKLAR: Originalstelle] markieren, nicht erraten[cite: 8].\n"
-        "- Bildverweise, Tabellenverweise und Abbildungsbeschriftungen erhalten[cite: 8].\n"
-        "- Markdown-Struktur beibehalten[cite: 8].\n\n"
+        "- Nichts auslassen.\n"
+        "- Nichts ergänzen.\n"
+        "- Nichts interpretieren.\n"
+        "- Keine Inhalte glätten, kürzen oder zusammenfassen.\n"
+        "- Fachbegriffe konsistent übersetzen.\n"
+        "- Überschriften, Absatzstruktur, Listen und Tabellenstruktur beibehalten.\n"
+        "- Zitate, Autorennamen, Jahreszahlen, Variablennamen, Skalen, Hypothesen und statistische Angaben exakt erhalten.\n"
+        "- Unklare oder beschädigte Stellen mit [UNKLAR: Originalstelle] markieren, nicht erraten.\n"
+        "- Bildverweise, Tabellenverweise und Abbildungsbeschriftungen erhalten.\n"
+        "- Markdown-Struktur beibehalten.\n\n"
         "Ausgabeformat:\n"
-        "1. Nur die deutsche Übersetzung[cite: 9].\n"
-        "2. Danach eine kurze Kontrollliste[cite: 9]:\n"
-        "   - Anzahl erkannter Absätze im Original [cite: 9]\n"
-        "   - Anzahl übersetzter Absätze [cite: 9]\n"
-        "   - Hinweise auf unklare Stellen [cite: 9]\n"
-        "   - Hinweise auf mögliche fehlende Tabellen/Bildinhalte [cite: 9]"
+        "1. Nur die deutsche Übersetzung.\n"
+        "2. Danach eine kurze Kontrollliste:\n"
+        "   - Anzahl erkannter Absätze im Original\n"
+        "   - Anzahl übersetzter Absätze\n"
+        "   - Hinweise auf unklare Stellen\n"
+        "   - Hinweise auf mögliche fehlende Tabellen/Bildinhalte"
     )
     
     chunks = split_text_by_headings(text)
@@ -167,7 +167,6 @@ def translate_text(text: str) -> str:
                 config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=0.1)
             )
             translated_chunks.append(response.text)
-            # Kurze Pause zwischen den Abschnitten, um die API-Rate-Limits zu schonen
             time.sleep(2)
         except Exception as e:
             print(f"Fehler bei der Übersetzung von Abschnitt {i}: {e}")
@@ -177,25 +176,25 @@ def translate_text(text: str) -> str:
 
 
 def generate_summary(text: str) -> str:
-    """Schritt 4: Erstellt eine lernorientierte Zusammenfassung nach 02_prompts-zusammenfassung.txt[cite: 12]."""
+    """Schritt 4: Erstellt eine lernorientierte Zusammenfassung nach 02_prompts-zusammenfassung.txt."""
     print("--- Schritt 4: Erstelle lernorientierte Zusammenfassung (via Gemini 2.5 Pro) ---")
     
     prompt = (
-        "Erstelle eine lernorientierte Zusammenfassung zum nachfolgenden Text, der nach 'Inhalt:' kommt[cite: 12].\n\n"
+        "Erstelle eine lernorientierte Zusammenfassung zum nachfolgenden Text, der nach 'Inhalt:' kommt.\n\n"
         "Anforderungen:\n"
-        "Alle zentralen Konzepte enthalten [cite: 13]\n"
-        "Keine Beispiele entfernen, wenn sie zum Verständnis nötig sind [cite: 13]\n"
-        "Definitionen vollständig übernehmen [cite: 13]\n"
-        "Studienergebnisse erhalten [cite: 13]\n"
-        "Keine neuen Informationen ergänzen [cite: 13]\n"
-        "Struktur des Originals beibehalten (wichtig! Auch alle Unterkapitel, es darf keines fehlen! Die Gliederungsstruktur muss 100% erhalten bleiben) [cite: 13]\n"
-        "Möglichst kurz und stichpunktartig[cite: 13]. Maximal 40 % der ursprünglichen Länge (wichtig!) [cite: 14]\n"
-        "Es darf aber nicht zu kurz sein, es muss alles vorhanden sein was in Prüfungsfragen dramkommen könnte (sehr wichtig!) [cite: 14]\n"
-        "Berücksichtige Abbildungen im Text und erläutere diese kurz[cite: 14].\n\n"
+        "Alle zentralen Konzepte enthalten\n"
+        "Keine Beispiele entfernen, wenn sie zum Verständnis nötig sind\n"
+        "Definitionen vollständig übernehmen\n"
+        "Studienergebnisse erhalten\n"
+        "Keine neuen Informationen ergänzen\n"
+        "Struktur des Originals beibehalten (wichtig! Auch alle Unterkapitel, es darf keines fehlen! Die Gliederungsstruktur muss 100% erhalten bleiben)\n"
+        "Möglichst kurz und stichpunktartig. Maximal 40 % der ursprünglichen Länge (wichtig!)\n"
+        "Es darf aber nicht zu kurz sein, es muss alles vorhanden sein was in Prüfungsfragen dramkommen könnte (sehr wichtig!)\n"
+        "Berücksichtige Abbildungen im Text und erläutere diese kurz.\n\n"
         "Prüfe:\n"
-        "Welche Informationen aus dem Original in der Zusammenfassung fehlen [cite: 15]\n"
-        "Welche Definitionen verloren gingen [cite: 15]\n"
-        "Welche Einschränkungen oder Bedingungen fehlen [cite: 15]\n\n"
+        "Welche Informationen aus dem Original in der Zusammenfassung fehlen\n"
+        "Welche Definitionen verloren gingen\n"
+        "Welche Einschränkungen oder Bedingungen fehlen\n\n"
         f"Inhalt:\n{text}"
     )
     try:
@@ -211,41 +210,41 @@ def generate_summary(text: str) -> str:
 
 
 def verify_with_questions(summary_text: str, questions_path: str) -> str:
-    """Schritt 5: Qualitätssicherung der Zusammenfassung anhand der Fragen aus 03_prompt_Fragen.txt[cite: 19, 20]."""
+    """Schritt 5: Qualitätssicherung der Zusammenfassung anhand der Fragen aus 03_prompt_Fragen.txt."""
     print(f"--- Schritt 5: Qualitätssicherung via Leitfragen aus {questions_path} ---")
     
     with open(questions_path, "r", encoding="utf-8") as f:
         questions = f.read()
         
     prompt = (
-        "Rolle:\nDu bist Lerncoach und Prüfer für Wirtschaftspsychologie[cite: 21].\n\n"
-        "Aufgabe:\nBeantworte die leseleitenden Fragen ultrakompakt und mit exakt einem Unterkapitelverweis[cite: 21]. "
-        "Nutze ausschließlich den hochgeladenen Text als Wissensbasis[cite: 22].\n\n"
+        "Rolle:\nDu bist Lerncoach und Prüfer für Wirtschaftspsychologie.\n\n"
+        "Aufgabe:\nBeantworte die leseleitenden Fragen ultrakompakt und mit exakt einem Unterkapitelverweis. "
+        "Nutze ausschließlich den hochgeladenen Text als Wissensbasis.\n\n"
         "Bevor du antwortest:\n"
-        "Schritt 1: Suche die relevanten Stellen im Dokument[cite: 22].\n"
-        "Schritt 2: Liste die Textstellen stichpunktartig auf[cite: 23].\n"
-        "Schritt 3: Erst danach beantworte die Frage[cite: 23].\n\n"
-        "Wenn keine passende Stelle existiert:\n'Im Dokument nicht enthalten'[cite: 23]. Nicht raten[cite: 24].\n\n"
+        "Schritt 1: Suche die relevanten Stellen im Dokument.\n"
+        "Schritt 2: Liste die Textstellen stichpunktartig auf.\n"
+        "Schritt 3: Erst danach beantworte die Frage.\n\n"
+        "Wenn keine passende Stelle existiert:\n'Im Dokument nicht enthalten'. Nicht raten.\n\n"
         "Antwortregeln:\n"
-        "- Maximal 3 Sätze pro Frage[cite: 24].\n"
-        "- Keine Einleitung[cite: 24].\n"
-        "- Keine Wiederholung der Frage[cite: 24].\n"
-        "- Keine ausführlichen Erklärungen[cite: 24].\n"
-        "- Nur prüfungsrelevante Kernaussage[cite: 25].\n"
-        "- Wenn Zahlen/Studienwerte relevant sind: nennen[cite: 25].\n"
-        "- Wenn die Antwort im Dokument nicht eindeutig steht: „Im Dokument nicht eindeutig beantwortbar.“ [cite: 26]\n\n"
+        "- Maximal 3 Sätze pro Frage.\n"
+        "- Keine Einleitung.\n"
+        "- Keine Wiederholung der Frage.\n"
+        "- Keine ausführlichen Erklärungen.\n"
+        "- Nur prüfungsrelevante Kernaussage.\n"
+        "- Wenn Zahlen/Studienwerte relevant sind: nennen.\n"
+        "- Wenn die Antwort im Dokument nicht eindeutig steht: „Im Dokument nicht eindeutig beantwortbar.“\n\n"
         "Quellenregeln:\n"
-        "- Verweise immer auf die genaueste vorhandene Überschrift[cite: 27].\n"
-        "- Nicht nur „Kapitel 6.4“, sondern z. B. „6.4.1.2 Eine umfassende Übersicht“[cite: 27].\n"
-        "- Wenn mehrere Unterkapitel nötig sind, maximal 3 nennen[cite: 28].\n"
-        "- Zusätzlich 1–3 Schlüsselbegriffe aus der Textstelle nennen[cite: 28].\n"
-        "- Keine groben Kapitelverweise, wenn Unterkapitel vorhanden sind[cite: 29].\n\n"
+        "- Verweise immer auf die genaueste vorhandene Überschrift.\n"
+        "- Nicht nur „Kapitel 6.4“, sondern z. B. „6.4.1.2 Eine umfassende Übersicht“.\n"
+        "- Wenn mehrere Unterkapitel nötig sind, maximal 3 nennen.\n"
+        "- Zusätzlich 1–3 Schlüsselbegriffe aus der Textstelle nennen.\n"
+        "- Keine groben Kapitelverweise, wenn Unterkapitel vorhanden sind.\n\n"
         "Ausgabeformat pro Frage:\n"
         "Frage X\n"
-        "Antwort: [max. 3 Sätze] [cite: 29, 30]\n"
-        "Textgrundlage: [genaues Unterkapitel] [cite: 30]\n"
-        "Schlüsselbegriffe: [1–3 Begriffe] [cite: 30]\n"
-        "Abdeckung: vollständig / teilweise / nicht enthalten [cite: 30]\n\n"
+        "Antwort: [max. 3 Sätze]\n"
+        "Textgrundlage: [genaues Unterkapitel]\n"
+        "Schlüsselbegriffe: [1–3 Begriffe]\n"
+        "Abdeckung: vollständig / teilweise / nicht enthalten\n\n"
         f"Wissensbasis (Zusammenfassung):\n{summary_text}\n\n"
         f"Fragen:\n{questions}"
     )
@@ -261,9 +260,70 @@ def verify_with_questions(summary_text: str, questions_path: str) -> str:
         raise
 
 
+def add_formatted_text(paragraph, text, default_color=None):
+    """Hilfsfunktion: Parse Markdown-Fettungen (**text**) und füge sie als Word-Runs hinzu."""
+    parts = re.split(r'(\*\*.*?\*\*)', text)
+    for part in parts:
+        if part.startswith('**') and part.endswith('**'):
+            run = paragraph.add_run(part[2:-2])
+            run.bold = True
+        else:
+            run = paragraph.add_run(part)
+        
+        if default_color:
+            run.font.color.rgb = default_color
+
+
+def process_markdown_to_docx(doc, block_text, hide_text=False):
+    """Interpretiert Markdown-Zeilen und fügt sie sauber formatiert dem Word-Dokument hinzu."""
+    color_map = {
+        'heading1': RGBColor(0x00, 0x33, 0x66), # Dunkelblau für Strukturen
+        'heading2': RGBColor(0x00, 0x44, 0x88),
+        'heading3': RGBColor(0x33, 0x66, 0x99),
+        'hidden_text': RGBColor(0xCC, 0xCC, 0xCC), # Diskretes Hellgrau
+        'hidden_heading1': RGBColor(0x99, 0x99, 0x99),
+        'hidden_heading2': RGBColor(0xAA, 0xAA, 0xAA)
+    }
+
+    for line in block_text.split('\n'):
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # 1. Überschriften übersetzen
+        if stripped.startswith('# '):
+            p = doc.add_heading(level=1)
+            color = color_map['hidden_heading1'] if hide_text else color_map['heading1']
+            add_formatted_text(p, stripped[2:], default_color=color)
+        elif stripped.startswith('## '):
+            p = doc.add_heading(level=2)
+            color = color_map['hidden_heading2'] if hide_text else color_map['heading2']
+            add_formatted_text(p, stripped[3:], default_color=color)
+        elif stripped.startswith('### '):
+            p = doc.add_heading(level=3)
+            color = color_map['hidden_heading2'] if hide_text else color_map['heading3']
+            add_formatted_text(p, stripped[4:], default_color=color)
+            
+        # 2. Aufzählungspunkte übersetzen
+        elif stripped.startswith('* ') or stripped.startswith('- '):
+            p = doc.add_paragraph(style='List Bullet')
+            color = color_map['hidden_text'] if hide_text else None
+            add_formatted_text(p, stripped[2:], default_color=color)
+            if hide_text:
+                p.style.font.size = Pt(9.5)
+                
+        # 3. Normaler Fließtext
+        else:
+            p = doc.add_paragraph()
+            color = color_map['hidden_text'] if hide_text else None
+            add_formatted_text(p, line, default_color=color)
+            if hide_text:
+                p.style.font.size = Pt(9.5)
+
+
 def build_final_word_document(translated_text: str, summary_text: str, qa_text: str, output_path: str):
-    """Schritt 3 erweitert: Erstellt das Word-Dokument mit ausgeblendetem Original, Zusammenfassung und QA."""
-    print(f"--- Schritt 3/Final: Erstelle finalisiertes Word-Dokument -> {output_path} ---")
+    """Schritt 3 erweitert: Erstellt das finale Word-Dokument ohne MD-Überreste."""
+    print(f"--- Schritt 3/Final: Erstelle formatiertes Word-Dokument -> {output_path} ---")
     doc = Document()
     
     style = doc.styles['Normal']
@@ -272,47 +332,22 @@ def build_final_word_document(translated_text: str, summary_text: str, qa_text: 
     
     # 1. QA / Quizfragen-Prüfung ganz oben anheften
     doc.add_heading("Qualitätsprüfung & Leitfragen-Abdeckung", level=1)
-    for line in qa_text.split("\n"):
-        if line.strip():
-            doc.add_paragraph(line)
+    process_markdown_to_docx(doc, qa_text, hide_text=False)
             
     doc.add_page_break()
     
     # 2. Lernorientierte Zusammenfassung
     doc.add_heading("Lernorientierte Zusammenfassung", level=1)
-    for line in summary_text.split("\n"):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith('# '):
-            doc.add_heading(stripped[2:], level=2)
-        elif stripped.startswith('## '):
-            doc.add_heading(stripped[3:], level=3)
-        else:
-            doc.add_paragraph(line)
+    process_markdown_to_docx(doc, summary_text, hide_text=False)
             
     doc.add_page_break()
     
     # 3. Übersetzter Originaltext (visuell "ausgeblendet" in Hellgrau)
     doc.add_heading("Vollständige Textgrundlage (Original/Übersetzung)", level=1)
-    for line in translated_text.split("\n"):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith('# '):
-            p = doc.add_heading(stripped[2:], level=2)
-            p.style.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
-        elif stripped.startswith('## '):
-            p = doc.add_heading(stripped[3:], level=3)
-            p.style.font.color.rgb = RGBColor(0xAA, 0xAA, 0xAA)
-        else:
-            p = doc.add_paragraph()
-            run = p.add_run(line)
-            run.font.color.rgb = RGBColor(0xCC, 0xCC, 0xCC)
-            run.font.size = Pt(9.5)
+    process_markdown_to_docx(doc, translated_text, hide_text=True)
             
     doc.save(output_path)
-    print("Word-Dokument erfolgreich finalisiert.")
+    print("Word-Dokument erfolgreich strukturiert und bereinigt.")
 
 
 if __name__ == "__main__":
@@ -353,7 +388,7 @@ if __name__ == "__main__":
         # 5. Optionale Qualitätssicherung über Fragen
         qa_result = "Keine Leitfragen zur Prüfung übergeben."
         if args.questions:
-            if os.path.exists(args.questions):
+            if os.getenv("GEMINI_API_KEY") and os.path.exists(args.questions):
                 qa_result = verify_with_questions(summary_result, args.questions)
             else:
                 print(f"Warnung: Fragen-Datei '{args.questions}' nicht gefunden. Überspringe QS.")
