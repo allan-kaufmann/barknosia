@@ -49,23 +49,23 @@ def translate_text(text: str) -> str:
         "Ziel:\n"
         "Eine vollständige, sinntreue Übersetzung, keine Zusammenfassung.\n\n"
         "Strenge Regeln:\n"
-        "- Nichts auslassen.\n"
-        "- Nichts ergänzen.\n"
-        "- Nichts interpretieren.\n"
-        "- Keine Inhalte glätten, kürzen oder zusammenfassen.\n"
-        "- Fachbegriffe konsistent übersetzen.\n"
-        "- Überschriften, Absatzstruktur, Listen und Tabellenstruktur beibehalten.\n"
-        "- Zitate, Autorennamen, Jahreszahlen, Variablennamen, Skalen, Hypothesen und statistische Angaben exakt erhalten.\n"
-        "- Unklare oder beschädigte Stellen mit [UNKLAR: Originalstelle] markieren, nicht erraten.\n"
-        "- Bildverweise, Tabellenverweise und Abbildungsbeschriftungen erhalten.\n"
-        "- Markdown-Struktur beibehalten.\n\n"
+        "- Nichts auslassen. [cite: 5]\n"
+        "- Nichts ergänzen. [cite: 6]\n"
+        "- Nichts interpretieren. [cite: 6]\n"
+        "- Keine Inhalte glätten, kürzen oder zusammenfassen. [cite: 6]\n"
+        "- Fachbegriffe konsistent übersetzen. [cite: 6]\n"
+        "- Überschriften, Absatzstruktur, Listen und Tabellenstruktur beibehalten. [cite: 7]\n"
+        "- Zitate, Autorennamen, Jahreszahlen, Variablennamen, Skalen, Hypothesen und statistische Angaben exakt erhalten. [cite: 7]\n"
+        "- Unklare oder beschädigte Stellen mit [UNKLAR: Originalstelle] markieren, nicht erraten. [cite: 8]\n"
+        "- Bildverweise, Tabellenverweise und Abbildungsbeschriftungen erhalten. [cite: 8]\n"
+        "- Markdown-Struktur beibehalten. [cite: 8]\n\n"
         "Ausgabeformat:\n"
-        "1. Nur die deutsche Übersetzung.\n"
+        "1. Nur die deutsche Übersetzung. [cite: 9]\n"
         "2. Danach eine kurze Kontrollliste:\n"
-        "   - Anzahl erkannter Absätze im Original\n"
-        "   - Anzahl übersetzter Absätze\n"
-        "   - Hinweise auf unklare Stellen\n"
-        "   - Hinweise auf mögliche fehlende Tabellen/Bildinhalte"
+        "   - Anzahl erkannter Absätze im Original [cite: 9]\n"
+        "   - Anzahl übersetzter Absätze [cite: 9]\n"
+        "   - Hinweise auf unklare Stellen [cite: 9]\n"
+        "   - Hinweise auf mögliche fehlende Tabellen/Bildinhalte [cite: 9]"
     )
     
     try:
@@ -123,8 +123,6 @@ def create_word_document(markdown_text: str, output_docx_path: str, hide_origina
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="KI-gestützte Übersetzungs- und Zusammenfassungs-Pipeline ab Markdown")
-    
-    # Jetzt wird direkt die von Marker erzeugte .md Datei übergeben
     parser.add_argument("md_path", type=str, help="Pfad zur Quell-Markdown-Datei (.md)")
     
     args = parser.parse_args()
@@ -133,18 +131,26 @@ if __name__ == "__main__":
         if not os.getenv("GEMINI_API_KEY"):
             raise ValueError("Kein GEMINI_API_KEY in der .env-Datei gefunden!")
 
+        # Sicherheits-Check vorab: Wurde fälschlicherweise ein PDF übergeben?
+        if args.md_path.lower().endswith('.pdf'):
+            print("\n[FEHLER] Du hast dem Skript eine .pdf-Datei übergeben.")
+            print("Dieses Skript benötigt die bereits von Marker extrahierte .md-Datei!")
+            print("Beispiel für den richtigen Aufruf:")
+            print("python pipeline.py workspace/output/Sonnentag-.../Sonnentag-....md\n")
+            exit(1)
+
         if os.path.exists(args.md_path):
             # 1. Existierende Markdown-Datei einlesen
             print(f"--- Schritt 1: Lese extrahierte Markdown-Datei {args.md_path} ---")
             with open(args.md_path, "r", encoding="utf-8") as f:
                 aktueller_text = f.read()
             
-            # 2. Sprache prüfen & ggfls. übersetzen 
+            # 2. Sprache prüfen & ggfls. übersetzen
             is_english = check_if_english(aktueller_text)
             
             if is_english:
-                print("Text ist Englisch. Starte Übersetzung...") [cite: 5]
-                aktueller_text = translate_text(aktueller_text) [cite: 5]
+                print("Text ist Englisch. Starte Übersetzung...")
+                aktueller_text = translate_text(aktueller_text)
                 
                 # Speichere die rohe Übersetzung als Backup ab
                 output_md_pfad = Path(args.md_path).parent / "de_uebersetzung.md"
@@ -154,11 +160,11 @@ if __name__ == "__main__":
             else:
                 print("Text ist bereits Deutsch. Keine Übersetzung notwendig.")
             
-            # 3. Word-Dokument erstellen 
+            # 3. Word-Dokument erstellen
             md_path_obj = Path(args.md_path)
             output_docx = md_path_obj.parent / f"{md_path_obj.stem}_studienbasis.docx"
             
-            create_word_document(aktueller_text, str(output_docx), hide_original=True) [cite: 7]
+            create_word_document(aktueller_text, str(output_docx), hide_original=True)
             
             print(f"=== Pipeline-Etappe erfolgreich! ===")
             print(f"Word-Basis liegt bereit in: {output_docx}")
