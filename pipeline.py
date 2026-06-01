@@ -6,6 +6,8 @@ from pypdf import PdfReader, PdfWriter
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from docx import Document
+from docx.shared import Pt, RGBColor
 
 # Lädt die Umgebungsvariablen aus der .env-Datei
 load_dotenv()
@@ -43,7 +45,6 @@ def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
     print(f"--- Schritt 1b: Starte Marker-OCR für {input_pdf_path} ---")
     os.makedirs(output_dir, exist_ok=True)
     
-    # Ermittle den absoluten Pfad von marker_single im System
     try:
         marker_path = subprocess.check_output(["which", "marker_single"], text=True).strip()
         print(f"Marker-Pfad gefunden: {marker_path}")
@@ -51,11 +52,9 @@ def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
         marker_path = "marker_single"
         print("Warnung: Konnte absoluten Pfad für 'marker_single' nicht ermitteln. Nutze Standard-Aufruf.")
 
-    # Befehl aufbauen
     command = [marker_path, str(input_pdf_path), "--output_dir", str(output_dir)]
     
     try:
-        # shell=True und String-Aufruf für korrekte Rechte- und Pfadauflösung unter WSL/Linux
         cmd_string = " ".join(command)
         subprocess.run(cmd_string, check=True, text=True, stdout=subprocess.DEVNULL, shell=True)
         print(f"Marker erfolgreich ausgeführt.\n")
@@ -109,25 +108,25 @@ def translate_text(text: str) -> str:
     system_prompt = (
         "Übersetze den folgenden englischen wissenschaftlichen Text originalgetreu ins Deutsche.\n\n"
         "Ziel:\n"
-        "Eine vollständige, sinntreue Übersetzung, keine Zusammenfassung.\n\n"
+        "Eine vollständige, sinntreue Übersetzung, keine Zusammenfassung[cite: 5].\n\n"
         "Strenge Regeln:\n"
-        "- Nichts auslassen.\n"
-        "- Nichts ergänzen.\n"
-        "- Nichts interpretieren.\n"
-        "- Keine Inhalte glätten, kürzen oder zusammenfassen.\n"
-        "- Fachbegriffe konsistent übersetzen.\n"
+        "- Nichts auslassen[cite: 5].\n"
+        "- Nichts ergänzen[cite: 6].\n"
+        "- Nichts interpretieren[cite: 6].\n"
+        "- Keine Inhalte glätten, kürzen oder zusammenfassen[cite: 6].\n"
+        "- Fachbegriffe konsistent übersetzen[cite: 6].\n"
         "- Überschriften, Absatzstruktur, Listen und Tabellenstruktur beibehalten.\n"
         "- Zitate, Autorennamen, Jahreszahlen, Variablennamen, Skalen, Hypothesen und statistische Angaben exakt erhalten.\n"
-        "- Unklare oder beschädigte Stellen mit [UNKLAR: Originalstelle] markieren, nicht erraten.\n"
-        "- Bildverweise, Tabellenverweise und Abbildungsbeschriftungen erhalten.\n"
-        "- Markdown-Struktur beibehalten.\n\n"
+        "- Unklare oder beschädigte Stellen mit [UNKLAR: Originalstelle] markieren, nicht erraten[cite: 8].\n"
+        "- Bildverweise, Tabellenverweise und Abbildungsbeschriftungen erhalten[cite: 8].\n"
+        "- Markdown-Struktur beibehalten[cite: 8].\n\n"
         "Ausgabeformat:\n"
-        "1. Nur die deutsche Übersetzung.\n"
+        "1. Nur die deutsche Übersetzung[cite: 9].\n"
         "2. Danach eine kurze Kontrollliste:\n"
-        "   - Anzahl erkannter Absätze im Original\n"
-        "   - Anzahl übersetzter Absätze\n"
-        "   - Hinweise auf unklare Stellen\n"
-        "   - Hinweise auf mögliche fehlende Tabellen/Bildinhalte"
+        "   - Anzahl erkannter Absätze im Original [cite: 9]\n"
+        "   - Anzahl übersetzten Absätze [cite: 9]\n"
+        "   - Hinweise auf unklare Stellen [cite: 9]\n"
+        "   - Hinweise auf mögliche fehlende Tabellen/Bildinhalte [cite: 9]"
     )
     
     try:
@@ -143,6 +142,52 @@ def translate_text(text: str) -> str:
     except Exception as e:
         print(f"Fehler bei der Gemini-Übersetzung: {e}")
         raise
+
+
+def create_word_document(markdown_text: str, output_docx_path: str, hide_original: bool = True):
+    """
+    Schritt 3: Konvertiert den strukturierten Markdown-Text in ein Word-Dokument.
+    Falls hide_original=True, wird der Quelltext in einem sehr hellen Grau formatiert,
+    damit er visuell in den Hintergrund rückt (ausgeblendet ist).
+    """
+    print(f"--- Schritt 3: Generiere strukturiertes Word-Dokument -> {output_docx_path} ---")
+    
+    doc = Document()
+    
+    # Standard-Styles einrichten
+    style_normal = doc.styles['Normal']
+    font = style_normal.font
+    font.name = 'Arial'
+    font.size = Pt(11)
+    
+    lines = markdown_text.split('\n')
+    
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+            
+        # Überschriften erkennen und Formatierung matchen [cite: 7, 27]
+        if stripped.startswith('# '):
+            p = doc.add_heading(stripped[2:], level=1)
+            p.style.font.color.rgb = RGBColor(0x00, 0x33, 0x66) # Dunkelblau für Struktur
+        elif stripped.startswith('## '):
+            p = doc.add_heading(stripped[3:], level=2)
+            p.style.font.color.rgb = RGBColor(0x00, 0x44, 0x88)
+        elif stripped.startswith('### '):
+            p = doc.add_heading(stripped[4:], level=3)
+        else:
+            # Normaler Textabsatz 
+            p = doc.add_paragraph()
+            run = p.add_run(line)
+            
+            # Falls ausgeblendet gewünscht, färben wir das Original hellgrau 
+            if hide_original:
+                run.font.color.rgb = RGBColor(0xBB, 0xBB, 0xBB)
+                run.font.size = Pt(9.5)
+
+    doc.save(output_docx_path)
+    print(f"Word-Dokument erfolgreich erstellt.\n")
 
 
 if __name__ == "__main__":
@@ -166,27 +211,34 @@ if __name__ == "__main__":
             markdown_datei_pfad = run_marker_ocr(pdf_zu_verarbeiten, MARKER_OUTPUT_ORDNER)
             
             with open(markdown_datei_pfad, "r", encoding="utf-8") as f:
-                original_text = f.read()
+                aktueller_text = f.read()
             
             # Temp-Datei aufräumen
             if args.start is None and args.end is None and os.path.exists(TEMPORÄRES_PDF):
                 os.remove(TEMPORÄRES_PDF)
 
             # 2. Sprache prüfen & ggfls. übersetzen
-            is_english = check_if_english(original_text)
+            is_english = check_if_english(aktueller_text)
             
             if is_english:
                 print("Text ist Englisch. Starte Übersetzung...")
-                uebersetzter_text = translate_text(original_text)
+                aktueller_text = translate_text(aktueller_text)
                 
+                # Speichere die rohe Übersetzung als Backup
                 output_md_pfad = Path(markdown_datei_pfad).parent / "de_uebersetzung.md"
                 with open(output_md_pfad, "w", encoding="utf-8") as f:
-                    f.write(uebersetzter_text)
-                    
-                print(f"\n=== Schritt 1 & 2 erfolgreich abgeschlossen! ===")
-                print(f"Übersetzung gespeichert unter: {output_md_pfad}")
+                    f.write(aktueller_text)
             else:
                 print("Text ist bereits Deutsch. Keine Übersetzung notwendig.")
+            
+            # 3. Word-Dokument erstellen (Originaltext/Übersetzung wird hellgrau) 
+            pdf_stem = Path(args.pdf_path).stem
+            output_docx = Path(MARKER_OUTPUT_ORDNER) / pdf_stem / f"{pdf_stem}_studienbasis.docx"
+            
+            create_word_document(aktueller_text, str(output_docx), hide_original=True)
+            
+            print(f"=== Pipeline-Etappe erfolgreich! ===")
+            print(f"Bereit für den Zusammenfassungs-Schritt. Word-Basis liegt in: {output_docx}")
                 
         else:
             print(f"Fehler: Die Datei '{args.pdf_path}' wurde nicht gefunden.")
