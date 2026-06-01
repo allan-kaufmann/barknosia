@@ -1,5 +1,7 @@
 import os
 import argparse
+import subprocess
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
@@ -13,8 +15,51 @@ load_dotenv()
 # Gemini API-Client initialisieren
 client = genai.Client()
 
+def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
+    """
+    Schritt 1: Ruft das 'marker'-Modul direkt über den Python-Interpreter auf.
+    Das verhindert den 'Permission denied' Fehler unter WSL/Linux vollständig.
+    """
+    print(f"--- Schritt 1: Starte Marker-OCR für {input_pdf_path} ---")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Wir nehmen den exakten Python-Interpreter deiner aktiven virtuellen Umgebung
+    python_executable = sys.executable
+    
+    # Befehl wird als Modulaufruf gestartet (entspricht: python -m marker.cli.convert_single ...)
+    command = [
+        python_executable, 
+        "-m", "marker.cli.convert_single", 
+        str(input_pdf_path), 
+        "--output_dir", str(output_dir)
+    ]
+    
+    print(f"Führe OCR aus (das kann einen Moment dauern)...")
+    try:
+        # Führt den Befehl aus und leitet Ausgaben um, damit das Terminal übersichtlich bleibt
+        subprocess.run(command, check=True, text=True, stdout=subprocess.DEVNULL)
+        print(f"Marker erfolgreich ausgeführt.\n")
+        
+        # Den Pfad der generierten .md-Datei ermitteln
+        pdf_stem = Path(input_pdf_path).stem
+        expected_md_path = Path(output_dir) / pdf_stem / f"{pdf_stem}.md"
+        
+        if expected_md_path.exists():
+            return str(expected_md_path)
+        else:
+            # Fallback: Falls marker den Ordnernamen leicht abgewandelt hat
+            found_md_files = list(Path(output_dir).glob("**/*.md"))
+            if found_md_files:
+                return str(found_md_files[0])
+            raise FileNotFoundError("Marker hat den Prozess beendet, aber es wurde keine .md-Datei gefunden.")
+            
+    except subprocess.CalledProcessError as e:
+        print(f"\n[FEHLER] Marker-OCR fehlgeschlagen. Vergewissere dich, dass 'marker' in deiner .venv installiert ist.")
+        raise e
+
+
 def check_if_english(text: str) -> bool:
-    """Prüft per schnellem KI-Aufruf via gemini-2.5-flash, ob der Text englisch ist."""
+    """Schritt 2a: Prüfe per schnellem KI-Aufruf via gemini-2.5-flash, ob der Text englisch ist."""
     print("--- Schritt 2a: Prüfe Sprache des Dokuments ---")
     
     leseprobe = text[:2000]
@@ -41,7 +86,7 @@ def check_if_english(text: str) -> bool:
 
 
 def translate_text(text: str) -> str:
-    """Übersetzt den Text mit gemini-2.5-pro nach den strengen Regeln aus 01_b_text_uebersetzen.txt"""
+    """Schritt 2b: Übersetzt den Text mit gemini-2.5-pro nach deinen strengen Regeln."""
     print("--- Schritt 2b: Übersetze englischen Text ins Deutsche (via Gemini 2.5 Pro) ---")
     
     system_prompt = (
@@ -49,23 +94,23 @@ def translate_text(text: str) -> str:
         "Ziel:\n"
         "Eine vollständige, sinntreue Übersetzung, keine Zusammenfassung.\n\n"
         "Strenge Regeln:\n"
-        "- Nichts auslassen. [cite: 5]\n"
-        "- Nichts ergänzen. [cite: 6]\n"
-        "- Nichts interpretieren. [cite: 6]\n"
-        "- Keine Inhalte glätten, kürzen oder zusammenfassen. [cite: 6]\n"
-        "- Fachbegriffe konsistent übersetzen. [cite: 6]\n"
-        "- Überschriften, Absatzstruktur, Listen und Tabellenstruktur beibehalten. [cite: 7]\n"
-        "- Zitate, Autorennamen, Jahreszahlen, Variablennamen, Skalen, Hypothesen und statistische Angaben exakt erhalten. [cite: 7]\n"
-        "- Unklare oder beschädigte Stellen mit [UNKLAR: Originalstelle] markieren, nicht erraten. [cite: 8]\n"
-        "- Bildverweise, Tabellenverweise und Abbildungsbeschriftungen erhalten. [cite: 8]\n"
-        "- Markdown-Struktur beibehalten. [cite: 8]\n\n"
+        "- Nichts auslassen.\n"
+        "- Nichts ergänzen.\n"
+        "- Nichts interpretieren.\n"
+        "- Keine Inhalte glätten, kürzen oder zusammenfassen.\n"
+        "- Fachbegriffe konsistent übersetzen.\n"
+        "- Überschriften, Absatzstruktur, Listen und Tabellenstruktur beibehalten.\n"
+        "- Zitate, Autorennamen, Jahreszahlen, Variablennamen, Skalen, Hypothesen und statistische Angaben exakt erhalten.\n"
+        "- Unklare oder beschädigte Stellen mit [UNKLAR: Originalstelle] markieren, nicht erraten.\n"
+        "- Bildverweise, Tabellenverweise und Abbildungsbeschriftungen erhalten.\n"
+        "- Markdown-Struktur beibehalten.\n\n"
         "Ausgabeformat:\n"
-        "1. Nur die deutsche Übersetzung. [cite: 9]\n"
+        "1. Nur die deutsche Übersetzung.\n"
         "2. Danach eine kurze Kontrollliste:\n"
-        "   - Anzahl erkannter Absätze im Original [cite: 9]\n"
-        "   - Anzahl übersetzter Absätze [cite: 9]\n"
-        "   - Hinweise auf unklare Stellen [cite: 9]\n"
-        "   - Hinweise auf mögliche fehlende Tabellen/Bildinhalte [cite: 9]"
+        "   - Anzahl erkannter Absätze im Original\n"
+        "   - Anzahl übersetzter Absätze\n"
+        "   - Hinweise auf unklare Stellen\n"
+        "   - Hinweise auf mögliche fehlende Tabellen/Bildinhalte"
     )
     
     try:
@@ -122,27 +167,25 @@ def create_word_document(markdown_text: str, output_docx_path: str, hide_origina
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="KI-gestützte Übersetzungs- und Zusammenfassungs-Pipeline ab Markdown")
-    parser.add_argument("md_path", type=str, help="Pfad zur Quell-Markdown-Datei (.md)")
+    parser = argparse.ArgumentParser(description="Vollautomatische PDF-Übersetzungs- und Formatierungs-Pipeline")
+    
+    # Nimmt jetzt wie gewünscht wieder direkt den Pfad zur .pdf Datei an
+    parser.add_argument("pdf_path", type=str, help="Pfad zur Quell-PDF-Datei")
     
     args = parser.parse_args()
+    
+    MARKER_OUTPUT_ORDNER = "workspace/output"
     
     try:
         if not os.getenv("GEMINI_API_KEY"):
             raise ValueError("Kein GEMINI_API_KEY in der .env-Datei gefunden!")
 
-        # Sicherheits-Check vorab: Wurde fälschlicherweise ein PDF übergeben?
-        if args.md_path.lower().endswith('.pdf'):
-            print("\n[FEHLER] Du hast dem Skript eine .pdf-Datei übergeben.")
-            print("Dieses Skript benötigt die bereits von Marker extrahierte .md-Datei!")
-            print("Beispiel für den richtigen Aufruf:")
-            print("python pipeline.py workspace/output/Sonnentag-.../Sonnentag-....md\n")
-            exit(1)
-
-        if os.path.exists(args.md_path):
-            # 1. Existierende Markdown-Datei einlesen
-            print(f"--- Schritt 1: Lese extrahierte Markdown-Datei {args.md_path} ---")
-            with open(args.md_path, "r", encoding="utf-8") as f:
+        if os.path.exists(args.pdf_path):
+            # 1. Marker OCR direkt aus dem Skript starten
+            markdown_datei_pfad = run_marker_ocr(args.pdf_path, MARKER_OUTPUT_ORDNER)
+            
+            # Die von Marker neu erzeugte .md Datei einlesen
+            with open(markdown_datei_pfad, "r", encoding="utf-8") as f:
                 aktueller_text = f.read()
             
             # 2. Sprache prüfen & ggfls. übersetzen
@@ -153,7 +196,7 @@ if __name__ == "__main__":
                 aktueller_text = translate_text(aktueller_text)
                 
                 # Speichere die rohe Übersetzung als Backup ab
-                output_md_pfad = Path(args.md_path).parent / "de_uebersetzung.md"
+                output_md_pfad = Path(markdown_datei_pfad).parent / "de_uebersetzung.md"
                 with open(output_md_pfad, "w", encoding="utf-8") as f:
                     f.write(aktueller_text)
                 print(f"Übersetztes Markdown gesichert unter: {output_md_pfad}")
@@ -161,8 +204,8 @@ if __name__ == "__main__":
                 print("Text ist bereits Deutsch. Keine Übersetzung notwendig.")
             
             # 3. Word-Dokument erstellen
-            md_path_obj = Path(args.md_path)
-            output_docx = md_path_obj.parent / f"{md_path_obj.stem}_studienbasis.docx"
+            pdf_stem = Path(args.pdf_path).stem
+            output_docx = Path(MARKER_OUTPUT_ORDNER) / pdf_stem / f"{pdf_stem}_studienbasis.docx"
             
             create_word_document(aktueller_text, str(output_docx), hide_original=True)
             
@@ -170,7 +213,7 @@ if __name__ == "__main__":
             print(f"Word-Basis liegt bereit in: {output_docx}")
                 
         else:
-            print(f"Fehler: Die Datei '{args.md_path}' wurde nicht gefunden.")
+            print(f"Fehler: Die Datei '{args.pdf_path}' wurde nicht gefunden.")
             
     except Exception as e:
         print(f"Pipeline abgebrochen wegen: {e}")
