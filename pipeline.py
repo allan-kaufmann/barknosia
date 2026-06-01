@@ -20,15 +20,11 @@ def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
     print(f"--- Schritt 1: Starte Marker-OCR für {input_pdf_path} ---")
     os.makedirs(output_dir, exist_ok=True)
     
-    # Nutzt exakt die Umgebungsvariablen deiner aktiven .venv
     env = os.environ.copy()
-    
-    # Wir übergeben den Befehl exakt so, wie er auf der CLI läuft
     command = f"marker_single \"{input_pdf_path}\" --output_dir \"{output_dir}\""
     
     print("Führe OCR via System-Shell aus (das kann einen Moment dauern)...")
     try:
-        # shell=True stellt sicher, dass WSL den Befehl 'marker_single' in der venv findet
         subprocess.run(command, check=True, shell=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print("Marker erfolgreich ausgeführt.\n")
         
@@ -69,8 +65,31 @@ def check_if_english(text: str) -> bool:
         return True
 
 
+def split_text_by_headings(text: str, max_chars: int = 15000) -> list:
+    """Hilfsfunktion: Splittet Markdown-Text an Überschriften in logische Abschnitte,"""
+    """damit das Ausgabe-Limit der API (8k Token) nicht gesprengt wird."""
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for line in text.split('\n'):
+        # Wenn eine neue Hauptüberschrift kommt und der aktuelle Chunk groß genug ist, splitten wir
+        if (line.startswith('# ') or line.startswith('## ')) and current_length > max_chars:
+            chunks.append('\n'.join(current_chunk))
+            current_chunk = []
+            current_length = 0
+            
+        current_chunk.append(line)
+        current_length += len(line)
+        
+    if current_chunk:
+        chunks.append('\n'.join(current_chunk))
+        
+    return chunks
+
+
 def translate_text(text: str) -> str:
-    """Schritt 2b: Übersetzt den Text nach den strengen Regeln aus 01_b_text_uebersetzen.txt[cite: 5]."""
+    """Schritt 2b: Übersetzt den Text abschnittsweise nach den strengen Regeln aus 01_b_text_uebersetzen.txt[cite: 5]."""
     print("--- Schritt 2b: Übersetze englischen Text ins Deutsche (via Gemini 2.5 Pro) ---")
     
     system_prompt = (
@@ -96,16 +115,25 @@ def translate_text(text: str) -> str:
         "   - Hinweise auf unklare Stellen [cite: 9]\n"
         "   - Hinweise auf mögliche fehlende Tabellen/Bildinhalte [cite: 9]"
     )
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-pro',
-            contents=f"Text:\n{text}",
-            config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=0.1)
-        )
-        return response.text
-    except Exception as e:
-        print(f"Fehler bei der Übersetzung: {e}")
-        raise
+    
+    chunks = split_text_by_headings(text)
+    translated_chunks = []
+    
+    for i, chunk in enumerate(chunks, 1):
+        if len(chunks) > 1:
+            print(f"   -> Übersetze Abschnitt {i} von {len(chunks)}...")
+        try:
+            response = client.models.generate_content(
+                model='gemini-2.5-pro',
+                contents=f"Text:\n{chunk}",
+                config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=0.1)
+            )
+            translated_chunks.append(response.text)
+        except Exception as e:
+            print(f"Fehler bei der Übersetzung von Abschnitt {i}: {e}")
+            raise
+            
+    return '\n\n'.join(translated_chunks)
 
 
 def generate_summary(text: str) -> str:
@@ -198,12 +226,11 @@ def build_final_word_document(translated_text: str, summary_text: str, qa_text: 
     print(f"--- Schritt 3/Final: Erstelle finalisiertes Word-Dokument -> {output_path} ---")
     doc = Document()
     
-    # Globaler Style
     style = doc.styles['Normal']
     style.font.name = 'Arial'
     style.font.size = Pt(11)
     
-    # 1. QA / Quizfragen-Prüfung ganz oben als Qualitäts-Zertifikat anheften
+    # 1. QA / Quizfragen-Prüfung ganz oben anheften
     doc.add_heading("Qualitätsprüfung & Leitfragen-Abdeckung", level=1)
     for line in qa_text.split("\n"):
         if line.strip():
@@ -241,7 +268,7 @@ def build_final_word_document(translated_text: str, summary_text: str, qa_text: 
         else:
             p = doc.add_paragraph()
             run = p.add_run(line)
-            run.font.color.rgb = RGBColor(0xCC, 0xCC, 0xCC)  # Sehr helles Grau zum "Ausblenden"
+            run.font.color.rgb = RGBColor(0xCC, 0xCC, 0xCC)
             run.font.size = Pt(9.5)
             
     doc.save(output_path)
@@ -274,7 +301,6 @@ if __name__ == "__main__":
             print("Text ist Englisch. Starte Übersetzung...")
             working_text = translate_text(working_text)
             
-            # Backup-MD sichern
             backup_md = Path(md_file_path).parent / "de_uebersetzung.md"
             with open(backup_md, "w", encoding="utf-8") as f:
                 f.write(working_text)
