@@ -41,22 +41,27 @@ def extract_pdf_pages(input_pdf_path: str, output_pdf_path: str, start_page: int
 
 
 def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
-    """Schritt 1b: Ruft das 'marker'-Tool über den absoluten Systempfad auf."""
+    """Schritt 1b: Ruft das 'marker'-Tool direkt aus der virtuellen Umgebung auf."""
     print(f"--- Schritt 1b: Starte Marker-OCR für {input_pdf_path} ---")
     os.makedirs(output_dir, exist_ok=True)
     
-    try:
-        marker_path = subprocess.check_output(["which", "marker_single"], text=True).strip()
-        print(f"Marker-Pfad gefunden: {marker_path}")
-    except subprocess.CalledProcessError:
+    # Pfad zur ausführbaren Datei in deiner virtuellen Umgebung unter WSL/Linux
+    local_marker = "./.venv/bin/marker_single"
+    
+    if os.path.exists(local_marker):
+        marker_path = local_marker
+        print(f"Nutze venv-lokalen Marker: {marker_path}")
+        use_shell = False
+    else:
         marker_path = "marker_single"
-        print("Warnung: Konnte absoluten Pfad für 'marker_single' nicht ermitteln. Nutze Standard-Aufruf.")
+        print("Warnung: Lokaler venv-Marker nicht gefunden. Weiche auf globalen Aufruf aus.")
+        use_shell = True
 
     command = [marker_path, str(input_pdf_path), "--output_dir", str(output_dir)]
     
     try:
-        cmd_string = " ".join(command)
-        subprocess.run(cmd_string, check=True, text=True, stdout=subprocess.DEVNULL, shell=True)
+        # Führt marker aus; shell=False sorgt bei direkten Pfaden für stabile Rechte unter WSL
+        subprocess.run(command, check=True, text=True, stdout=subprocess.DEVNULL, shell=use_shell)
         print(f"Marker erfolgreich ausgeführt.\n")
         
         pdf_stem = Path(input_pdf_path).stem
@@ -108,25 +113,25 @@ def translate_text(text: str) -> str:
     system_prompt = (
         "Übersetze den folgenden englischen wissenschaftlichen Text originalgetreu ins Deutsche.\n\n"
         "Ziel:\n"
-        "Eine vollständige, sinntreue Übersetzung, keine Zusammenfassung[cite: 5].\n\n"
+        "Eine vollständige, sinntreue Übersetzung, keine Zusammenfassung.\n\n"
         "Strenge Regeln:\n"
-        "- Nichts auslassen[cite: 5].\n"
-        "- Nichts ergänzen[cite: 6].\n"
-        "- Nichts interpretieren[cite: 6].\n"
-        "- Keine Inhalte glätten, kürzen oder zusammenfassen[cite: 6].\n"
-        "- Fachbegriffe konsistent übersetzen[cite: 6].\n"
+        "- Nichts auslassen.\n"
+        "- Nichts ergänzen.\n"
+        "- Nichts interpretieren.\n"
+        "- Keine Inhalte glätten, kürzen oder zusammenfassen.\n"
+        "- Fachbegriffe konsistent übersetzen.\n"
         "- Überschriften, Absatzstruktur, Listen und Tabellenstruktur beibehalten.\n"
         "- Zitate, Autorennamen, Jahreszahlen, Variablennamen, Skalen, Hypothesen und statistische Angaben exakt erhalten.\n"
-        "- Unklare oder beschädigte Stellen mit [UNKLAR: Originalstelle] markieren, nicht erraten[cite: 8].\n"
-        "- Bildverweise, Tabellenverweise und Abbildungsbeschriftungen erhalten[cite: 8].\n"
-        "- Markdown-Struktur beibehalten[cite: 8].\n\n"
+        "- Unklare oder beschädigte Stellen mit [UNKLAR: Originalstelle] markieren, nicht erraten.\n"
+        "- Bildverweise, Tabellenverweise und Abbildungsbeschriftungen erhalten.\n"
+        "- Markdown-Struktur beibehalten.\n\n"
         "Ausgabeformat:\n"
-        "1. Nur die deutsche Übersetzung[cite: 9].\n"
+        "1. Nur die deutsche Übersetzung.\n"
         "2. Danach eine kurze Kontrollliste:\n"
-        "   - Anzahl erkannter Absätze im Original [cite: 9]\n"
-        "   - Anzahl übersetzten Absätze [cite: 9]\n"
-        "   - Hinweise auf unklare Stellen [cite: 9]\n"
-        "   - Hinweise auf mögliche fehlende Tabellen/Bildinhalte [cite: 9]"
+        "   - Anzahl erkannter Absätze im Original\n"
+        "   - Anzahl übersetzter Absätze\n"
+        "   - Hinweise auf unklare Stellen\n"
+        "   - Hinweise auf mögliche fehlende Tabellen/Bildinhalte"
     )
     
     try:
@@ -147,14 +152,12 @@ def translate_text(text: str) -> str:
 def create_word_document(markdown_text: str, output_docx_path: str, hide_original: bool = True):
     """
     Schritt 3: Konvertiert den strukturierten Markdown-Text in ein Word-Dokument.
-    Falls hide_original=True, wird der Quelltext in einem sehr hellen Grau formatiert,
-    damit er visuell in den Hintergrund rückt (ausgeblendet ist).
+    Falls hide_original=True, wird der Quelltext in einem sehr hellen Grau formatiert.
     """
     print(f"--- Schritt 3: Generiere strukturiertes Word-Dokument -> {output_docx_path} ---")
     
     doc = Document()
     
-    # Standard-Styles einrichten
     style_normal = doc.styles['Normal']
     font = style_normal.font
     font.name = 'Arial'
@@ -167,21 +170,18 @@ def create_word_document(markdown_text: str, output_docx_path: str, hide_origina
         if not stripped:
             continue
             
-        # Überschriften erkennen und Formatierung matchen [cite: 7, 27]
         if stripped.startswith('# '):
             p = doc.add_heading(stripped[2:], level=1)
-            p.style.font.color.rgb = RGBColor(0x00, 0x33, 0x66) # Dunkelblau für Struktur
+            p.style.font.color.rgb = RGBColor(0x00, 0x33, 0x66)
         elif stripped.startswith('## '):
             p = doc.add_heading(stripped[3:], level=2)
             p.style.font.color.rgb = RGBColor(0x00, 0x44, 0x88)
         elif stripped.startswith('### '):
             p = doc.add_heading(stripped[4:], level=3)
         else:
-            # Normaler Textabsatz 
             p = doc.add_paragraph()
             run = p.add_run(line)
             
-            # Falls ausgeblendet gewünscht, färben wir das Original hellgrau 
             if hide_original:
                 run.font.color.rgb = RGBColor(0xBB, 0xBB, 0xBB)
                 run.font.size = Pt(9.5)
@@ -224,21 +224,20 @@ if __name__ == "__main__":
                 print("Text ist Englisch. Starte Übersetzung...")
                 aktueller_text = translate_text(aktueller_text)
                 
-                # Speichere die rohe Übersetzung als Backup
                 output_md_pfad = Path(markdown_datei_pfad).parent / "de_uebersetzung.md"
                 with open(output_md_pfad, "w", encoding="utf-8") as f:
                     f.write(aktueller_text)
             else:
                 print("Text ist bereits Deutsch. Keine Übersetzung notwendig.")
             
-            # 3. Word-Dokument erstellen (Originaltext/Übersetzung wird hellgrau) 
+            # 3. Word-Dokument erstellen
             pdf_stem = Path(args.pdf_path).stem
             output_docx = Path(MARKER_OUTPUT_ORDNER) / pdf_stem / f"{pdf_stem}_studienbasis.docx"
             
             create_word_document(aktueller_text, str(output_docx), hide_original=True)
             
             print(f"=== Pipeline-Etappe erfolgreich! ===")
-            print(f"Bereit für den Zusammenfassungs-Schritt. Word-Basis liegt in: {output_docx}")
+            print(f"Word-Basis liegt in: {output_docx}")
                 
         else:
             print(f"Fehler: Die Datei '{args.pdf_path}' wurde nicht gefunden.")
