@@ -2,10 +2,12 @@ import os
 import argparse
 import subprocess
 import sys
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError  # Für das Abfangen von Serverfehlern
 from docx import Document
 from docx.shared import Pt, RGBColor
 
@@ -15,12 +17,32 @@ load_dotenv()
 # Gemini API-Client mit der offiziellen Bibliothek initialisieren
 client = genai.Client()
 
+def call_gemini_with_retry(model_name: str, contents, config, max_retries: int = 5, delay: int = 5):
+    """Hilfsfunktion: Ruft Gemini auf und wiederholt den Versuch bei Serverüberlastung (503)."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config
+            )
+            return response
+        except APIError as e:
+            # Wenn der Server überlastet (503) oder blockiert (429) ist, warten wir
+            if e.code in [503, 429] and attempt < max_retries:
+                print(f"      [Server ausgelastet] Fehler {e.code}. Warte {delay} Sekunden (Versuch {attempt}/{max_retries})...")
+                time.sleep(delay)
+                delay *= 2  # Exponentielles Backoff: Wartezeit verdoppeln
+            else:
+                raise e
+    raise APIError("Maximale Anzahl an Wiederholungsversuchen erreicht.")
+
+
 def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
     """Schritt 1: Konvertiert das PDF über den nativen Systemaufruf in Markdown."""
     print(f"--- Schritt 1: Starte Marker-OCR für {input_pdf_path} ---")
     os.makedirs(output_dir, exist_ok=True)
     
-    # Pfade absolut machen, um den FileNotFoundError in Subprozessen zu verhindern
     abs_pdf_path = os.path.abspath(input_pdf_path)
     abs_output_dir = os.path.abspath(output_dir)
     
@@ -28,8 +50,6 @@ def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
         raise FileNotFoundError(f"Die PDF-Datei wurde unter '{abs_pdf_path}' nicht gefunden.")
     
     env = os.environ.copy()
-    
-    # Befehl mit absoluten Pfaden aufbauen
     inner_command = f"marker_single \"{abs_pdf_path}\" --output_dir \"{abs_output_dir}\""
     command = ["/bin/bash", "-i", "-c", inner_command]
     
@@ -40,7 +60,6 @@ def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
         
     except subprocess.CalledProcessError:
         print("\nStandard-CLI-Aufruf fehlgeschlagen. Versuche Modul-Fallback via Python-Interpreter...")
-        # Korrigierter Fallback: marker nutzt intern marker.scripts.convert_single
         fallback_command = [
             sys.executable, 
             "-m", "marker.scripts.convert_single", 
@@ -54,7 +73,6 @@ def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
             print("\n[FEHLER] Beide Marker-Aufrufe sind fehlgeschlagen.")
             raise e
 
-    # Pfad der generierten .md-Datei ermitteln
     pdf_stem = Path(input_pdf_path).stem
     expected_md_path = Path(abs_output_dir) / pdf_stem / f"{pdf_stem}.md"
     
@@ -77,8 +95,8 @@ def check_if_english(text: str) -> bool:
         f"Text:\n{leseprobe}"
     )
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
+        response = call_gemini_with_retry(
+            model_name='gemini-2.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=5)
         )
@@ -89,8 +107,7 @@ def check_if_english(text: str) -> bool:
 
 
 def split_text_by_headings(text: str, max_chars: int = 15000) -> list:
-    """Hilfsfunktion: Splittet Markdown-Text an Überschriften in logische Abschnitte,"""
-    """damit das Ausgabe-Limit der API (8k Token) nicht gesprengt wird."""
+    """Hilfsfunktion: Splittet Markdown-Text an Überschriften in logische Abschnitte."""
     chunks = []
     current_chunk = []
     current_length = 0
@@ -111,46 +128,47 @@ def split_text_by_headings(text: str, max_chars: int = 15000) -> list:
 
 
 def translate_text(text: str) -> str:
-    """Schritt 2b: Übersetzt den Text abschnittsweise nach den strengen Regeln aus 01_b_text_uebersetzen.txt."""
+    """Schritt 2b: Übersetzt den Text abschnittsweise nach den strengen Regeln aus 01_b_text_uebersetzen.txt[cite: 5]."""
     print("--- Schritt 2b: Übersetze englischen Text ins Deutsche (via Gemini 2.5 Pro) ---")
     
     system_prompt = (
         "Übersetze den folgenden englischen wissenschaftlichen Text originalgetreu ins Deutsche.\n\n"
         "Ziel:\n"
-        "Eine vollständige, sinntreue Übersetzung, keine Zusammenfassung.\n\n"
+        "Eine vollständige, sinntreue Übersetzung, keine Zusammenfassung[cite: 5].\n\n"
         "Strenge Regeln:\n"
-        "- Nichts auslassen.\n"
-        "- Nichts ergänzen.\n"
-        "- Nichts interpretieren.\n"
-        "- Keine Inhalte glätten, kürzen oder zusammenfassen.\n"
-        "- Fachbegriffe konsistent übersetzen.\n"
-        "- Überschriften, Absatzstruktur, Listen und Tabellenstruktur beibehalten.\n"
-        "- Zitate, Autorennamen, Jahreszahlen, Variablennamen, Skalen, Hypothesen und statistische Angaben exakt erhalten.\n"
-        "- Unklare oder beschädigte Stellen mit [UNKLAR: Originalstelle] markieren, nicht erraten.\n"
-        "- Bildverweise, Tabellenverweise und Abbildungsbeschriftungen erhalten.\n"
-        "- Markdown-Struktur beibehalten.\n\n"
+        "- Nichts auslassen[cite: 5].\n"
+        "- Nichts ergänzen[cite: 6].\n"
+        "- Nichts interpretieren[cite: 6].\n"
+        "- Keine Inhalte glätten, kürzen oder zusammenfassen[cite: 6].\n"
+        "- Fachbegriffe konsistent übersetzen[cite: 6].\n"
+        "- Überschriften, Absatzstruktur, Listen und Tabellenstruktur beibehalten[cite: 7].\n"
+        "- Zitate, Autorennamen, Jahreszahlen, Variablennamen, Skalen, Hypothesen und statistische Angaben exakt erhalten[cite: 7].\n"
+        "- Unklare oder beschädigte Stellen mit [UNKLAR: Originalstelle] markieren, nicht erraten[cite: 8].\n"
+        "- Bildverweise, Tabellenverweise und Abbildungsbeschriftungen erhalten[cite: 8].\n"
+        "- Markdown-Struktur beibehalten[cite: 8].\n\n"
         "Ausgabeformat:\n"
-        "1. Nur die deutsche Übersetzung.\n"
-        "2. Danach eine kurze Kontrollliste:\n"
-        "   - Anzahl erkannter Absätze im Original\n"
-        "   - Anzahl übersetzter Absätze\n"
-        "   - Hinweise auf unklare Stellen\n"
-        "   - Hinweise auf mögliche fehlende Tabellen/Bildinhalte"
+        "1. Nur die deutsche Übersetzung[cite: 9].\n"
+        "2. Danach eine kurze Kontrollliste[cite: 9]:\n"
+        "   - Anzahl erkannter Absätze im Original [cite: 9]\n"
+        "   - Anzahl übersetzter Absätze [cite: 9]\n"
+        "   - Hinweise auf unklare Stellen [cite: 9]\n"
+        "   - Hinweise auf mögliche fehlende Tabellen/Bildinhalte [cite: 9]"
     )
     
     chunks = split_text_by_headings(text)
     translated_chunks = []
     
     for i, chunk in enumerate(chunks, 1):
-        if len(chunks) > 1:
-            print(f"   -> Übersetze Abschnitt {i} von {len(chunks)}...")
+        print(f"   -> Übersetze Abschnitt {i} von {len(chunks)}...")
         try:
-            response = client.models.generate_content(
-                model='gemini-2.5-pro',
+            response = call_gemini_with_retry(
+                model_name='gemini-2.5-pro',
                 contents=f"Text:\n{chunk}",
                 config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=0.1)
             )
             translated_chunks.append(response.text)
+            # Kurze Pause zwischen den Abschnitten, um die API-Rate-Limits zu schonen
+            time.sleep(2)
         except Exception as e:
             print(f"Fehler bei der Übersetzung von Abschnitt {i}: {e}")
             raise
@@ -159,30 +177,30 @@ def translate_text(text: str) -> str:
 
 
 def generate_summary(text: str) -> str:
-    """Schritt 4: Erstellt eine lernorientierte Zusammenfassung nach 02_prompts-zusammenfassung.txt."""
+    """Schritt 4: Erstellt eine lernorientierte Zusammenfassung nach 02_prompts-zusammenfassung.txt[cite: 12]."""
     print("--- Schritt 4: Erstelle lernorientierte Zusammenfassung (via Gemini 2.5 Pro) ---")
     
     prompt = (
-        "Erstelle eine lernorientierte Zusammenfassung zum nachfolgenden Text, der nach 'Inhalt:' kommt.\n\n"
+        "Erstelle eine lernorientierte Zusammenfassung zum nachfolgenden Text, der nach 'Inhalt:' kommt[cite: 12].\n\n"
         "Anforderungen:\n"
-        "Alle zentralen Konzepte enthalten\n"
-        "Keine Beispiele entfernen, wenn sie zum Verständnis nötig sind\n"
-        "Definitionen vollständig übernehmen\n"
-        "Studienergebnisse erhalten\n"
-        "Keine neuen Informationen ergänzen\n"
-        "Struktur des Originals beibehalten (wichtig! Auch alle Unterkapitel, es darf keines fehlen! Die Gliederungsstruktur muss 100% erhalten bleiben)\n"
-        "Möglichst kurz und stichpunktartig. Maximal 40 % der ursprünglichen Länge (wichtig!)\n"
-        "Es darf aber nicht zu kurz sein, es muss alles vorhanden sein was in Prüfungsfragen dramkommen könnte (sehr wichtig!)\n"
-        "Berücksichtige Abbildungen im Text und erläutere diese kurz.\n\n"
+        "Alle zentralen Konzepte enthalten [cite: 13]\n"
+        "Keine Beispiele entfernen, wenn sie zum Verständnis nötig sind [cite: 13]\n"
+        "Definitionen vollständig übernehmen [cite: 13]\n"
+        "Studienergebnisse erhalten [cite: 13]\n"
+        "Keine neuen Informationen ergänzen [cite: 13]\n"
+        "Struktur des Originals beibehalten (wichtig! Auch alle Unterkapitel, es darf keines fehlen! Die Gliederungsstruktur muss 100% erhalten bleiben) [cite: 13]\n"
+        "Möglichst kurz und stichpunktartig[cite: 13]. Maximal 40 % der ursprünglichen Länge (wichtig!) [cite: 14]\n"
+        "Es darf aber nicht zu kurz sein, es muss alles vorhanden sein was in Prüfungsfragen dramkommen könnte (sehr wichtig!) [cite: 14]\n"
+        "Berücksichtige Abbildungen im Text und erläutere diese kurz[cite: 14].\n\n"
         "Prüfe:\n"
-        "Welche Informationen aus dem Original in der Zusammenfassung fehlen\n"
-        "Welche Definitionen verloren gingen\n"
-        "Welche Einschränkungen oder Bedingungen fehlen\n\n"
+        "Welche Informationen aus dem Original in der Zusammenfassung fehlen [cite: 15]\n"
+        "Welche Definitionen verloren gingen [cite: 15]\n"
+        "Welche Einschränkungen oder Bedingungen fehlen [cite: 15]\n\n"
         f"Inhalt:\n{text}"
     )
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-pro',
+        response = call_gemini_with_retry(
+            model_name='gemini-2.5-pro',
             contents=prompt,
             config=types.GenerateContentConfig(temperature=0.2)
         )
@@ -193,47 +211,47 @@ def generate_summary(text: str) -> str:
 
 
 def verify_with_questions(summary_text: str, questions_path: str) -> str:
-    """Schritt 5: Qualitätssicherung der Zusammenfassung anhand der Fragen aus 03_prompt_Fragen.txt."""
+    """Schritt 5: Qualitätssicherung der Zusammenfassung anhand der Fragen aus 03_prompt_Fragen.txt[cite: 19, 20]."""
     print(f"--- Schritt 5: Qualitätssicherung via Leitfragen aus {questions_path} ---")
     
     with open(questions_path, "r", encoding="utf-8") as f:
         questions = f.read()
         
     prompt = (
-        "Rolle:\nDu bist Lerncoach und Prüfer für Wirtschaftspsychologie.\n\n"
-        "Aufgabe:\nBeantworte die leseleitenden Fragen ultrakompakt und mit exakt einem Unterkapitelverweis. "
-        "Nutze ausschließlich den hochgeladenen Text als Wissensbasis.\n\n"
+        "Rolle:\nDu bist Lerncoach und Prüfer für Wirtschaftspsychologie[cite: 21].\n\n"
+        "Aufgabe:\nBeantworte die leseleitenden Fragen ultrakompakt und mit exakt einem Unterkapitelverweis[cite: 21]. "
+        "Nutze ausschließlich den hochgeladenen Text als Wissensbasis[cite: 22].\n\n"
         "Bevor du antwortest:\n"
-        "Schritt 1: Suche die relevanten Stellen im Dokument.\n"
-        "Schritt 2: Liste die Textstellen stichpunktartig auf.\n"
-        "Schritt 3: Erst danach beantworte die Frage.\n\n"
-        "Wenn keine passende Stelle existiert:\n'Im Dokument nicht enthalten'. Nicht raten.\n\n"
+        "Schritt 1: Suche die relevanten Stellen im Dokument[cite: 22].\n"
+        "Schritt 2: Liste die Textstellen stichpunktartig auf[cite: 23].\n"
+        "Schritt 3: Erst danach beantworte die Frage[cite: 23].\n\n"
+        "Wenn keine passende Stelle existiert:\n'Im Dokument nicht enthalten'[cite: 23]. Nicht raten[cite: 24].\n\n"
         "Antwortregeln:\n"
-        "- Maximal 3 Sätze pro Frage.\n"
-        "- Keine Einleitung.\n"
-        "- Keine Wiederholung der Frage.\n"
-        "- Keine ausführlichen Erklärungen.\n"
-        "- Nur prüfungsrelevante Kernaussage.\n"
-        "- Wenn Zahlen/Studienwerte relevant sind: nennen.\n"
-        "- Wenn die Antwort im Dokument nicht eindeutig steht: „Im Dokument nicht eindeutig beantwortbar.“\n\n"
+        "- Maximal 3 Sätze pro Frage[cite: 24].\n"
+        "- Keine Einleitung[cite: 24].\n"
+        "- Keine Wiederholung der Frage[cite: 24].\n"
+        "- Keine ausführlichen Erklärungen[cite: 24].\n"
+        "- Nur prüfungsrelevante Kernaussage[cite: 25].\n"
+        "- Wenn Zahlen/Studienwerte relevant sind: nennen[cite: 25].\n"
+        "- Wenn die Antwort im Dokument nicht eindeutig steht: „Im Dokument nicht eindeutig beantwortbar.“ [cite: 26]\n\n"
         "Quellenregeln:\n"
-        "- Verweise immer auf die genaueste vorhandene Überschrift.\n"
-        "- Nicht nur „Kapitel 6.4“, sondern z. B. „6.4.1.2 Eine umfassende Übersicht“.\n"
-        "- Wenn mehrere Unterkapitel nötig sind, maximal 3 nennen.\n"
-        "- Zusätzlich 1–3 Schlüsselbegriffe aus der Textstelle nennen.\n"
-        "- Keine groben Kapitelverweise, wenn Unterkapitel vorhanden sind.\n\n"
+        "- Verweise immer auf die genaueste vorhandene Überschrift[cite: 27].\n"
+        "- Nicht nur „Kapitel 6.4“, sondern z. B. „6.4.1.2 Eine umfassende Übersicht“[cite: 27].\n"
+        "- Wenn mehrere Unterkapitel nötig sind, maximal 3 nennen[cite: 28].\n"
+        "- Zusätzlich 1–3 Schlüsselbegriffe aus der Textstelle nennen[cite: 28].\n"
+        "- Keine groben Kapitelverweise, wenn Unterkapitel vorhanden sind[cite: 29].\n\n"
         "Ausgabeformat pro Frage:\n"
         "Frage X\n"
-        "Antwort: [max. 3 Sätze]\n"
-        "Textgrundlage: [genaues Unterkapitel]\n"
-        "Schlüsselbegriffe: [1–3 Begriffe]\n"
-        "Abdeckung: vollständig / teilweise / nicht enthalten\n\n"
+        "Antwort: [max. 3 Sätze] [cite: 29, 30]\n"
+        "Textgrundlage: [genaues Unterkapitel] [cite: 30]\n"
+        "Schlüsselbegriffe: [1–3 Begriffe] [cite: 30]\n"
+        "Abdeckung: vollständig / teilweise / nicht enthalten [cite: 30]\n\n"
         f"Wissensbasis (Zusammenfassung):\n{summary_text}\n\n"
         f"Fragen:\n{questions}"
     )
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-pro',
+        response = call_gemini_with_retry(
+            model_name='gemini-2.5-pro',
             contents=prompt,
             config=types.GenerateContentConfig(temperature=0.1)
         )
@@ -312,7 +330,7 @@ if __name__ == "__main__":
         if not os.path.exists(args.pdf_path):
             raise FileNotFoundError(f"Die Datei {args.pdf_path} wurde nicht gefunden.")
             
-        # 1. OCR mit absoluten Pfaden absichern
+        # 1. OCR ausführen
         md_file_path = run_marker_ocr(args.pdf_path, OUTPUT_BASE)
         
         with open(md_file_path, "r", encoding="utf-8") as f:
