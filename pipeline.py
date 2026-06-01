@@ -39,7 +39,7 @@ def call_gemini_with_retry(model_name: str, contents, config, max_retries: int =
 
 
 def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
-    """Schritt 1: Konvertiert das PDF über den nativen Systemaufruf in Markdown."""
+    """Schritt 1: Konvertiert das PDF über den isolierten venv-Aufruf in Markdown."""
     print(f"--- Schritt 1: Starte Marker-OCR für {input_pdf_path} ---")
     os.makedirs(output_dir, exist_ok=True)
     
@@ -49,29 +49,30 @@ def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
     if not os.path.exists(abs_pdf_path):
         raise FileNotFoundError(f"Die PDF-Datei wurde unter '{abs_pdf_path}' nicht gefunden.")
     
-    env = os.environ.copy()
-    inner_command = f"marker_single \"{abs_pdf_path}\" --output_dir \"{abs_output_dir}\""
-    command = ["/bin/bash", "-i", "-c", inner_command]
+    # Ermittle den direkten Pfad zu marker_single in deiner aktiven .venv
+    # Das verhindert das Laden der .bashrc und somit den ungewollten Ordnerwechsel.
+    venv_bin_dir = Path(sys.executable).parent
+    local_marker_executable = venv_bin_dir / "marker_single"
     
-    print("Führe OCR via Benutzer-Shell aus (das kann einen Moment dauern)...")
+    if local_marker_executable.exists():
+        command = [str(local_marker_executable), str(abs_pdf_path), "--output_dir", str(abs_output_dir)]
+        print(f"Nutze isolierten venv-Marker: {local_marker_executable}")
+    else:
+        # Fallback auf den globalen Befehl, falls die venv-Struktur unerwartet abweicht
+        command = ["marker_single", str(abs_pdf_path), "--output_dir", str(abs_output_dir)]
+        print("Nutze Standard-Pfad für marker_single...")
+
+    env = os.environ.copy()
+    
+    print("Führe OCR aus (das kann einen Moment dauern)...")
     try:
-        subprocess.run(command, check=True, shell=True, env=env, stdout=subprocess.DEVNULL, stderr=sys.stderr)
+        # shell=False ist hier essenziell, um die Terminal-Umgebung nicht zu verfälschen
+        subprocess.run(command, check=True, env=env, stdout=subprocess.DEVNULL, stderr=sys.stderr, shell=False)
         print("Marker erfolgreich ausgeführt.\n")
         
-    except subprocess.CalledProcessError:
-        print("\nStandard-CLI-Aufruf fehlgeschlagen. Versuche Modul-Fallback via Python-Interpreter...")
-        fallback_command = [
-            sys.executable, 
-            "-m", "marker.scripts.convert_single", 
-            str(abs_pdf_path), 
-            "--output_dir", str(abs_output_dir)
-        ]
-        try:
-            subprocess.run(fallback_command, check=True, env=env, stdout=subprocess.DEVNULL, stderr=sys.stderr)
-            print("Marker über Modul-Fallback erfolgreich ausgeführt.\n")
-        except subprocess.CalledProcessError as e:
-            print("\n[FEHLER] Beide Marker-Aufrufe sind fehlgeschlagen.")
-            raise e
+    except subprocess.CalledProcessError as e:
+        print("\n[FEHLER] Marker-OCR fehlgeschlagen.")
+        raise e
 
     pdf_stem = Path(input_pdf_path).stem
     expected_md_path = Path(abs_output_dir) / pdf_stem / f"{pdf_stem}.md"
@@ -237,7 +238,7 @@ def verify_with_questions(summary_text: str, questions_path: str) -> str:
         "- Verweise immer auf die genaueste vorhandene Überschrift.\n"
         "- Nicht nur „Kapitel 6.4“, sondern z. B. „6.4.1.2 Eine umfassende Übersicht“.\n"
         "- Wenn mehrere Unterkapitel nötig sind, maximal 3 nennen.\n"
-        "- Zusätzlich 1–3 Schlüsselbegriffe aus der Textstelle nennen.\n"
+        "- Zusätzlich 1–3 Schlüsselbegriffe aus die Textstelle nennen.\n"
         "- Keine groben Kapitelverweise, wenn Unterkapitel vorhanden sind.\n\n"
         "Ausgabeformat pro Frage:\n"
         "Frage X\n"
@@ -277,10 +278,10 @@ def add_formatted_text(paragraph, text, default_color=None):
 def process_markdown_to_docx(doc, block_text, hide_text=False):
     """Interpretiert Markdown-Zeilen und fügt sie sauber formatiert dem Word-Dokument hinzu."""
     color_map = {
-        'heading1': RGBColor(0x00, 0x33, 0x66), # Dunkelblau für Strukturen
+        'heading1': RGBColor(0x00, 0x33, 0x66),
         'heading2': RGBColor(0x00, 0x44, 0x88),
         'heading3': RGBColor(0x33, 0x66, 0x99),
-        'hidden_text': RGBColor(0xCC, 0xCC, 0xCC), # Diskretes Hellgrau
+        'hidden_text': RGBColor(0xCC, 0xCC, 0xCC),
         'hidden_heading1': RGBColor(0x99, 0x99, 0x99),
         'hidden_heading2': RGBColor(0xAA, 0xAA, 0xAA)
     }
@@ -290,7 +291,6 @@ def process_markdown_to_docx(doc, block_text, hide_text=False):
         if not stripped:
             continue
 
-        # 1. Überschriften übersetzen
         if stripped.startswith('# '):
             p = doc.add_heading(level=1)
             color = color_map['hidden_heading1'] if hide_text else color_map['heading1']
@@ -304,7 +304,6 @@ def process_markdown_to_docx(doc, block_text, hide_text=False):
             color = color_map['hidden_heading2'] if hide_text else color_map['heading3']
             add_formatted_text(p, stripped[4:], default_color=color)
             
-        # 2. Aufzählungspunkte übersetzen
         elif stripped.startswith('* ') or stripped.startswith('- '):
             p = doc.add_paragraph(style='List Bullet')
             color = color_map['hidden_text'] if hide_text else None
@@ -312,7 +311,6 @@ def process_markdown_to_docx(doc, block_text, hide_text=False):
             if hide_text:
                 p.style.font.size = Pt(9.5)
                 
-        # 3. Normaler Fließtext
         else:
             p = doc.add_paragraph()
             color = color_map['hidden_text'] if hide_text else None
@@ -365,7 +363,7 @@ if __name__ == "__main__":
         if not os.path.exists(args.pdf_path):
             raise FileNotFoundError(f"Die Datei {args.pdf_path} wurde nicht gefunden.")
             
-        # 1. OCR ausführen
+        # 1. OCR ausführen (isoliert)
         md_file_path = run_marker_ocr(args.pdf_path, OUTPUT_BASE)
         
         with open(md_file_path, "r", encoding="utf-8") as f:
@@ -388,7 +386,7 @@ if __name__ == "__main__":
         # 5. Optionale Qualitätssicherung über Fragen
         qa_result = "Keine Leitfragen zur Prüfung übergeben."
         if args.questions:
-            if os.getenv("GEMINI_API_KEY") and os.path.exists(args.questions):
+            if os.path.exists(args.questions):
                 qa_result = verify_with_questions(summary_result, args.questions)
             else:
                 print(f"Warnung: Fragen-Datei '{args.questions}' nicht gefunden. Überspringe QS.")
