@@ -10,7 +10,9 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 from docx import Document
-from docx.shared import Pt, RGBColor
+from docx.shared import Pt, RGBColor, Inches
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 
 # Lädt die Umgebungsvariablen aus der .env-Datei
 load_dotenv()
@@ -423,8 +425,110 @@ def add_formatted_text(paragraph, text, default_color=None):
             run.font.color.rgb = default_color
 
 
-def process_markdown_to_docx(doc, block_text, hide_text=False):
-    """Interpretiert Markdown-Zeilen und fügt sie sauber formatiert dem Word-Dokument hinzu."""
+def _html_entities(text: str) -> str:
+    """Wandelt einfache HTML-Entities in Plaintext um."""
+    return (text
+            .replace('&amp;', '&')
+            .replace('&lt;', '<')
+            .replace('&gt;', '>')
+            .replace('&nbsp;', ' ')
+            .replace('&#x27;', "'")
+            .replace('&quot;', '"'))
+
+
+def _set_cell_text(cell, raw_text: str, bold: bool = False):
+    """Schreibt Text in eine Word-Tabellenzelle; <br> wird zu Absatzumbruch."""
+    raw_text = _html_entities(raw_text.replace('<br>', '\n'))
+    parts = raw_text.split('\n')
+
+    para = cell.paragraphs[0]
+    para.clear()
+    run = para.add_run(parts[0].strip())
+    run.bold = bold
+    run.font.size = Pt(9.5)
+
+    for part in parts[1:]:
+        para = cell.add_paragraph()
+        run = para.add_run(part.strip())
+        run.bold = bold
+        run.font.size = Pt(9.5)
+
+
+def _shade_cell(cell, fill_hex: str):
+    """Setzt Hintergrundfarbe einer Tabellenzelle (z.B. 'DDEEFF')."""
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    shd = OxmlElement('w:shd')
+    shd.set(qn('w:val'), 'clear')
+    shd.set(qn('w:color'), 'auto')
+    shd.set(qn('w:fill'), fill_hex)
+    tcPr.append(shd)
+
+
+def add_markdown_table_to_doc(doc, table_lines: list):
+    """
+    Konvertiert eine Liste von Markdown-Pipe-Zeilen in eine Word-Tabelle.
+    Leere Zellen in derselben Spalte werden vertikal mit der Zelle darüber zusammengeführt.
+    Tabellen werden nie ausgeblendet.
+    """
+    SEP_RE = re.compile(r'^\|[-|: ]+\|$')
+
+    rows_data = []
+    for raw_line in table_lines:
+        line = raw_line.strip()
+        if SEP_RE.match(line):
+            continue
+        cells = [c.strip() for c in line.split('|')]
+        if cells and cells[0] == '':
+            cells = cells[1:]
+        if cells and cells[-1] == '':
+            cells = cells[:-1]
+        rows_data.append(cells)
+
+    if not rows_data:
+        return
+
+    num_cols = max(len(r) for r in rows_data)
+    num_rows = len(rows_data)
+
+    # Zellinhalt normieren (alle Zeilen auf gleiche Spaltenanzahl)
+    for r in rows_data:
+        while len(r) < num_cols:
+            r.append('')
+
+    table = doc.add_table(rows=num_rows, cols=num_cols)
+    table.style = 'Table Grid'
+
+    # Zellen befüllen
+    for r_idx, row in enumerate(rows_data):
+        for c_idx, cell_text in enumerate(row):
+            cell = table.cell(r_idx, c_idx)
+            is_header = (r_idx == 0)
+            _set_cell_text(cell, cell_text, bold=is_header)
+            if is_header:
+                _shade_cell(cell, 'D9E2F3')
+
+    # Leere Zellen vertikal zusammenführen (Spanning-Simulation)
+    for c in range(num_cols):
+        r = 1
+        while r < num_rows:
+            if rows_data[r][c] == '':
+                try:
+                    table.cell(r - 1, c).merge(table.cell(r, c))
+                except Exception:
+                    pass
+            r += 1
+
+    doc.add_paragraph()  # Abstand nach Tabelle
+
+
+def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
+    """
+    Interpretiert Markdown und fügt Inhalte dem Word-Dokument hinzu.
+    - Tabellen und Bilder werden IMMER sichtbar eingefügt (nie ausgeblendet).
+    - hide_text blendet normalen Text und Überschriften grau aus.
+    - base_path: Verzeichnis zur Auflösung relativer Bildpfade.
+    """
     color_map = {
         'heading1': RGBColor(0x00, 0x33, 0x66),
         'heading2': RGBColor(0x00, 0x44, 0x88),
@@ -434,9 +538,40 @@ def process_markdown_to_docx(doc, block_text, hide_text=False):
         'hidden_heading': RGBColor(0x99, 0x99, 0x99),
     }
 
-    for line in block_text.split('\n'):
+    lines = block_text.split('\n')
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         stripped = line.strip()
+
+        # ── Tabelle: alle aufeinanderfolgenden Pipe-Zeilen sammeln ──
+        if stripped.startswith('|'):
+            table_lines = []
+            while i < len(lines) and lines[i].strip().startswith('|'):
+                table_lines.append(lines[i].strip())
+                i += 1
+            add_markdown_table_to_doc(doc, table_lines)
+            continue
+
+        # ── Bild: ![]() ──
+        img_m = re.match(r'^!\[([^\]]*)\]\(([^)]+)\)$', stripped)
+        if img_m:
+            img_rel = img_m.group(2)
+            img_path = os.path.join(base_path, img_rel) if base_path else img_rel
+            if os.path.exists(img_path):
+                try:
+                    doc.add_picture(img_path, width=Inches(5.5))
+                    doc.add_paragraph()
+                except Exception:
+                    doc.add_paragraph(f"[Bild nicht eingebettet: {img_rel}]")
+            else:
+                doc.add_paragraph(f"[Bild nicht gefunden: {img_rel}]")
+            i += 1
+            continue
+
+        # ── Überschriften / Text (hide_text anwendbar) ──
         if not stripped:
+            i += 1
             continue
 
         if stripped.startswith('#### '):
@@ -459,8 +594,8 @@ def process_markdown_to_docx(doc, block_text, hide_text=False):
             p = doc.add_paragraph(style='List Bullet')
             color = color_map['hidden_text'] if hide_text else None
             add_formatted_text(p, stripped[2:], default_color=color)
-            if hide_text:
-                p.runs[0].font.size = Pt(9.5) if p.runs else None
+            if hide_text and p.runs:
+                p.runs[0].font.size = Pt(9.5)
         else:
             p = doc.add_paragraph()
             color = color_map['hidden_text'] if hide_text else None
@@ -468,6 +603,7 @@ def process_markdown_to_docx(doc, block_text, hide_text=False):
             if hide_text:
                 for run in p.runs:
                     run.font.size = Pt(9.5)
+        i += 1
 
 
 def _set_heading_color(heading_paragraph, color: RGBColor):
@@ -476,25 +612,27 @@ def _set_heading_color(heading_paragraph, color: RGBColor):
         run.font.color.rgb = color
 
 
-def build_translation_word_document(translated_text: str, output_path: str):
+def build_translation_word_document(translated_text: str, output_path: str, base_path: str = None):
     """Zwischenschritt: Erstellt ein einfaches Word-Dokument aus dem übersetzten Text (kein Grau, keine Zusammenfassung)."""
     print(f"--- Erstelle Übersetzungs-Word-Dokument -> {output_path} ---")
     doc = Document()
     style = doc.styles['Normal']
     style.font.name = 'Arial'
     style.font.size = Pt(11)
-    process_markdown_to_docx(doc, normalize_heading_levels(translated_text), hide_text=False)
+    process_markdown_to_docx(doc, normalize_heading_levels(translated_text), hide_text=False, base_path=base_path)
     doc.save(output_path)
     print("Übersetzungs-Word-Dokument erstellt.")
 
 
-def build_interleaved_word_document(translated_text: str, summary_text: str, qa_text: str, output_path: str):
+def build_interleaved_word_document(translated_text: str, summary_text: str, qa_text: str,
+                                    output_path: str, base_path: str = None):
     """
     Erstellt ein Word-Dokument, bei dem Zusammenfassung und Originaltext
     kapitelweise verschränkt sind. Jedes Kapitel enthält:
       - Die Kapitelüberschrift (aus dem Originaltext, mit Nummerierung)
       - Den Zusammenfassungstext dieses Kapitels
       - Einen einklappbaren '▸ Originaltext'-Abschnitt (grau) mit dem Volltext
+    Bilder und Tabellen werden immer sichtbar eingefügt (base_path für relative Bildpfade).
     """
     print(f"--- Erstelle interleaved Word-Dokument -> {output_path} ---")
 
@@ -510,7 +648,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     if qa_text and qa_text.strip() != "Keine Leitfragen zur Prüfung übergeben.":
         h = doc.add_heading("Qualitätsprüfung & Leitfragen-Abdeckung", level=1)
         _set_heading_color(h, RGBColor(0x00, 0x33, 0x66))
-        process_markdown_to_docx(doc, qa_text, hide_text=False)
+        process_markdown_to_docx(doc, qa_text, hide_text=False, base_path=base_path)
         doc.add_page_break()
 
     # --- Haupttitel ---
@@ -534,16 +672,15 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     # --- Interleaved Aufbau ---
     for section in orig_sections:
         if section['heading'] == '__preamble__':
-            # Präambel-Text (vor erster Überschrift) direkt ausgeben
             if section['body']:
-                process_markdown_to_docx(doc, section['body'])
+                process_markdown_to_docx(doc, section['body'], base_path=base_path)
             continue
 
-        level   = section['level']       # 1, 2 oder 3
-        heading = section['heading']     # z.B. "4.1.1 Hedonic well-being"
+        level     = section['level']
+        heading   = section['heading']
         orig_body = section['body']
 
-        # Kapitelüberschrift (mit original Nummerierung)
+        # Kapitelüberschrift (mit originaler Nummerierung)
         h = doc.add_heading(heading, level=level)
         heading_colors = {
             1: RGBColor(0x00, 0x33, 0x66),
@@ -559,14 +696,14 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             run = p.add_run("Zusammenfassung")
             run.bold = True
             run.font.color.rgb = COLOR_SUM_LABEL
-            process_markdown_to_docx(doc, sum_body, hide_text=False)
+            process_markdown_to_docx(doc, sum_body, hide_text=False, base_path=base_path)
 
         # Originaltext (einklappbar via Word-Heading-Collapse)
         if orig_body.strip():
             orig_heading_level = min(level + 1, 4)
-            h_orig = doc.add_heading(f"▸ Originaltext", level=orig_heading_level)
+            h_orig = doc.add_heading("▸ Originaltext", level=orig_heading_level)
             _set_heading_color(h_orig, COLOR_ORIG_LABEL)
-            process_markdown_to_docx(doc, orig_body, hide_text=True)
+            process_markdown_to_docx(doc, orig_body, hide_text=True, base_path=base_path)
 
     doc.save(output_path)
     print("Word-Dokument erfolgreich erstellt.")
@@ -626,7 +763,7 @@ if __name__ == "__main__":
         # --- Zwischenschritt: Übersetzung als eigenes Word-Dokument ---
         transl_docx_path = out_dir / f"{pdf_stem}_Uebersetzung.docx"
         if args.force or not transl_docx_path.exists():
-            build_translation_word_document(working_text, str(transl_docx_path))
+            build_translation_word_document(working_text, str(transl_docx_path), base_path=str(out_dir))
         else:
             print(f"[SKIP] Übersetzungs-Docx – bereits vorhanden: {transl_docx_path}")
 
@@ -660,7 +797,8 @@ if __name__ == "__main__":
 
         # --- Word-Dokument zusammensetzen ---
         final_docx_path = out_dir / f"{pdf_stem}_Lernskript.docx"
-        build_interleaved_word_document(working_text, summary_result, qa_result, str(final_docx_path))
+        build_interleaved_word_document(working_text, summary_result, qa_result,
+                                        str(final_docx_path), base_path=str(out_dir))
 
         print(f"\n=== PIPELINE ERFOLGREICH BEENDET ===")
         print(f"Zwischenergebnisse:   {out_dir}")
