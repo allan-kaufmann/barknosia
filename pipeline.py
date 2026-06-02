@@ -186,18 +186,22 @@ def translate_text(text: str) -> str:
 
 def split_into_level1_chapters(text: str) -> list:
     """
-    Splittet den Markdown-Text an Level-1-Überschriften.
-    Jeder Eintrag: {'heading': str, 'full_text': str} (full_text enthält die # Überschrift + alle Unterabschnitte).
+    Splittet den (bereits normalisierten) Markdown-Text an nummerierten ## Kapitelüberschriften.
+    Jeder Eintrag: {'heading': str, 'full_text': str}.
+    Erkennt Zeilen wie '## **1 EINLEITUNG**' oder '## 4 INDIVIDUELLE FAKTOREN'.
     """
     chapters = []
     current_heading = None
     current_lines = []
 
     for line in text.split('\n'):
-        if re.match(r'^# ', line):
+        # Nummeriertes ## -Kapitel: "## **1 ..." oder "## 1 ..."
+        m = re.match(r'^##\s+(?:\*\*)?(\d+)\s', line)
+        if m:
             if current_heading is not None:
                 chapters.append({'heading': current_heading, 'full_text': '\n'.join(current_lines)})
-            current_heading = line[2:].strip()
+            # Heading-Text ohne Bold-Marker speichern
+            current_heading = line[3:].strip().replace('**', '').strip()
             current_lines = [line]
         else:
             current_lines.append(line)
@@ -247,6 +251,7 @@ def generate_summary_by_chapter(text: str, out_dir: Path) -> str:
     """
     print("--- Schritt 4: Erstelle kapitelweise Zusammenfassung (via Gemini 2.5 Pro) ---")
 
+    text = normalize_heading_levels(text)
     chapters = split_into_level1_chapters(text)
 
     if not chapters:
@@ -343,7 +348,7 @@ def parse_sections(text: str) -> list:
     current = {'level': 0, 'heading': '__preamble__', 'lines': []}
 
     for line in text.split('\n'):
-        m = re.match(r'^(#{1,3})\s+(.+)$', line)
+        m = re.match(r'^(#{1,6})\s+(.+)$', line)
         if m:
             body = '\n'.join(current['lines']).strip()
             if body or current['heading'] != '__preamble__':
@@ -368,9 +373,40 @@ def parse_sections(text: str) -> list:
 
 
 def normalize_heading(h: str) -> str:
-    """Für fuzzy-Matching: führende Nummerierung entfernen, lowercase."""
-    h = re.sub(r'^\d[\d\.]*\s*', '', h)
+    """Für Matching: Bold-/Italic-Marker entfernen, lowercase. Nummern bleiben für eindeutige Keys."""
+    h = re.sub(r'\*+', '', h)   # strip ** und *
     return h.lower().strip()
+
+
+def normalize_heading_levels(text: str) -> str:
+    """
+    Normalisiert inkonsistente Markdown-Überschriftenebenen.
+    Nummerierte Kapitelüberschriften erhalten konsistente Ebenen:
+      "1 Titel"     → ## (H2)
+      "4.1 Titel"   → ### (H3)
+      "4.1.1 Titel" → #### (H4)
+    Nicht-nummerierte Überschriften werden nicht verändert.
+    """
+    result = []
+    for line in text.split('\n'):
+        m = re.match(r'^(#{1,6})\s+(.+)$', line)
+        if m:
+            content = m.group(2).strip()
+            clean = content.replace('**', '').strip()
+            num_m = re.match(r'^(\d+)(\.(\d+)(\.(\d+))?)?(\s|$)', clean)
+            if num_m:
+                if num_m.group(3) is None:
+                    new_level = '##'
+                elif num_m.group(5) is None:
+                    new_level = '###'
+                else:
+                    new_level = '####'
+                result.append(f'{new_level} {content}')
+            else:
+                result.append(line)
+        else:
+            result.append(line)
+    return '\n'.join(result)
 
 
 def add_formatted_text(paragraph, text, default_color=None):
@@ -447,7 +483,7 @@ def build_translation_word_document(translated_text: str, output_path: str):
     style = doc.styles['Normal']
     style.font.name = 'Arial'
     style.font.size = Pt(11)
-    process_markdown_to_docx(doc, translated_text, hide_text=False)
+    process_markdown_to_docx(doc, normalize_heading_levels(translated_text), hide_text=False)
     doc.save(output_path)
     print("Übersetzungs-Word-Dokument erstellt.")
 
@@ -481,7 +517,9 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     h = doc.add_heading("Lernskript", level=1)
     _set_heading_color(h, RGBColor(0x00, 0x33, 0x66))
 
-    # --- Sections parsen ---
+    # --- Heading-Level normalisieren & Sections parsen ---
+    translated_text = normalize_heading_levels(translated_text)
+    summary_text    = normalize_heading_levels(summary_text)
     orig_sections = parse_sections(translated_text)
     sum_sections  = parse_sections(summary_text)
 
