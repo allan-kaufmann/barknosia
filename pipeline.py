@@ -184,27 +184,48 @@ def translate_text(text: str) -> str:
     return '\n\n'.join(translated_chunks)
 
 
-def generate_summary(text: str) -> str:
-    """Schritt 4: Erstellt eine lernorientierte Zusammenfassung."""
-    print("--- Schritt 4: Erstelle lernorientierte Zusammenfassung (via Gemini 2.5 Pro) ---")
+def split_into_level1_chapters(text: str) -> list:
+    """
+    Splittet den Markdown-Text an Level-1-Überschriften.
+    Jeder Eintrag: {'heading': str, 'full_text': str} (full_text enthält die # Überschrift + alle Unterabschnitte).
+    """
+    chapters = []
+    current_heading = None
+    current_lines = []
 
+    for line in text.split('\n'):
+        if re.match(r'^# ', line):
+            if current_heading is not None:
+                chapters.append({'heading': current_heading, 'full_text': '\n'.join(current_lines)})
+            current_heading = line[2:].strip()
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+    if current_heading is not None:
+        chapters.append({'heading': current_heading, 'full_text': '\n'.join(current_lines)})
+
+    return chapters
+
+
+def _summarize_single_chapter(heading: str, chapter_text: str) -> str:
+    """Erstellt eine lernorientierte Zusammenfassung für ein einzelnes Kapitel."""
     prompt = (
-        "Erstelle eine lernorientierte Zusammenfassung zum nachfolgenden Text, der nach 'Inhalt:' kommt.\n\n"
-        "Anforderungen:\n"
-        "Alle zentralen Konzepte enthalten\n"
-        "Keine Beispiele entfernen, wenn sie zum Verständnis nötig sind\n"
-        "Definitionen vollständig übernehmen\n"
-        "Studienergebnisse erhalten\n"
-        "Keine neuen Informationen ergänzen\n"
-        "Struktur des Originals beibehalten (wichtig! Auch alle Unterkapitel, es darf keines fehlen! Die Gliederungsstruktur muss 100% erhalten bleiben)\n"
-        "Möglichst kurz und stichpunktartig. Maximal 40 % der ursprünglichen Länge (wichtig!)\n"
-        "Es darf aber nicht zu kurz sein, es muss alles vorhanden sein was in Prüfungsfragen vorkommen könnte (sehr wichtig!)\n"
-        "Berücksichtige Abbildungen im Text und erläutere diese kurz.\n\n"
-        "Prüfe:\n"
-        "Welche Informationen aus dem Original in der Zusammenfassung fehlen\n"
-        "Welche Definitionen verloren gingen\n"
-        "Welche Einschränkungen oder Bedingungen fehlen\n\n"
-        f"Inhalt:\n{text}"
+        f"Erstelle eine lernorientierte Zusammenfassung für das folgende Kapitel: \"{heading}\"\n\n"
+        "Pflichtanforderungen:\n"
+        "1. ALLE Unterkapitel müssen vorhanden sein – kein einziges Unterkapitel darf fehlen!\n"
+        "   Behalte die genauen Überschriften inkl. Nummerierung bei (z.B. '4.1.1 Hedonisches Wohlbefinden').\n"
+        "2. Pro Unterkapitel: mindestens 3–5 Stichpunkte mit den wichtigsten Inhalten.\n"
+        "3. Studienergebnisse IMMER erhalten: Metaanalysen, Effektstärken, Befundrichtung, Autoren & Jahr.\n"
+        "4. Definitionen: wörtlich oder sehr nah am Original übernehmen.\n"
+        "5. Keine neuen Informationen ergänzen.\n"
+        "6. Abbildungen und Tabellen kurz erwähnen und ihren Inhalt beschreiben.\n"
+        "7. Stichpunkte statt Fließtext (Ausnahme: Definitionen).\n"
+        "8. Länge: maximal 40–50 % des Originals – ABER vollständige Unterkapitelabdeckung hat Vorrang vor Kürze.\n\n"
+        "Selbstprüfung (am Ende anhängen):\n"
+        "- Liste alle Unterkapitel des Originals auf\n"
+        "- Markiere fehlende Unterkapitel oder fehlende Studienergebnisse\n\n"
+        f"Kapiteltext:\n{chapter_text}"
     )
     try:
         response = call_gemini_with_retry(
@@ -214,8 +235,47 @@ def generate_summary(text: str) -> str:
         )
         return response.text
     except Exception as e:
-        print(f"Fehler bei der Generierung der Zusammenfassung: {e}")
+        print(f"Fehler bei Zusammenfassung von '{heading}': {e}")
         raise
+
+
+def generate_summary_by_chapter(text: str, out_dir: Path) -> str:
+    """
+    Schritt 4: Erstellt die Zusammenfassung kapitelweise (je Level-1-Kapitel ein API-Call).
+    Nutzt Caching pro Kapitel: zusammenfassung_kap_XX.md in out_dir.
+    Kombiniert am Ende zu zusammenfassung.md.
+    """
+    print("--- Schritt 4: Erstelle kapitelweise Zusammenfassung (via Gemini 2.5 Pro) ---")
+
+    chapters = split_into_level1_chapters(text)
+
+    if not chapters:
+        print("   Keine Level-1-Kapitel gefunden, fasse Gesamttext zusammen...")
+        fallback_path = out_dir / "zusammenfassung_kap_00.md"
+        result = load_or_run(
+            fallback_path,
+            lambda: _summarize_single_chapter("Volltext", text),
+            "Zusammenfassung (Volltext)"
+        )
+        (out_dir / "zusammenfassung.md").write_text(result, encoding="utf-8")
+        return result
+
+    summaries = []
+    for i, chapter in enumerate(chapters, 1):
+        cache_path = out_dir / f"zusammenfassung_kap_{i:02d}.md"
+        label = f"Zusammenfassung Kap. {i}: {chapter['heading'][:60]}"
+        chapter_summary = load_or_run(
+            cache_path,
+            lambda ch=chapter: _summarize_single_chapter(ch['heading'], ch['full_text']),
+            label
+        )
+        summaries.append(chapter_summary)
+        time.sleep(1)  # kurze Pause zwischen API-Calls
+
+    combined = "\n\n---\n\n".join(summaries)
+    (out_dir / "zusammenfassung.md").write_text(combined, encoding="utf-8")
+    print(f"   Zusammenfassung aus {len(chapters)} Kapiteln kombiniert.")
+    return combined
 
 
 def verify_with_questions(summary_text: str, questions_path: str) -> str:
@@ -380,6 +440,18 @@ def _set_heading_color(heading_paragraph, color: RGBColor):
         run.font.color.rgb = color
 
 
+def build_translation_word_document(translated_text: str, output_path: str):
+    """Zwischenschritt: Erstellt ein einfaches Word-Dokument aus dem übersetzten Text (kein Grau, keine Zusammenfassung)."""
+    print(f"--- Erstelle Übersetzungs-Word-Dokument -> {output_path} ---")
+    doc = Document()
+    style = doc.styles['Normal']
+    style.font.name = 'Arial'
+    style.font.size = Pt(11)
+    process_markdown_to_docx(doc, translated_text, hide_text=False)
+    doc.save(output_path)
+    print("Übersetzungs-Word-Dokument erstellt.")
+
+
 def build_interleaved_word_document(translated_text: str, summary_text: str, qa_text: str, output_path: str):
     """
     Erstellt ein Word-Dokument, bei dem Zusammenfassung und Originaltext
@@ -513,11 +585,25 @@ if __name__ == "__main__":
             print(f"[SKIP] Übersetzung – bereits vorhanden: {transl_path}")
             working_text = transl_path.read_text(encoding="utf-8")
 
-        # --- Schritt 4: Zusammenfassung ---
+        # --- Zwischenschritt: Übersetzung als eigenes Word-Dokument ---
+        transl_docx_path = out_dir / f"{pdf_stem}_Uebersetzung.docx"
+        if args.force or not transl_docx_path.exists():
+            build_translation_word_document(working_text, str(transl_docx_path))
+        else:
+            print(f"[SKIP] Übersetzungs-Docx – bereits vorhanden: {transl_docx_path}")
+
+        # --- Schritt 4: Zusammenfassung (kapitelweise) ---
         sum_path = out_dir / "zusammenfassung.md"
         if args.force and sum_path.exists():
             sum_path.unlink()
-        summary_result = load_or_run(sum_path, lambda: generate_summary(working_text), "Zusammenfassung")
+            for f in out_dir.glob("zusammenfassung_kap_*.md"):
+                f.unlink()
+
+        if sum_path.exists():
+            print(f"[SKIP] Zusammenfassung – bereits vorhanden: {sum_path}")
+            summary_result = sum_path.read_text(encoding="utf-8")
+        else:
+            summary_result = generate_summary_by_chapter(working_text, out_dir)
 
         # --- Schritt 5: Qualitätssicherung (optional) ---
         qa_result = "Keine Leitfragen zur Prüfung übergeben."
@@ -539,8 +625,9 @@ if __name__ == "__main__":
         build_interleaved_word_document(working_text, summary_result, qa_result, str(final_docx_path))
 
         print(f"\n=== PIPELINE ERFOLGREICH BEENDET ===")
-        print(f"Zwischenergebnisse: {out_dir}")
-        print(f"Fertiges Dokument:  {final_docx_path}")
+        print(f"Zwischenergebnisse:   {out_dir}")
+        print(f"Übersetzung (Word):   {transl_docx_path}")
+        print(f"Fertiges Lernskript:  {final_docx_path}")
 
     except Exception as e:
         print(f"\nPipeline abgebrochen wegen: {e}")
