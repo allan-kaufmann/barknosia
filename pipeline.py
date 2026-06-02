@@ -680,8 +680,9 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         heading   = section['heading']
         orig_body = section['body']
 
-        # Kapitelüberschrift (mit originaler Nummerierung)
-        h = doc.add_heading(heading, level=level)
+        # Kapitelüberschrift (mit originaler Nummerierung, Markdown-Marker entfernt)
+        clean_heading = re.sub(r'\*+', '', heading).strip()
+        h = doc.add_heading(clean_heading, level=level)
         heading_colors = {
             1: RGBColor(0x00, 0x33, 0x66),
             2: RGBColor(0x00, 0x44, 0x88),
