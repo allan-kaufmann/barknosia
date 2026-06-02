@@ -612,6 +612,28 @@ def _set_heading_color(heading_paragraph, color: RGBColor):
         run.font.color.rgb = color
 
 
+def _parent_level_from_chapter(parent_chapter: str) -> int:
+    """
+    Leitet den Heading-Level des Elternkapitels aus der Kapitelnummer ab.
+    '4.2.1.2' → 4 Punkte-getrennte Teile → Heading 5
+    Annahme: Top-Level-Kapitel (z.B. '1') sind Heading 2, da Heading 1 der Dokumenttitel ist.
+    """
+    return len(parent_chapter.split('.')) + 1
+
+
+def _prefix_chapter_number(heading_text: str, prefix: str) -> str:
+    """
+    Setzt den Elternpräfix vor die Kapitelnummer einer Überschrift.
+    '1 EINLEITUNG'  + '4.2.1.2' → '4.2.1.2.1 EINLEITUNG'
+    '4.1 Abschnitt' + '4.2.1.2' → '4.2.1.2.4.1 Abschnitt'
+    Überschriften ohne führende Zahl bleiben unverändert.
+    """
+    m = re.match(r'^(\d[\d\.]*)(.*)', heading_text.strip())
+    if m:
+        return f"{prefix}.{m.group(1)}{m.group(2)}"
+    return heading_text
+
+
 def build_translation_word_document(translated_text: str, output_path: str, base_path: str = None):
     """Zwischenschritt: Erstellt ein einfaches Word-Dokument aus dem übersetzten Text (kein Grau, keine Zusammenfassung)."""
     print(f"--- Erstelle Übersetzungs-Word-Dokument -> {output_path} ---")
@@ -625,49 +647,64 @@ def build_translation_word_document(translated_text: str, output_path: str, base
 
 
 def build_interleaved_word_document(translated_text: str, summary_text: str, qa_text: str,
-                                    output_path: str, base_path: str = None):
+                                    output_path: str, base_path: str = None,
+                                    parent_chapter: str = None, parent_level: int = None):
     """
     Erstellt ein Word-Dokument, bei dem Zusammenfassung und Originaltext
-    kapitelweise verschränkt sind. Jedes Kapitel enthält:
-      - Die Kapitelüberschrift (aus dem Originaltext, mit Nummerierung)
-      - Den Zusammenfassungstext dieses Kapitels
-      - Einen einklappbaren '▸ Originaltext'-Abschnitt (grau) mit dem Volltext
-    Bilder und Tabellen werden immer sichtbar eingefügt (base_path für relative Bildpfade).
+    kapitelweise verschränkt sind.
+
+    parent_chapter: Elternkapitel im Zieldokument, z.B. '4.2.1.2'.
+      Wenn angegeben, werden alle Kapitelnummern mit diesem Präfix versehen
+      ('1 EINLEITUNG' → '4.2.1.2.1 EINLEITUNG') und Heading-Level entsprechend
+      verschoben. 'Lernskript'-Titel und QA-Block werden dann weggelassen.
+    parent_level:   Heading-Level des Elternkapitels (Standard: aus parent_chapter
+      automatisch berechnet, z.B. '4.2.1.2' → 5).
     """
     print(f"--- Erstelle interleaved Word-Dokument -> {output_path} ---")
 
+    # Elternkapitel-Logik
+    if parent_chapter:
+        lvl_shift = (parent_level if parent_level else _parent_level_from_chapter(parent_chapter))
+        print(f"    Einfügemodus: Präfix '{parent_chapter}', Heading-Shift +{lvl_shift}")
+    else:
+        lvl_shift = 0
+
     COLOR_ORIG_LABEL = RGBColor(0xAA, 0xAA, 0xAA)
     COLOR_SUM_LABEL  = RGBColor(0x00, 0x55, 0x22)
+    heading_colors   = {
+        1: RGBColor(0x00, 0x33, 0x66),
+        2: RGBColor(0x00, 0x44, 0x88),
+        3: RGBColor(0x33, 0x66, 0x99),
+        4: RGBColor(0x44, 0x77, 0xAA),
+    }
 
     doc = Document()
     style = doc.styles['Normal']
     style.font.name = 'Arial'
     style.font.size = Pt(11)
 
-    # --- QA-Block ---
-    if qa_text and qa_text.strip() != "Keine Leitfragen zur Prüfung übergeben.":
-        h = doc.add_heading("Qualitätsprüfung & Leitfragen-Abdeckung", level=1)
+    # --- QA-Block und Lernskript-Titel (nur im Standalone-Modus) ---
+    if not parent_chapter:
+        if qa_text and qa_text.strip() != "Keine Leitfragen zur Prüfung übergeben.":
+            h = doc.add_heading("Qualitätsprüfung & Leitfragen-Abdeckung", level=1)
+            _set_heading_color(h, RGBColor(0x00, 0x33, 0x66))
+            process_markdown_to_docx(doc, qa_text, hide_text=False, base_path=base_path)
+            doc.add_page_break()
+        h = doc.add_heading("Lernskript", level=1)
         _set_heading_color(h, RGBColor(0x00, 0x33, 0x66))
-        process_markdown_to_docx(doc, qa_text, hide_text=False, base_path=base_path)
-        doc.add_page_break()
-
-    # --- Haupttitel ---
-    h = doc.add_heading("Lernskript", level=1)
-    _set_heading_color(h, RGBColor(0x00, 0x33, 0x66))
 
     # --- Heading-Level normalisieren & Sections parsen ---
     translated_text = normalize_heading_levels(translated_text)
     summary_text    = normalize_heading_levels(summary_text)
-    orig_sections = parse_sections(translated_text)
-    sum_sections  = parse_sections(summary_text)
+    orig_sections   = parse_sections(translated_text)
+    sum_sections    = parse_sections(summary_text)
 
     # Lookup: normalisierter Heading → Zusammenfassungstext
     sum_lookup = {}
     for s in sum_sections:
         if s['heading'] == '__preamble__':
             continue
-        key = normalize_heading(s['heading'])
-        sum_lookup[key] = s['body']
+        sum_lookup[normalize_heading(s['heading'])] = s['body']
 
     # --- Interleaved Aufbau ---
     for section in orig_sections:
@@ -680,14 +717,14 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         heading   = section['heading']
         orig_body = section['body']
 
-        # Kapitelüberschrift (mit originaler Nummerierung, Markdown-Marker entfernt)
+        # Überschriftentext: Markdown-Marker + ggf. Kapitelnummer-Präfix
         clean_heading = re.sub(r'\*+', '', heading).strip()
-        h = doc.add_heading(clean_heading, level=level)
-        heading_colors = {
-            1: RGBColor(0x00, 0x33, 0x66),
-            2: RGBColor(0x00, 0x44, 0x88),
-            3: RGBColor(0x33, 0x66, 0x99),
-        }
+        if parent_chapter:
+            clean_heading = _prefix_chapter_number(clean_heading, parent_chapter)
+
+        # Heading-Level verschieben (Word max = 9)
+        display_level = min(level + lvl_shift, 9)
+        h = doc.add_heading(clean_heading, level=display_level)
         _set_heading_color(h, heading_colors.get(level, RGBColor(0x44, 0x77, 0xAA)))
 
         # Zusammenfassung für dieses Kapitel
@@ -701,8 +738,8 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
 
         # Originaltext (einklappbar via Word-Heading-Collapse)
         if orig_body.strip():
-            orig_heading_level = min(level + 1, 4)
-            h_orig = doc.add_heading("▸ Originaltext", level=orig_heading_level)
+            orig_label_level = min(level + 1 + lvl_shift, 9)
+            h_orig = doc.add_heading("▸ Originaltext", level=orig_label_level)
             _set_heading_color(h_orig, COLOR_ORIG_LABEL)
             process_markdown_to_docx(doc, orig_body, hide_text=True, base_path=base_path)
 
@@ -719,6 +756,11 @@ if __name__ == "__main__":
     parser.add_argument("pdf_path", type=str, help="Pfad zur Quell-PDF-Datei")
     parser.add_argument("--questions", type=str, default=None, help="Pfad zu den leseleitenden Fragen (optional)")
     parser.add_argument("--force", action="store_true", help="Alle Schritte neu berechnen (kein Resume)")
+    parser.add_argument("--parent-chapter", type=str, default=None,
+                        help="Elternkapitel im Zieldokument, z.B. '4.2.1.2'. "
+                             "Präfixiert alle Kapitelnummern und verschiebt Heading-Level.")
+    parser.add_argument("--parent-level", type=int, default=None,
+                        help="Heading-Level des Elternkapitels (Standard: automatisch aus --parent-chapter).")
 
     args = parser.parse_args()
     OUTPUT_BASE = "workspace/output"
@@ -797,14 +839,22 @@ if __name__ == "__main__":
                 print(f"Warnung: Fragen-Datei '{args.questions}' nicht gefunden. Überspringe QS.")
 
         # --- Word-Dokument zusammensetzen ---
-        final_docx_path = out_dir / f"{pdf_stem}_Lernskript.docx"
-        build_interleaved_word_document(working_text, summary_result, qa_result,
-                                        str(final_docx_path), base_path=str(out_dir))
+        suffix = f"_Einbetten_{args.parent_chapter.replace('.', '-')}" if args.parent_chapter else "_Lernskript"
+        final_docx_path = out_dir / f"{pdf_stem}{suffix}.docx"
+        build_interleaved_word_document(
+            working_text, summary_result, qa_result,
+            str(final_docx_path), base_path=str(out_dir),
+            parent_chapter=args.parent_chapter,
+            parent_level=args.parent_level,
+        )
 
         print(f"\n=== PIPELINE ERFOLGREICH BEENDET ===")
         print(f"Zwischenergebnisse:   {out_dir}")
         print(f"Übersetzung (Word):   {transl_docx_path}")
-        print(f"Fertiges Lernskript:  {final_docx_path}")
+        print(f"Fertiges Dokument:    {final_docx_path}")
+        if args.parent_chapter:
+            print(f"  → Einfügemodus: Kapitelpräfix '{args.parent_chapter}', "
+                  f"Heading-Shift +{args.parent_level or _parent_level_from_chapter(args.parent_chapter)}")
 
     except Exception as e:
         print(f"\nPipeline abgebrochen wegen: {e}")
