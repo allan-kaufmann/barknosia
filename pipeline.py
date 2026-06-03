@@ -10,9 +10,22 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 from docx import Document
-from docx.shared import Pt, RGBColor, Inches
+from docx.shared import Pt, RGBColor, Inches, Cm
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+
+# Heading-Farben aus MM-Skript MM_36633_AuG_SS2026
+MM_HEADING_COLORS = {
+    1: RGBColor(0xC4, 0x9A, 0x00),  # H1: dunkles Gold
+    2: RGBColor(0xFF, 0xCA, 0x08),  # H2: helles Gold
+    3: RGBColor(0xFF, 0xCA, 0x08),  # H3: helles Gold
+    4: RGBColor(0x82, 0x66, 0x00),  # H4: dunkles Amber
+    5: RGBColor(0x82, 0x66, 0x00),  # H5: dunkles Amber
+    6: RGBColor(0x82, 0x66, 0x00),  # H6: dunkles Amber
+    7: RGBColor(0x82, 0x66, 0x00),  # H7: dunkles Amber
+    8: RGBColor(0x27, 0x27, 0x27),  # H8: fast Schwarz
+    9: RGBColor(0x27, 0x27, 0x27),  # H9: fast Schwarz
+}
 
 # Lädt die Umgebungsvariablen aus der .env-Datei
 load_dotenv()
@@ -436,22 +449,53 @@ def _html_entities(text: str) -> str:
             .replace('&quot;', '"'))
 
 
-def _set_cell_text(cell, raw_text: str, bold: bool = False):
-    """Schreibt Text in eine Word-Tabellenzelle; <br> wird zu Absatzumbruch."""
-    raw_text = _html_entities(raw_text.replace('<br>', '\n'))
-    parts = raw_text.split('\n')
+def _set_cell_text(cell, raw_text: str, bold: bool = False, font_size: Pt = None):
+    """Schreibt Text in eine Word-Tabellenzelle.
+    Kopfzeilen (bold=True): <br> → Leerzeichen (kein Umbruch).
+    Datenzellen: <br> → eigener Absatz je Teil.
+    """
+    font_size = font_size or Pt(9.5)
+    raw_text = _html_entities(raw_text)
 
-    para = cell.paragraphs[0]
-    para.clear()
-    run = para.add_run(parts[0].strip())
-    run.bold = bold
-    run.font.size = Pt(9.5)
+    if bold:
+        # Kopfzeile: alle Umbrüche als Leerzeichen, einzeiliger Text
+        text = raw_text.replace('<br>', ' ').replace('\n', ' ').strip()
+        para = cell.paragraphs[0]
+        para.clear()
+        run = para.add_run(text)
+        run.bold = True
+        run.font.size = font_size
+    else:
+        raw_text = raw_text.replace('<br>', '\n')
+        parts = raw_text.split('\n')
+        para = cell.paragraphs[0]
+        para.clear()
+        run = para.add_run(parts[0].strip())
+        run.font.size = font_size
+        for part in parts[1:]:
+            para = cell.add_paragraph()
+            run = para.add_run(part.strip())
+            run.font.size = font_size
 
-    for part in parts[1:]:
-        para = cell.add_paragraph()
-        run = para.add_run(part.strip())
-        run.bold = bold
-        run.font.size = Pt(9.5)
+
+def _calc_col_widths(rows_data: list, num_cols: int) -> list:
+    """
+    Berechnet Spaltenbreiten in cm proportional zum längsten Zellinhalt je Spalte.
+    Gesamtbreite: 16 cm (A4 minus Standardränder). Mindestbreite: 1,2 cm.
+    """
+    PAGE_CM = 16.0
+    MIN_CM  = 1.2
+    max_lens = []
+    for c in range(num_cols):
+        ml = max(
+            (len(row[c].replace('<br>', ' ').replace('\n', ' ')) for row in rows_data if c < len(row)),
+            default=1
+        )
+        max_lens.append(max(ml, 1))
+    total = sum(max_lens)
+    raw = [max(PAGE_CM * ml / total, MIN_CM) for ml in max_lens]
+    scale = PAGE_CM / sum(raw)
+    return [w * scale for w in raw]
 
 
 def _shade_cell(cell, fill_hex: str):
@@ -499,12 +543,19 @@ def add_markdown_table_to_doc(doc, table_lines: list):
     table = doc.add_table(rows=num_rows, cols=num_cols)
     table.style = 'Table Grid'
 
+    # Spaltenbreiten proportional zum Inhalt setzen
+    col_widths_cm = _calc_col_widths(rows_data, num_cols)
+    font_size = Pt(8) if num_cols > 5 else Pt(9.5)
+    for ci, w_cm in enumerate(col_widths_cm):
+        for cell in table.column_cells(ci):
+            cell.width = Cm(w_cm)
+
     # Zellen befüllen
     for r_idx, row in enumerate(rows_data):
         for c_idx, cell_text in enumerate(row):
             cell = table.cell(r_idx, c_idx)
             is_header = (r_idx == 0)
-            _set_cell_text(cell, cell_text, bold=is_header)
+            _set_cell_text(cell, cell_text, bold=is_header, font_size=font_size)
             if is_header:
                 _shade_cell(cell, 'D9E2F3')
 
@@ -530,11 +581,11 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
     - base_path: Verzeichnis zur Auflösung relativer Bildpfade.
     """
     color_map = {
-        'heading1': RGBColor(0x00, 0x33, 0x66),
-        'heading2': RGBColor(0x00, 0x44, 0x88),
-        'heading3': RGBColor(0x33, 0x66, 0x99),
-        'heading4': RGBColor(0x44, 0x77, 0xAA),
-        'hidden_text': RGBColor(0xCC, 0xCC, 0xCC),
+        'heading1': MM_HEADING_COLORS[1],
+        'heading2': MM_HEADING_COLORS[2],
+        'heading3': MM_HEADING_COLORS[3],
+        'heading4': MM_HEADING_COLORS[4],
+        'hidden_text':    RGBColor(0xCC, 0xCC, 0xCC),
         'hidden_heading': RGBColor(0x99, 0x99, 0x99),
     }
 
@@ -612,6 +663,19 @@ def _set_heading_color(heading_paragraph, color: RGBColor):
         run.font.color.rgb = color
 
 
+def _advance_counter(counters: list, level: int) -> str:
+    """
+    Erhöht den Zähler für `level` (1-basiert) und setzt tiefere Ebenen zurück.
+    Gibt die kompakte Nummerierung zurück – Null-Ebenen werden übersprungen,
+    damit Ebenensprünge (z.B. level 2 → level 4) keine '0.0'-Segmente erzeugen.
+    Beispiel: counters=[4,0,0,1] → '4.1' statt '4.0.0.1'
+    """
+    counters[level - 1] += 1
+    for i in range(level, len(counters)):
+        counters[i] = 0
+    return '.'.join(str(counters[i]) for i in range(level) if counters[i] > 0)
+
+
 def _parent_level_from_chapter(parent_chapter: str) -> int:
     """
     Leitet den Heading-Level des Elternkapitels aus der Kapitelnummer ab.
@@ -671,12 +735,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
 
     COLOR_ORIG_LABEL = RGBColor(0xAA, 0xAA, 0xAA)
     COLOR_SUM_LABEL  = RGBColor(0x00, 0x55, 0x22)
-    heading_colors   = {
-        1: RGBColor(0x00, 0x33, 0x66),
-        2: RGBColor(0x00, 0x44, 0x88),
-        3: RGBColor(0x33, 0x66, 0x99),
-        4: RGBColor(0x44, 0x77, 0xAA),
-    }
+    counters = [0] * 9  # Zähler je Heading-Ebene für Auto-Nummerierung
 
     doc = Document()
     style = doc.styles['Normal']
@@ -687,11 +746,11 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     if not parent_chapter:
         if qa_text and qa_text.strip() != "Keine Leitfragen zur Prüfung übergeben.":
             h = doc.add_heading("Qualitätsprüfung & Leitfragen-Abdeckung", level=1)
-            _set_heading_color(h, RGBColor(0x00, 0x33, 0x66))
+            _set_heading_color(h, MM_HEADING_COLORS[1])
             process_markdown_to_docx(doc, qa_text, hide_text=False, base_path=base_path)
             doc.add_page_break()
         h = doc.add_heading("Lernskript", level=1)
-        _set_heading_color(h, RGBColor(0x00, 0x33, 0x66))
+        _set_heading_color(h, MM_HEADING_COLORS[1])
 
     # --- Heading-Level normalisieren & Sections parsen ---
     translated_text = normalize_heading_levels(translated_text)
@@ -717,15 +776,21 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         heading   = section['heading']
         orig_body = section['body']
 
-        # Überschriftentext: Markdown-Marker + ggf. Kapitelnummer-Präfix
+        # Überschriftentext: Markdown-Marker entfernen
         clean_heading = re.sub(r'\*+', '', heading).strip()
         if parent_chapter:
-            clean_heading = _prefix_chapter_number(clean_heading, parent_chapter)
+            if re.match(r'^\d', clean_heading):
+                # Quelle hat eigene Nummerierung → Präfix voranstellen
+                clean_heading = _prefix_chapter_number(clean_heading, parent_chapter)
+            else:
+                # Keine Nummerierung → automatisch vergeben
+                local_num = _advance_counter(counters, level)
+                clean_heading = f"{parent_chapter}.{local_num} {clean_heading}"
 
         # Heading-Level verschieben (Word max = 9)
         display_level = min(level + lvl_shift, 9)
         h = doc.add_heading(clean_heading, level=display_level)
-        _set_heading_color(h, heading_colors.get(level, RGBColor(0x44, 0x77, 0xAA)))
+        _set_heading_color(h, MM_HEADING_COLORS.get(display_level, MM_HEADING_COLORS[9]))
 
         # Zusammenfassung für dieses Kapitel
         sum_body = sum_lookup.get(normalize_heading(heading), '')
