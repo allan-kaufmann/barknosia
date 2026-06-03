@@ -438,6 +438,25 @@ def add_formatted_text(paragraph, text, default_color=None):
             run.font.color.rgb = default_color
 
 
+def _clean_unklar_cell(text: str) -> str:
+    """
+    Verbessert unleserliche OCR-Zellen: [UNKLAR: N<br>fo<br>k<br>t...]
+    Fragmente werden zusammengefügt. Kurze Fragmente (≤2 Zeichen) werden
+    direkt verbunden (Zeichen-OCR), längere mit Leerzeichen getrennt.
+    Ergebnis: kompakter [OCR: ...]-Hinweis statt seitenlanger Garbage-Spalte.
+    """
+    def rebuild(m):
+        inner = m.group(1).strip()
+        parts = [p.strip() for p in re.split(r'<br\s*/?>', inner) if p.strip()]
+        if not parts:
+            return '[unleserlich]'
+        avg_len = sum(len(p) for p in parts) / len(parts)
+        joined = ''.join(parts) if avg_len <= 2.5 else ' '.join(parts)
+        truncated = joined[:80] + ('…' if len(joined) > 80 else '')
+        return f'[OCR: {truncated}]'
+    return re.sub(r'\[UNKLAR:\s*(.*?)\]', rebuild, text, flags=re.DOTALL)
+
+
 def _html_entities(text: str) -> str:
     """Wandelt einfache HTML-Entities in Plaintext um."""
     return (text
@@ -455,6 +474,7 @@ def _set_cell_text(cell, raw_text: str, bold: bool = False, font_size: Pt = None
     Datenzellen: <br> → eigener Absatz je Teil.
     """
     font_size = font_size or Pt(9.5)
+    raw_text = _clean_unklar_cell(raw_text)
     raw_text = _html_entities(raw_text)
 
     if bold:
