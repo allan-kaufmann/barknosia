@@ -292,7 +292,7 @@ def generate_summary_by_chapter(text: str, out_dir: Path) -> str:
         summaries.append(chapter_summary)
         time.sleep(1)  # kurze Pause zwischen API-Calls
 
-    combined = "\n\n---\n\n".join(summaries)
+    combined = "\n\n".join(summaries)
     (out_dir / "zusammenfassung.md").write_text(combined, encoding="utf-8")
     print(f"   Zusammenfassung aus {len(chapters)} Kapiteln kombiniert.")
     return combined
@@ -593,19 +593,34 @@ def add_markdown_table_to_doc(doc, table_lines: list):
     doc.add_paragraph()  # Abstand nach Tabelle
 
 
+_CAPTION_RE = re.compile(
+    r'^(\*\*)?(TABELLE|Tabelle|ABBILDUNG|Abbildung|TABLE|FIGURE|Figure|Abb\.|Tab\.)\b',
+    re.IGNORECASE
+)
+_HRULE_RE = re.compile(r'^-{3,}$|^\*{3,}$|^_{3,}$')
+
+
+def _hide_paragraph(p, indent_cm: float = 1.5):
+    """Setzt alle Runs eines Absatzes auf hidden + fügt Einrückung hinzu."""
+    p.paragraph_format.left_indent = Cm(indent_cm)
+    for run in p.runs:
+        run.font.hidden = True
+
+
 def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
     """
     Interpretiert Markdown und fügt Inhalte dem Word-Dokument hinzu.
-    - Tabellen und Bilder werden IMMER sichtbar eingefügt (nie ausgeblendet).
-    - hide_text blendet normalen Text und Überschriften grau aus.
-    - base_path: Verzeichnis zur Auflösung relativer Bildpfade.
+    - Tabellen und Bilder: IMMER sichtbar (nie ausgeblendet).
+    - Abbildungs-/Tabellenbeschriftungen: sichtbar, auch wenn hide_text=True.
+    - hide_text=True: Text wird hidden (nicht druckbar) + eingerückt; grau für Sichtbarkeit.
+    - Horizontale Linien (---) werden übersprungen.
     """
     color_map = {
         'heading1': MM_HEADING_COLORS[1],
         'heading2': MM_HEADING_COLORS[2],
         'heading3': MM_HEADING_COLORS[3],
         'heading4': MM_HEADING_COLORS[4],
-        'hidden_text':    RGBColor(0xCC, 0xCC, 0xCC),
+        'hidden_text':    RGBColor(0xBB, 0xBB, 0xBB),
         'hidden_heading': RGBColor(0x99, 0x99, 0x99),
     }
 
@@ -615,7 +630,12 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
         line = lines[i]
         stripped = line.strip()
 
-        # ── Tabelle: alle aufeinanderfolgenden Pipe-Zeilen sammeln ──
+        # ── Horizontale Linie überspringen (--- / *** / ___) ──
+        if _HRULE_RE.match(stripped):
+            i += 1
+            continue
+
+        # ── Tabelle: immer sichtbar ──
         if stripped.startswith('|'):
             table_lines = []
             while i < len(lines) and lines[i].strip().startswith('|'):
@@ -624,7 +644,7 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
             add_markdown_table_to_doc(doc, table_lines)
             continue
 
-        # ── Bild: ![]() ──
+        # ── Bild: immer sichtbar ──
         img_m = re.match(r'^!\[([^\]]*)\]\(([^)]+)\)$', stripped)
         if img_m:
             img_rel = img_m.group(2)
@@ -640,40 +660,53 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
             i += 1
             continue
 
-        # ── Überschriften / Text (hide_text anwendbar) ──
         if not stripped:
             i += 1
             continue
 
+        # Abbildungs-/Tabellenbeschriftungen nie ausblenden
+        is_caption = bool(_CAPTION_RE.match(stripped))
+        do_hide = hide_text and not is_caption
+
+        # ── Überschriften ──
         if stripped.startswith('#### '):
             p = doc.add_heading(level=4)
-            color = color_map['hidden_heading'] if hide_text else color_map['heading4']
+            color = color_map['hidden_heading'] if do_hide else color_map['heading4']
             add_formatted_text(p, stripped[5:], default_color=color)
+            if do_hide:
+                _hide_paragraph(p)
         elif stripped.startswith('### '):
             p = doc.add_heading(level=3)
-            color = color_map['hidden_heading'] if hide_text else color_map['heading3']
+            color = color_map['hidden_heading'] if do_hide else color_map['heading3']
             add_formatted_text(p, stripped[4:], default_color=color)
+            if do_hide:
+                _hide_paragraph(p)
         elif stripped.startswith('## '):
             p = doc.add_heading(level=2)
-            color = color_map['hidden_heading'] if hide_text else color_map['heading2']
+            color = color_map['hidden_heading'] if do_hide else color_map['heading2']
             add_formatted_text(p, stripped[3:], default_color=color)
+            if do_hide:
+                _hide_paragraph(p)
         elif stripped.startswith('# '):
             p = doc.add_heading(level=1)
-            color = color_map['hidden_heading'] if hide_text else color_map['heading1']
+            color = color_map['hidden_heading'] if do_hide else color_map['heading1']
             add_formatted_text(p, stripped[2:], default_color=color)
+            if do_hide:
+                _hide_paragraph(p)
+        # ── Aufzählung ──
         elif stripped.startswith('* ') or stripped.startswith('- '):
             p = doc.add_paragraph(style='List Bullet')
-            color = color_map['hidden_text'] if hide_text else None
+            color = color_map['hidden_text'] if do_hide else None
             add_formatted_text(p, stripped[2:], default_color=color)
-            if hide_text and p.runs:
-                p.runs[0].font.size = Pt(9.5)
+            if do_hide:
+                _hide_paragraph(p)
+        # ── Normaler Text ──
         else:
             p = doc.add_paragraph()
-            color = color_map['hidden_text'] if hide_text else None
+            color = color_map['hidden_text'] if do_hide else None
             add_formatted_text(p, line, default_color=color)
-            if hide_text:
-                for run in p.runs:
-                    run.font.size = Pt(9.5)
+            if do_hide:
+                _hide_paragraph(p)
         i += 1
 
 
@@ -681,6 +714,21 @@ def _set_heading_color(heading_paragraph, color: RGBColor):
     """Setzt die Schriftfarbe aller Runs einer Überschrift."""
     for run in heading_paragraph.runs:
         run.font.color.rgb = color
+
+
+# Überschriften, die standardmäßig übersprungen werden (Referenzen etc.)
+_SKIP_HEADINGS = frozenset([
+    'referenzen', 'literaturverzeichnis', 'references', 'bibliography',
+    'literatur', 'quellen', 'quellenverzeichnis', 'endnoten', 'endnotes',
+    'orcid', 'interessenkonflikt', 'conflict of interest',
+    'erklärung zur datenverfügbarkeit', 'data availability statement',
+    'danksagung', 'acknowledgments', 'kontrollliste',
+])
+
+def _is_skip_heading(heading: str) -> bool:
+    """Gibt True zurück, wenn diese Überschrift standardmäßig übersprungen werden soll."""
+    key = normalize_heading(heading)
+    return key in _SKIP_HEADINGS
 
 
 def _advance_counter(counters: list, level: int) -> str:
@@ -732,7 +780,8 @@ def build_translation_word_document(translated_text: str, output_path: str, base
 
 def build_interleaved_word_document(translated_text: str, summary_text: str, qa_text: str,
                                     output_path: str, base_path: str = None,
-                                    parent_chapter: str = None, parent_level: int = None):
+                                    parent_chapter: str = None, parent_level: int = None,
+                                    skip_references: bool = True):
     """
     Erstellt ein Word-Dokument, bei dem Zusammenfassung und Originaltext
     kapitelweise verschränkt sind.
@@ -753,8 +802,6 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     else:
         lvl_shift = 0
 
-    COLOR_ORIG_LABEL = RGBColor(0xAA, 0xAA, 0xAA)
-    COLOR_SUM_LABEL  = RGBColor(0x00, 0x55, 0x22)
     counters = [0] * 9  # Zähler je Heading-Ebene für Auto-Nummerierung
 
     doc = Document()
@@ -786,7 +833,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         sum_lookup[normalize_heading(s['heading'])] = s['body']
 
     # --- Interleaved Aufbau ---
-    for section in orig_sections:
+    for idx, section in enumerate(orig_sections):
         if section['heading'] == '__preamble__':
             if section['body']:
                 process_markdown_to_docx(doc, section['body'], base_path=base_path)
@@ -798,34 +845,48 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
 
         # Überschriftentext: Markdown-Marker entfernen
         clean_heading = re.sub(r'\*+', '', heading).strip()
+
+        # Referenzen und interne Sections ggf. überspringen
+        if skip_references and _is_skip_heading(clean_heading):
+            continue
+
+        # Kapitelnummer vergeben (Einbettungsmodus)
         if parent_chapter:
             if re.match(r'^\d', clean_heading):
-                # Quelle hat eigene Nummerierung → Präfix voranstellen
                 clean_heading = _prefix_chapter_number(clean_heading, parent_chapter)
             else:
-                # Keine Nummerierung → automatisch vergeben
                 local_num = _advance_counter(counters, level)
                 clean_heading = f"{parent_chapter}.{local_num} {clean_heading}"
 
-        # Heading-Level verschieben (Word max = 9)
-        display_level = min(level + lvl_shift, 9)
-        h = doc.add_heading(clean_heading, level=display_level)
-        _set_heading_color(h, MM_HEADING_COLORS.get(display_level, MM_HEADING_COLORS[9]))
+        # Heading-Level: aus der Kapitelnummer ableiten (korrekte Einrückung)
+        if parent_chapter:
+            num_m = re.match(r'^([\d.]+)\b', clean_heading)
+            display_level = min(len(num_m.group(1).split('.')) + 1, 9) if num_m else min(level + lvl_shift, 9)
+        else:
+            display_level = level  # Standalone: originale Ebene
 
         # Zusammenfassung für dieses Kapitel
         sum_body = sum_lookup.get(normalize_heading(heading), '')
+
+        # Leere Blatt-Kapitel überspringen (kein Inhalt, keine Unterkapitel)
+        has_children = (
+            idx + 1 < len(orig_sections) and
+            orig_sections[idx + 1]['heading'] != '__preamble__' and
+            orig_sections[idx + 1]['level'] > level
+        )
+        if not sum_body.strip() and not orig_body.strip() and not has_children:
+            continue
+
+        # Kapitelüberschrift
+        h = doc.add_heading(clean_heading, level=display_level)
+        _set_heading_color(h, MM_HEADING_COLORS.get(display_level, MM_HEADING_COLORS[9]))
+
+        # Zusammenfassungstext (ohne Label)
         if sum_body.strip():
-            p = doc.add_paragraph()
-            run = p.add_run("Zusammenfassung")
-            run.bold = True
-            run.font.color.rgb = COLOR_SUM_LABEL
             process_markdown_to_docx(doc, sum_body, hide_text=False, base_path=base_path)
 
-        # Originaltext (einklappbar via Word-Heading-Collapse)
+        # Originaltext: hidden (nicht druckbar) + eingerückt, kein Gliederungspunkt
         if orig_body.strip():
-            orig_label_level = min(level + 1 + lvl_shift, 9)
-            h_orig = doc.add_heading("▸ Originaltext", level=orig_label_level)
-            _set_heading_color(h_orig, COLOR_ORIG_LABEL)
             process_markdown_to_docx(doc, orig_body, hide_text=True, base_path=base_path)
 
     doc.save(output_path)
@@ -846,6 +907,8 @@ if __name__ == "__main__":
                              "Präfixiert alle Kapitelnummern und verschiebt Heading-Level.")
     parser.add_argument("--parent-level", type=int, default=None,
                         help="Heading-Level des Elternkapitels (Standard: automatisch aus --parent-chapter).")
+    parser.add_argument("--include-references", action="store_true",
+                        help="Referenzen, Literaturverzeichnis etc. einbeziehen (Standard: werden übersprungen).")
 
     args = parser.parse_args()
     OUTPUT_BASE = "workspace/output"
@@ -931,6 +994,7 @@ if __name__ == "__main__":
             str(final_docx_path), base_path=str(out_dir),
             parent_chapter=args.parent_chapter,
             parent_level=args.parent_level,
+            skip_references=not args.include_references,
         )
 
         print(f"\n=== PIPELINE ERFOLGREICH BEENDET ===")
