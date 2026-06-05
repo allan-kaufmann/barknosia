@@ -206,12 +206,16 @@ def parse_qa_response(qa_text: str) -> list:
     return items
 
 
-def _add_word_comment(paragraph, comment_text: str, comment_id: int):
-    """Fügt einem Absatz commentRangeStart/End + commentReference hinzu (XML-Ebene)."""
-    p_elem = paragraph._p
+def _add_comment_range_start(paragraph, comment_id: int):
+    """Setzt w:commentRangeStart als erstes Kind eines Absatzes."""
     crs = OxmlElement('w:commentRangeStart')
     crs.set(qn('w:id'), str(comment_id))
-    p_elem.insert(0, crs)
+    paragraph._p.insert(0, crs)
+
+
+def _add_comment_range_end(paragraph, comment_id: int):
+    """Setzt w:commentRangeEnd + w:commentReference ans Ende eines Absatzes."""
+    p_elem = paragraph._p
     cre = OxmlElement('w:commentRangeEnd')
     cre.set(qn('w:id'), str(comment_id))
     p_elem.append(cre)
@@ -578,10 +582,14 @@ def normalize_heading_levels(text: str) -> str:
 
 
 def add_formatted_text(paragraph, text, default_color=None):
-    """Parse Markdown-Fettungen (**text**) und Kursive (*text*) und füge sie als Word-Runs hinzu."""
-    parts = re.split(r'(\*\*[^*]+?\*\*|\*[^*]+?\*)', text)
+    """Parse Markdown: ***bold+italic***, **bold**, *italic*."""
+    parts = re.split(r'(\*{3}[^*]+?\*{3}|\*{2}[^*]+?\*{2}|\*[^*]+?\*)', text)
     for part in parts:
-        if part.startswith('**') and part.endswith('**') and len(part) > 4:
+        if part.startswith('***') and part.endswith('***') and len(part) > 6:
+            run = paragraph.add_run(part[3:-3])
+            run.bold = True
+            run.italic = True
+        elif part.startswith('**') and part.endswith('**') and len(part) > 4:
             run = paragraph.add_run(part[2:-2])
             run.bold = True
         elif part.startswith('*') and part.endswith('*') and len(part) > 2:
@@ -838,7 +846,7 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
         is_caption = bool(_CAPTION_RE.match(stripped))
         do_hide = hide_text and not is_caption
 
-        # ── Sub-Bullets (2+ führende Leerzeichen) ──
+        # ── Sub-Bullets (2+ führende Leerzeichen, Strich/Stern) ──
         sub_m = re.match(r'^(\s{2,})([-*])\s+(.+)', line)
         if sub_m:
             depth = len(sub_m.group(1)) // 2
@@ -846,6 +854,20 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
             p = doc.add_paragraph(style=style)
             color = color_map['hidden_text'] if do_hide else None
             add_formatted_text(p, sub_m.group(3), default_color=color)
+            p.paragraph_format.space_after = Pt(0)
+            if do_hide:
+                _hide_paragraph(p)
+            i += 1
+            continue
+
+        # ── Nummerierte Sub-Items (2+ führende Leerzeichen + Zahl) ──
+        num_sub_m = re.match(r'^(\s{2,})(\d+)[.)]\s+(.+)', line)
+        if num_sub_m:
+            depth = len(num_sub_m.group(1)) // 2
+            style = 'List Bullet 3' if depth >= 2 else 'List Bullet 2'
+            p = doc.add_paragraph(style=style)
+            color = color_map['hidden_text'] if do_hide else None
+            add_formatted_text(p, num_sub_m.group(3), default_color=color)
             p.paragraph_format.space_after = Pt(0)
             if do_hide:
                 _hide_paragraph(p)
@@ -879,10 +901,13 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
                 _hide_paragraph(p)
         # ── Aufzählung ──
         elif stripped.startswith('* ') or stripped.startswith('- '):
-            p = doc.add_paragraph(style='List Bullet')
-            color = color_map['hidden_text'] if do_hide else None
             bullet_m = re.match(r'^[*-]\s+(.*)', stripped)
             bullet_content = bullet_m.group(1) if bullet_m else stripped[2:]
+            if not bullet_content.strip():
+                i += 1
+                continue
+            p = doc.add_paragraph(style='List Bullet')
+            color = color_map['hidden_text'] if do_hide else None
             add_formatted_text(p, bullet_content, default_color=color)
             p.paragraph_format.space_after = Pt(0)
             if do_hide:
@@ -1085,8 +1110,9 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             process_markdown_to_docx(doc, sum_body, hide_text=False, base_path=base_path)
             new_paras = doc.paragraphs[before:]
             first_para = next((p for p in new_paras if p.text.strip()), None)
+            last_para  = next((p for p in reversed(new_paras) if p.text.strip()), first_para)
 
-            # Word-Kommentar setzen wenn diese Section Textgrundlage einer Lernfrage ist
+            # Word-Kommentar über gesamte Sektion wenn diese Textgrundlage einer Lernfrage ist
             if first_para and textgrundlage_map:
                 # lookup_key = pre-Präfix-Heading, passend zu QA-Textgrundlage-Referenzen
                 match_keys = [lookup_key]
@@ -1101,7 +1127,8 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                     cid = comment_id[0]
                     comment_id[0] += 1
                     ctext = ', '.join(f'Frage {n}' for n in q_nums)
-                    _add_word_comment(first_para, ctext, cid)
+                    _add_comment_range_start(first_para, cid)
+                    _add_comment_range_end(last_para, cid)
                     comment_list.append((cid, ctext))
 
         if orig_body.strip():
