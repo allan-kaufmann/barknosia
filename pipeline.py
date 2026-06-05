@@ -12,6 +12,7 @@ from google.genai.errors import APIError
 from lxml import etree
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches, Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx.opc.part import Part
@@ -747,9 +748,10 @@ def add_markdown_table_to_doc(doc, table_lines: list):
 
 def _clean_for_hidden(text: str) -> str:
     """Bereinigt Markdown-Text für den Hidden-Originaltext-Block.
-    Entfernt Links, HTML-Tags, Seitenreferenzen und andere OCR-Artefakte."""
-    text = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', text)  # [Text](url) → Text
-    text = re.sub(r'<[^>]+>', '', text)                    # HTML-Tags entfernen
+    Entfernt Links, HTML-Tags, Seitenreferenzen und andere OCR-Artefakte.
+    Bilder (![]()) bleiben erhalten."""
+    text = re.sub(r'(?<!!)\[([^\]]*)\]\([^)]*\)', r'\1', text)  # [Text](url) → Text (nicht Bilder)
+    text = re.sub(r'<[^>]+>', '', text)                          # HTML-Tags entfernen
     text = re.sub(r'^\[\d+\]\s*$', '', text, flags=re.MULTILINE)  # [1] allein → weg
     return text
 
@@ -883,8 +885,9 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
         # ── Normaler Text ──
         else:
             p = doc.add_paragraph()
+            p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             color = color_map['hidden_text'] if do_hide else None
-            add_formatted_text(p, line, default_color=color)
+            add_formatted_text(p, stripped, default_color=color)
             if do_hide:
                 _hide_paragraph(p)
         i += 1
@@ -953,6 +956,7 @@ def build_translation_word_document(translated_text: str, output_path: str, base
     style = doc.styles['Normal']
     style.font.name = 'Arial'
     style.font.size = Pt(11)
+    style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     process_markdown_to_docx(doc, normalize_heading_levels(translated_text), hide_text=False, base_path=base_path)
     doc.save(output_path)
     print("Übersetzungs-Word-Dokument erstellt.")
@@ -1002,6 +1006,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     style = doc.styles['Normal']
     style.font.name = 'Arial'
     style.font.size = Pt(11)
+    style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
     # --- Lernskript-Titel (Standalone-Modus) ---
     if not parent_chapter:
@@ -1033,6 +1038,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         orig_body = section['body']
 
         clean_heading = _clean_heading_text(heading)
+        lookup_key = normalize_heading(clean_heading)  # vor Präfix-Addition für Lookups
 
         if skip_references and _is_skip_heading(clean_heading):
             continue
@@ -1050,7 +1056,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         else:
             display_level = level
 
-        sum_body = sum_lookup.get(normalize_heading(heading), '')
+        sum_body = sum_lookup.get(lookup_key, '')
 
         has_children = (
             idx + 1 < len(orig_sections) and
@@ -1072,10 +1078,9 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
 
             # Word-Kommentar setzen wenn diese Section Textgrundlage einer Lernfrage ist
             if first_para and textgrundlage_map:
-                norm_clean = normalize_heading(clean_heading)
-                # Prüfe clean_heading und auch nur den letzten Teil
-                match_keys = [norm_clean]
-                last_part = re.sub(r'^[\d.]+\s*', '', clean_heading).lower().strip()
+                # lookup_key = pre-Präfix-Heading, passend zu QA-Textgrundlage-Referenzen
+                match_keys = [lookup_key]
+                last_part = re.sub(r'^[\d.]+\s*', '', lookup_key).strip()
                 if last_part:
                     match_keys.append(last_part)
                 q_nums = []
