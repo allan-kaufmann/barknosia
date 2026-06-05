@@ -578,12 +578,15 @@ def normalize_heading_levels(text: str) -> str:
 
 
 def add_formatted_text(paragraph, text, default_color=None):
-    """Parse Markdown-Fettungen (**text**) und füge sie als Word-Runs hinzu."""
-    parts = re.split(r'(\*\*.*?\*\*)', text)
+    """Parse Markdown-Fettungen (**text**) und Kursive (*text*) und füge sie als Word-Runs hinzu."""
+    parts = re.split(r'(\*\*[^*]+?\*\*|\*[^*]+?\*)', text)
     for part in parts:
-        if part.startswith('**') and part.endswith('**'):
+        if part.startswith('**') and part.endswith('**') and len(part) > 4:
             run = paragraph.add_run(part[2:-2])
             run.bold = True
+        elif part.startswith('*') and part.endswith('*') and len(part) > 2:
+            run = paragraph.add_run(part[1:-1])
+            run.italic = True
         else:
             run = paragraph.add_run(part)
 
@@ -878,7 +881,9 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
         elif stripped.startswith('* ') or stripped.startswith('- '):
             p = doc.add_paragraph(style='List Bullet')
             color = color_map['hidden_text'] if do_hide else None
-            add_formatted_text(p, stripped[2:], default_color=color)
+            bullet_m = re.match(r'^[*-]\s+(.*)', stripped)
+            bullet_content = bullet_m.group(1) if bullet_m else stripped[2:]
+            add_formatted_text(p, bullet_content, default_color=color)
             p.paragraph_format.space_after = Pt(0)
             if do_hide:
                 _hide_paragraph(p)
@@ -965,7 +970,8 @@ def build_translation_word_document(translated_text: str, output_path: str, base
 def build_interleaved_word_document(translated_text: str, summary_text: str, qa_text: str,
                                     output_path: str, base_path: str = None,
                                     parent_chapter: str = None, parent_level: int = None,
-                                    skip_references: bool = True):
+                                    skip_references: bool = True,
+                                    questions_path: str = None):
     """
     Erstellt ein Word-Dokument, bei dem Zusammenfassung und Originaltext
     kapitelweise verschränkt sind.
@@ -1057,14 +1063,18 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             display_level = level
 
         sum_body = sum_lookup.get(lookup_key, '')
+        originally_numbered = bool(re.match(r'^\d', lookup_key))
 
         has_children = (
             idx + 1 < len(orig_sections) and
             orig_sections[idx + 1]['heading'] != '__preamble__' and
             orig_sections[idx + 1]['level'] > level
         )
-        if not sum_body.strip() and not orig_body.strip() and not has_children:
-            continue
+        if not sum_body.strip() and not has_children:
+            if not originally_numbered:
+                continue  # Nicht-nummerierte Sections (Beispiel, Exkurs etc.) ohne Summary weglassen
+            if not orig_body.strip():
+                continue  # Nummerierte leere Sections ebenfalls weglassen
 
         h = doc.add_heading(clean_heading, level=display_level)
         _set_heading_color(h, MM_HEADING_COLORS.get(display_level, MM_HEADING_COLORS[9]))
@@ -1097,6 +1107,15 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         if orig_body.strip():
             process_markdown_to_docx(doc, orig_body, hide_text=True, base_path=base_path)
 
+    # --- Fragentext laden (optional) ---
+    questions_map: dict = {}
+    if questions_path and os.path.exists(questions_path):
+        with open(questions_path, encoding='utf-8') as qf:
+            for line in qf:
+                qm = re.match(r'^(\d+)\.\s+(.+)', line.strip())
+                if qm:
+                    questions_map[int(qm.group(1))] = qm.group(2)
+
     # --- QA-Unterkapitel am Dokumentende ---
     if has_qa and qa_items:
         if parent_chapter:
@@ -1119,6 +1138,14 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                 fq_hdg = f"Frage {item['num']}"
             h_f = doc.add_heading(fq_hdg, level=q_sub_level)
             _set_heading_color(h_f, MM_HEADING_COLORS.get(q_sub_level, MM_HEADING_COLORS[9]))
+
+            # Fragetext anzeigen wenn verfügbar
+            q_text = questions_map.get(item['num'])
+            if q_text:
+                p_q = doc.add_paragraph()
+                r_q = p_q.add_run(q_text)
+                r_q.bold = True
+                r_q.italic = True
 
             doc.add_paragraph(item['antwort'])
 
@@ -1248,6 +1275,7 @@ if __name__ == "__main__":
             parent_chapter=args.parent_chapter,
             parent_level=args.parent_level,
             skip_references=not args.include_references,
+            questions_path=args.questions,
         )
 
         print(f"\n=== PIPELINE ERFOLGREICH BEENDET ===")
