@@ -112,10 +112,19 @@ def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
         raise FileNotFoundError("Marker hat den Prozess beendet, aber es wurde keine .md-Datei gefunden.")
 
 
+def _clean_heading_text(line: str) -> str:
+    """Extrahiert reinen Text einer Markdown-Überschrift (ohne HTML, Links, Bold-Marker, #)."""
+    text = re.sub(r'<[^>]+>', '', line)                    # HTML-Tags (<span ...>) entfernen
+    text = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', text)  # [Text](url) → Text
+    text = re.sub(r'\*+', '', text)                        # **bold** → text
+    text = re.sub(r'^#+\s*', '', text)                     # führende # entfernen
+    return text.strip()
+
+
 def extract_chapter(text: str, chapter_id: str) -> str:
     """
     Extrahiert ein bestimmtes Kapitel (inkl. aller Unterkapitel) aus einem Markdown-Text.
-    chapter_id: z.B. '4.2' — sucht die erste Überschrift, die mit '4.2 ' oder '4.2.' beginnt.
+    chapter_id: z.B. '4.2' oder '1' — robuste Erkennung auch bei HTML-Tags in Überschriften.
     Extraktion endet bei der nächsten Überschrift gleicher/höherer Ebene die kein Unterkapitel ist.
     """
     escaped = re.escape(chapter_id)
@@ -124,15 +133,18 @@ def extract_chapter(text: str, chapter_id: str) -> str:
     heading_level = None
 
     for i, line in enumerate(lines):
-        m = re.match(rf'^(#{{1,6}})\s+\*?\*?{escaped}\b', line)
+        m = re.match(r'^(#{1,6})\s', line)
         if m:
-            start_idx = i
-            heading_level = len(m.group(1))
-            break
+            clean = _clean_heading_text(line)
+            # Exakter Match: "1 Titel" oder "1" allein — NICHT "1.1" oder "11"
+            if re.match(rf'^{escaped}(\s|$)', clean):
+                start_idx = i
+                heading_level = len(m.group(1))
+                break
 
     if start_idx is None:
-        raise ValueError(f"Kapitel '{chapter_id}' wurde nicht im Markdown gefunden. "
-                         f"Verfügbare Überschriften prüfen.")
+        raise ValueError(f"Kapitel '{chapter_id}' nicht im Markdown gefunden. "
+                         f"Tipp: --chapter mit exakter Nummer angeben (z.B. '1' oder '4.2').")
 
     result = []
     for i, line in enumerate(lines):
@@ -141,9 +153,10 @@ def extract_chapter(text: str, chapter_id: str) -> str:
         if i > start_idx:
             m2 = re.match(r'^(#{1,6})\s', line)
             if m2 and len(m2.group(1)) <= heading_level:
-                content = line.lstrip('#').strip().lstrip('*').strip()
-                if not re.match(rf'^{escaped}\.', content):
-                    break  # Ende des Kapitels
+                clean2 = _clean_heading_text(line)
+                # Ende wenn kein Unterkapitel (d.h. beginnt nicht mit chapter_id.)
+                if not re.match(rf'^{escaped}\.', clean2):
+                    break
         result.append(line)
 
     extracted = '\n'.join(result)
@@ -732,6 +745,15 @@ def add_markdown_table_to_doc(doc, table_lines: list):
     doc.add_paragraph()  # Abstand nach Tabelle
 
 
+def _clean_for_hidden(text: str) -> str:
+    """Bereinigt Markdown-Text für den Hidden-Originaltext-Block.
+    Entfernt Links, HTML-Tags, Seitenreferenzen und andere OCR-Artefakte."""
+    text = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', text)  # [Text](url) → Text
+    text = re.sub(r'<[^>]+>', '', text)                    # HTML-Tags entfernen
+    text = re.sub(r'^\[\d+\]\s*$', '', text, flags=re.MULTILINE)  # [1] allein → weg
+    return text
+
+
 _CAPTION_RE = re.compile(
     r'^(\*\*)?(TABELLE|Tabelle|ABBILDUNG|Abbildung|TABLE|FIGURE|Figure|Abb\.|Tab\.)\b',
     re.IGNORECASE
@@ -763,6 +785,10 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
         'hidden_heading': RGBColor(0x99, 0x99, 0x99),
     }
 
+    # Im Hidden-Block: Links, HTML und OCR-Artefakte bereinigen
+    if hide_text:
+        block_text = _clean_for_hidden(block_text)
+
     lines = block_text.split('\n')
     i = 0
     while i < len(lines):
@@ -774,13 +800,22 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
             i += 1
             continue
 
-        # ── Tabelle: immer sichtbar ──
+        # ── Tabelle ──
         if stripped.startswith('|'):
             table_lines = []
             while i < len(lines) and lines[i].strip().startswith('|'):
                 table_lines.append(lines[i].strip())
                 i += 1
-            add_markdown_table_to_doc(doc, table_lines)
+            if not hide_text:
+                add_markdown_table_to_doc(doc, table_lines)
+            else:
+                # Im Hidden-Block: nur Platzhalter, keine echte Tabelle
+                p = doc.add_paragraph('[Tabelle]')
+                p.paragraph_format.left_indent = Cm(1.5)
+                for run in p.runs:
+                    run.font.hidden = True
+                    run.font.color.rgb = RGBColor(0xBB, 0xBB, 0xBB)
+                    run.font.size = Pt(8)
             continue
 
         # ── Bild: immer sichtbar ──
@@ -806,6 +841,20 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
         # Abbildungs-/Tabellenbeschriftungen nie ausblenden
         is_caption = bool(_CAPTION_RE.match(stripped))
         do_hide = hide_text and not is_caption
+
+        # ── Sub-Bullets (2+ führende Leerzeichen) ──
+        sub_m = re.match(r'^(\s{2,})([-*])\s+(.+)', line)
+        if sub_m:
+            depth = len(sub_m.group(1)) // 2
+            style = 'List Bullet 3' if depth >= 2 else 'List Bullet 2'
+            p = doc.add_paragraph(style=style)
+            color = color_map['hidden_text'] if do_hide else None
+            add_formatted_text(p, sub_m.group(3), default_color=color)
+            p.paragraph_format.space_after = Pt(0)
+            if do_hide:
+                _hide_paragraph(p)
+            i += 1
+            continue
 
         # ── Überschriften ──
         if stripped.startswith('#### '):
@@ -837,6 +886,7 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
             p = doc.add_paragraph(style='List Bullet')
             color = color_map['hidden_text'] if do_hide else None
             add_formatted_text(p, stripped[2:], default_color=color)
+            p.paragraph_format.space_after = Pt(0)
             if do_hide:
                 _hide_paragraph(p)
         # ── Normaler Text ──
