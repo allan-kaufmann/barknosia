@@ -172,7 +172,7 @@ def parse_qa_response(qa_text: str) -> list:
     """
     items = []
     # Splitten an "Frage N" Zeilen
-    blocks = re.split(r'(?m)^(?:##\s*)?Frage\s+(\d+)\s*$', qa_text)
+    blocks = re.split(r'(?m)^\*{0,2}(?:##\s*)?Frage\s+(\d+)\*{0,2}:?\s*$', qa_text)
     # blocks[0] = text vor Frage 1, dann abwechselnd: Fragenummer, Frageblock
     i = 1
     while i < len(blocks) - 1:
@@ -806,16 +806,7 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
             while i < len(lines) and lines[i].strip().startswith('|'):
                 table_lines.append(lines[i].strip())
                 i += 1
-            if not hide_text:
-                add_markdown_table_to_doc(doc, table_lines)
-            else:
-                # Im Hidden-Block: nur Platzhalter, keine echte Tabelle
-                p = doc.add_paragraph('[Tabelle]')
-                p.paragraph_format.left_indent = Cm(1.5)
-                for run in p.runs:
-                    run.font.hidden = True
-                    run.font.color.rgb = RGBColor(0xBB, 0xBB, 0xBB)
-                    run.font.size = Pt(8)
+            add_markdown_table_to_doc(doc, table_lines)
             continue
 
         # ── Bild: immer sichtbar ──
@@ -1041,7 +1032,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         heading   = section['heading']
         orig_body = section['body']
 
-        clean_heading = re.sub(r'\*+', '', heading).strip()
+        clean_heading = _clean_heading_text(heading)
 
         if skip_references and _is_skip_heading(clean_heading):
             continue
