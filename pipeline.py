@@ -9,10 +9,13 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
+from lxml import etree
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches, Cm
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+from docx.opc.part import Part
+from docx.opc.packuri import PackURI
 
 # Heading-Farben aus MM-Skript MM_36633_AuG_SS2026
 MM_HEADING_COLORS = {
@@ -107,6 +110,142 @@ def run_marker_ocr(input_pdf_path: str, output_dir: str) -> str:
         if found_md_files:
             return str(found_md_files[0])
         raise FileNotFoundError("Marker hat den Prozess beendet, aber es wurde keine .md-Datei gefunden.")
+
+
+def extract_chapter(text: str, chapter_id: str) -> str:
+    """
+    Extrahiert ein bestimmtes Kapitel (inkl. aller Unterkapitel) aus einem Markdown-Text.
+    chapter_id: z.B. '4.2' — sucht die erste Überschrift, die mit '4.2 ' oder '4.2.' beginnt.
+    Extraktion endet bei der nächsten Überschrift gleicher/höherer Ebene die kein Unterkapitel ist.
+    """
+    escaped = re.escape(chapter_id)
+    lines = text.split('\n')
+    start_idx = None
+    heading_level = None
+
+    for i, line in enumerate(lines):
+        m = re.match(rf'^(#{{1,6}})\s+\*?\*?{escaped}\b', line)
+        if m:
+            start_idx = i
+            heading_level = len(m.group(1))
+            break
+
+    if start_idx is None:
+        raise ValueError(f"Kapitel '{chapter_id}' wurde nicht im Markdown gefunden. "
+                         f"Verfügbare Überschriften prüfen.")
+
+    result = []
+    for i, line in enumerate(lines):
+        if i < start_idx:
+            continue
+        if i > start_idx:
+            m2 = re.match(r'^(#{1,6})\s', line)
+            if m2 and len(m2.group(1)) <= heading_level:
+                content = line.lstrip('#').strip().lstrip('*').strip()
+                if not re.match(rf'^{escaped}\.', content):
+                    break  # Ende des Kapitels
+        result.append(line)
+
+    extracted = '\n'.join(result)
+    print(f"[KAPITEL] '{chapter_id}' extrahiert: {len(result)} Zeilen, {len(extracted)} Zeichen")
+    return extracted
+
+
+def parse_qa_response(qa_text: str) -> list:
+    """
+    Parst den strukturierten QA-Output von verify_with_questions().
+    Gibt eine Liste von Dicts zurück:
+      [{'num': 1, 'antwort': '...', 'textgrundlage': '...', 'schluessel': '...', 'abdeckung': '...'}, ...]
+    """
+    items = []
+    # Splitten an "Frage N" Zeilen
+    blocks = re.split(r'(?m)^(?:##\s*)?Frage\s+(\d+)\s*$', qa_text)
+    # blocks[0] = text vor Frage 1, dann abwechselnd: Fragenummer, Frageblock
+    i = 1
+    while i < len(blocks) - 1:
+        num_str = blocks[i].strip()
+        block = blocks[i + 1]
+        i += 2
+        try:
+            num = int(num_str)
+        except ValueError:
+            continue
+
+        def _extract(pattern, text, default='–'):
+            m = re.search(pattern, text, re.MULTILINE | re.DOTALL)
+            if m:
+                return m.group(1).strip().split('\n')[0].strip()
+            return default
+
+        antwort     = _extract(r'^Antwort:\s*(.+?)(?=\n(?:Textgrundlage|Schlüsselbegriffe|Abdeckung|$))', block)
+        textgr      = _extract(r'^Textgrundlage:\s*(.+)', block)
+        schluessel  = _extract(r'^Schlüsselbegriffe:\s*(.+)', block)
+        abdeckung   = _extract(r'^Abdeckung:\s*(.+)', block)
+
+        items.append({
+            'num': num,
+            'antwort': antwort,
+            'textgrundlage': textgr,
+            'schluessel': schluessel,
+            'abdeckung': abdeckung,
+        })
+    return items
+
+
+def _add_word_comment(paragraph, comment_text: str, comment_id: int):
+    """Fügt einem Absatz commentRangeStart/End + commentReference hinzu (XML-Ebene)."""
+    p_elem = paragraph._p
+    crs = OxmlElement('w:commentRangeStart')
+    crs.set(qn('w:id'), str(comment_id))
+    p_elem.insert(0, crs)
+    cre = OxmlElement('w:commentRangeEnd')
+    cre.set(qn('w:id'), str(comment_id))
+    p_elem.append(cre)
+    run = OxmlElement('w:r')
+    rpr = OxmlElement('w:rPr')
+    rs = OxmlElement('w:rStyle')
+    rs.set(qn('w:val'), 'CommentReference')
+    rpr.append(rs)
+    run.append(rpr)
+    ref = OxmlElement('w:commentReference')
+    ref.set(qn('w:id'), str(comment_id))
+    run.append(ref)
+    p_elem.append(run)
+
+
+def _inject_comments_part(doc, comments_list: list):
+    """
+    Erstellt word/comments.xml und registriert es im OPC-Package.
+    comments_list: [(id: int, text: str), ...]
+    Muss VOR doc.save() aufgerufen werden.
+    """
+    WURI  = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    CT    = 'application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml'
+    RT    = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments'
+    WDATE = '2024-01-01T00:00:00Z'
+
+    root = etree.Element(f'{{{WURI}}}comments',
+                         nsmap={'w': WURI,
+                                'wpc': 'http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas',
+                                'r':   'http://schemas.openxmlformats.org/officeDocument/2006/relationships'})
+    for cid, text in comments_list:
+        c = etree.SubElement(root, f'{{{WURI}}}comment')
+        c.set(f'{{{WURI}}}id',       str(cid))
+        c.set(f'{{{WURI}}}author',   'Lernfragen')
+        c.set(f'{{{WURI}}}date',     WDATE)
+        c.set(f'{{{WURI}}}initials', 'LF')
+        p = etree.SubElement(c, f'{{{WURI}}}p')
+        r = etree.SubElement(p, f'{{{WURI}}}r')
+        t = etree.SubElement(r, f'{{{WURI}}}t')
+        t.text = text
+
+    xml_bytes = etree.tostring(root, xml_declaration=True, encoding='UTF-8', standalone=True)
+    try:
+        part = Part(PackURI('/word/comments.xml'), CT, xml_bytes, doc.part.package)
+        doc.part.relate_to(part, RT)
+        print(f"   Word-Kommentare: {len(comments_list)} eingebettet")
+    except Exception as e:
+        print(f"   Kommentare konnten nicht eingebettet werden: {e}")
 
 
 def check_if_english(text: str) -> bool:
@@ -804,18 +943,27 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
 
     counters = [0] * 9  # Zähler je Heading-Ebene für Auto-Nummerierung
 
+    # --- QA vorbereiten: Textgrundlage-Map für Kommentare ---
+    has_qa = qa_text and qa_text.strip() not in ("", "Keine Leitfragen zur Prüfung übergeben.")
+    qa_items = parse_qa_response(qa_text) if has_qa else []
+    textgrundlage_map: dict = {}  # normalize_heading(textgrundlage) → [fragenummern]
+    for item in qa_items:
+        for key in [normalize_heading(item['textgrundlage']),
+                    normalize_heading(item['textgrundlage'].split('.')[-1])]:
+            textgrundlage_map.setdefault(key, [])
+            if item['num'] not in textgrundlage_map[key]:
+                textgrundlage_map[key].append(item['num'])
+
+    comment_list: list = []   # [(comment_id, comment_text)]
+    comment_id: list  = [0]  # mutable int-wrapper
+
     doc = Document()
     style = doc.styles['Normal']
     style.font.name = 'Arial'
     style.font.size = Pt(11)
 
-    # --- QA-Block und Lernskript-Titel (nur im Standalone-Modus) ---
+    # --- Lernskript-Titel (Standalone-Modus) ---
     if not parent_chapter:
-        if qa_text and qa_text.strip() != "Keine Leitfragen zur Prüfung übergeben.":
-            h = doc.add_heading("Qualitätsprüfung & Leitfragen-Abdeckung", level=1)
-            _set_heading_color(h, MM_HEADING_COLORS[1])
-            process_markdown_to_docx(doc, qa_text, hide_text=False, base_path=base_path)
-            doc.add_page_break()
         h = doc.add_heading("Lernskript", level=1)
         _set_heading_color(h, MM_HEADING_COLORS[1])
 
@@ -843,14 +991,11 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         heading   = section['heading']
         orig_body = section['body']
 
-        # Überschriftentext: Markdown-Marker entfernen
         clean_heading = re.sub(r'\*+', '', heading).strip()
 
-        # Referenzen und interne Sections ggf. überspringen
         if skip_references and _is_skip_heading(clean_heading):
             continue
 
-        # Kapitelnummer vergeben (Einbettungsmodus)
         if parent_chapter:
             if re.match(r'^\d', clean_heading):
                 clean_heading = _prefix_chapter_number(clean_heading, parent_chapter)
@@ -858,17 +1003,14 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                 local_num = _advance_counter(counters, level)
                 clean_heading = f"{parent_chapter}.{local_num} {clean_heading}"
 
-        # Heading-Level: aus der Kapitelnummer ableiten (korrekte Einrückung)
         if parent_chapter:
             num_m = re.match(r'^([\d.]+)\b', clean_heading)
             display_level = min(len(num_m.group(1).split('.')) + 1, 9) if num_m else min(level + lvl_shift, 9)
         else:
-            display_level = level  # Standalone: originale Ebene
+            display_level = level
 
-        # Zusammenfassung für dieses Kapitel
         sum_body = sum_lookup.get(normalize_heading(heading), '')
 
-        # Leere Blatt-Kapitel überspringen (kein Inhalt, keine Unterkapitel)
         has_children = (
             idx + 1 < len(orig_sections) and
             orig_sections[idx + 1]['heading'] != '__preamble__' and
@@ -877,20 +1019,77 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         if not sum_body.strip() and not orig_body.strip() and not has_children:
             continue
 
-        # Kapitelüberschrift
         h = doc.add_heading(clean_heading, level=display_level)
         _set_heading_color(h, MM_HEADING_COLORS.get(display_level, MM_HEADING_COLORS[9]))
 
-        # Zusammenfassungstext (ohne Label)
+        # Zusammenfassung + Kommentar-Erkennung
         if sum_body.strip():
+            before = len(doc.paragraphs)
             process_markdown_to_docx(doc, sum_body, hide_text=False, base_path=base_path)
+            new_paras = doc.paragraphs[before:]
+            first_para = next((p for p in new_paras if p.text.strip()), None)
 
-        # Originaltext: hidden (nicht druckbar) + eingerückt, kein Gliederungspunkt
+            # Word-Kommentar setzen wenn diese Section Textgrundlage einer Lernfrage ist
+            if first_para and textgrundlage_map:
+                norm_clean = normalize_heading(clean_heading)
+                # Prüfe clean_heading und auch nur den letzten Teil
+                match_keys = [norm_clean]
+                last_part = re.sub(r'^[\d.]+\s*', '', clean_heading).lower().strip()
+                if last_part:
+                    match_keys.append(last_part)
+                q_nums = []
+                for k in match_keys:
+                    q_nums.extend(textgrundlage_map.get(k, []))
+                q_nums = sorted(set(q_nums))
+                if q_nums:
+                    cid = comment_id[0]
+                    comment_id[0] += 1
+                    ctext = ', '.join(f'Frage {n}' for n in q_nums)
+                    _add_word_comment(first_para, ctext, cid)
+                    comment_list.append((cid, ctext))
+
         if orig_body.strip():
             process_markdown_to_docx(doc, orig_body, hide_text=True, base_path=base_path)
 
+    # --- QA-Unterkapitel am Dokumentende ---
+    if has_qa and qa_items:
+        if parent_chapter:
+            qa_top_num = counters[0] + 1
+            qa_hdg_text = f"{parent_chapter}.{qa_top_num} Lernfragen"
+            qa_level    = min(lvl_shift + 1, 9)
+            q_sub_level = min(lvl_shift + 2, 9)
+        else:
+            qa_hdg_text = "Lernfragen"
+            qa_level    = 1
+            q_sub_level = 2
+
+        h = doc.add_heading(qa_hdg_text, level=qa_level)
+        _set_heading_color(h, MM_HEADING_COLORS.get(qa_level, MM_HEADING_COLORS[9]))
+
+        for item in qa_items:
+            if parent_chapter:
+                fq_hdg = f"{parent_chapter}.{qa_top_num}.{item['num']} Frage {item['num']}"
+            else:
+                fq_hdg = f"Frage {item['num']}"
+            h_f = doc.add_heading(fq_hdg, level=q_sub_level)
+            _set_heading_color(h_f, MM_HEADING_COLORS.get(q_sub_level, MM_HEADING_COLORS[9]))
+
+            doc.add_paragraph(item['antwort'])
+
+            meta = doc.add_paragraph()
+            r = meta.add_run(
+                f"Quelle: {item['textgrundlage']}  |  "
+                f"Schlüsselbegriffe: {item['schluessel']}  |  "
+                f"Abdeckung: {item['abdeckung']}"
+            )
+            r.font.size = Pt(9)
+            r.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+
+    # --- Kommentare einbetten und speichern ---
+    if comment_list:
+        _inject_comments_part(doc, comment_list)
     doc.save(output_path)
-    print("Word-Dokument erfolgreich erstellt.")
+    print(f"Word-Dokument erstellt ({len(comment_list)} Kommentare).")
 
 
 # ---------------------------------------------------------------------------
@@ -909,6 +1108,10 @@ if __name__ == "__main__":
                         help="Heading-Level des Elternkapitels (Standard: automatisch aus --parent-chapter).")
     parser.add_argument("--include-references", action="store_true",
                         help="Referenzen, Literaturverzeichnis etc. einbeziehen (Standard: werden übersprungen).")
+    parser.add_argument("--chapter", type=str, default=None,
+                        help="Nur dieses Kapitel extrahieren, z.B. '4.2' oder '3'. "
+                             "Sucht im OCR-Markdown nach der Überschrift und extrahiert das Kapitel "
+                             "inkl. aller Unterkapitel bis zur nächsten gleichrangigen Überschrift.")
 
     args = parser.parse_args()
     OUTPUT_BASE = "workspace/output"
@@ -933,6 +1136,10 @@ if __name__ == "__main__":
             print(f"[SKIP] OCR – Markdown bereits vorhanden: {md_path}")
 
         raw_md = md_path.read_text(encoding="utf-8")
+
+        # --- Schritt 1b: Kapitel-Filter (optional) ---
+        if args.chapter:
+            raw_md = extract_chapter(raw_md, args.chapter)
 
         # --- Schritt 2: Sprache prüfen & Übersetzen ---
         transl_path = out_dir / "de_uebersetzung.md"
