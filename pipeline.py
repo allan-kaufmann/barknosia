@@ -916,6 +916,22 @@ def _image_display_width(img_path: str, max_in: float = 5.5, assumed_dpi: int = 
     return Inches(max_in)
 
 
+def _is_decorative_image(img_path: str, min_px: int = 100) -> bool:
+    """True wenn das Bild wahrscheinlich dekorativ ist (Icon, Logo, Randsymbol).
+    Kriterium: kleinste Seite < min_px Pixel → dekorativ, nicht einbetten.
+    Fallback ohne PIL: Dateigröße < 8 KB."""
+    try:
+        from PIL import Image as _PILImage
+        with _PILImage.open(img_path) as im:
+            return min(im.width, im.height) < min_px
+    except Exception:
+        pass
+    try:
+        return os.path.getsize(img_path) < 8 * 1024
+    except Exception:
+        return False
+
+
 _CAPTION_RE = re.compile(
     r'^(\*\*)?(TABELLE|Tabelle|ABBILDUNG|Abbildung|TABLE|FIGURE|Figure|Abb\.|Tab\.)\b',
     re.IGNORECASE
@@ -989,7 +1005,7 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None,
             add_markdown_table_to_doc(doc, table_lines)
             continue
 
-        # ── Bild: immer sichtbar (außer wenn skip_images=True) ──
+        # ── Bild: immer sichtbar (außer wenn skip_images=True oder dekorativ) ──
         img_m = re.match(r'^!\[([^\]]*)\]\(([^)]+)\)$', stripped)
         if img_m:
             if skip_images:
@@ -998,6 +1014,10 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None,
             img_rel = img_m.group(2)
             img_path = os.path.join(base_path, img_rel) if base_path else img_rel
             if os.path.exists(img_path):
+                if _is_decorative_image(img_path):
+                    # Icons, Logos, Randsymbole überspringen
+                    i += 1
+                    continue
                 try:
                     doc.add_picture(img_path, width=_image_display_width(img_path))
                     doc.add_paragraph()
@@ -1311,7 +1331,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     for idx, section in enumerate(orig_sections):
         if section['heading'] == '__preamble__':
             if section['body']:
-                process_markdown_to_docx(doc, section['body'], base_path=base_path, skip_images=True)
+                process_markdown_to_docx(doc, section['body'], base_path=base_path)
             continue
 
         level     = section['level']
@@ -1386,7 +1406,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         if sum_body.strip():
             before = len(doc.paragraphs)
             process_markdown_to_docx(doc, sum_body, hide_text=False, base_path=base_path,
-                                     skip_images=True, headings_as_bold=True)
+                                     headings_as_bold=True)
             new_paras = doc.paragraphs[before:]
             first_para = next((p for p in new_paras if p.text.strip()), None)
             last_para  = next((p for p in reversed(new_paras) if p.text.strip()), first_para)
@@ -1411,7 +1431,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                     comment_list.append((cid, ctext))
 
         if orig_body.strip():
-            process_markdown_to_docx(doc, orig_body, hide_text=True, base_path=base_path, skip_images=True)
+            process_markdown_to_docx(doc, orig_body, hide_text=True, base_path=base_path)
 
     # --- Fragentext laden (optional) ---
     questions_map: dict = {}
