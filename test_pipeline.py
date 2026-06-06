@@ -29,6 +29,7 @@ from pipeline import (
     _hide_paragraph,
     add_markdown_table_to_doc,
     _set_cell_text,
+    _strip_ocr_y_prefix,
 )
 
 
@@ -724,3 +725,59 @@ def test_process_markdown_headings_default_uses_heading_style():
     assert len(paras) >= 1
     assert 'Heading' in paras[0].style.name or paras[0].style.name.startswith('berschrift'), \
         f"Erwartet Heading-Style, erhalten: {paras[0].style.name}"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 22: _strip_ocr_y_prefix – Headings
+# ---------------------------------------------------------------------------
+
+def test_strip_y_prefix_heading():
+    """'## y **Titel**' → '## **Titel**' (y-Präfix entfernt)."""
+    text = "## y **Woran erkenne ich das?**"
+    result = _strip_ocr_y_prefix(text)
+    assert result == "## **Woran erkenne ich das?**"
+
+
+def test_strip_y_prefix_all_heading_levels():
+    """y-Präfix wird bei allen Heading-Levels (# bis ######) entfernt."""
+    for level in range(1, 7):
+        hashes = '#' * level
+        text = f"{hashes} y Titel"
+        result = _strip_ocr_y_prefix(text)
+        assert result == f"{hashes} Titel", f"Fehler bei Level {level}: {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 23: _strip_ocr_y_prefix – Bullets und Sonderfälle
+# ---------------------------------------------------------------------------
+
+def test_strip_y_prefix_bullet():
+    """'- y Inhalt' → '- Inhalt' (y-Präfix bei Bullet-Items entfernt)."""
+    text = "- y erfasst neue Situationen"
+    result = _strip_ocr_y_prefix(text)
+    assert result == "- erfasst neue Situationen"
+
+
+def test_strip_y_prefix_no_false_positive_word():
+    """'- young person' bleibt unverändert (y ist Teil eines Wortes, kein isoliertes Präfix)."""
+    text = "- young person"
+    result = _strip_ocr_y_prefix(text)
+    assert result == "- young person"
+
+
+def test_strip_y_prefix_regular_text_unchanged():
+    """Fließtext mit 'y' bleibt unverändert (kein Heading/Bullet-Präfix)."""
+    text = "Das Wort yesterday enthält y, aber das ist kein Präfix."
+    result = _strip_ocr_y_prefix(text)
+    assert result == text
+
+
+def test_strip_y_prefix_multiline():
+    """Mehrere Zeilen: nur Zeilen mit y-Präfix werden bereinigt."""
+    text = "## y Kapitel\nNormaler Text mit y drin.\n- y Bullet\n- Normales Bullet"
+    result = _strip_ocr_y_prefix(text)
+    lines = result.split('\n')
+    assert lines[0] == "## Kapitel"
+    assert lines[1] == "Normaler Text mit y drin."
+    assert lines[2] == "- Bullet"
+    assert lines[3] == "- Normales Bullet"

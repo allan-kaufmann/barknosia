@@ -884,6 +884,38 @@ def _compress_heading_levels(text: str) -> str:
     return '\n'.join(result)
 
 
+def _strip_ocr_y_prefix(text: str) -> str:
+    """Entfernt isoliertes 'y '-Präfix aus Headings und Bullet-Items.
+    OCR-Artefakt: Sonderzeichen (Bullet-Pfeil) einer Sonderzeichenschrift wird als 'y' gelesen."""
+    lines = []
+    for line in text.split('\n'):
+        line = re.sub(r'^(#{1,6}\s+)y\s+', r'\1', line)   # ## y **Titel** → ## **Titel**
+        line = re.sub(r'^([-*]\s+)y\s+', r'\1', line)      # - y Text → - Text
+        lines.append(line)
+    return '\n'.join(lines)
+
+
+def _image_display_width(img_path: str, max_in: float = 5.5, assumed_dpi: int = 150):
+    """Berechnet Anzeigebreite: min(natürliche Bildbreite, max_in).
+    Nutzt PIL/Pillow falls verfügbar; andernfalls Dateigröße als Heuristik."""
+    try:
+        from PIL import Image as _PILImage
+        with _PILImage.open(img_path) as im:
+            natural_in = im.width / assumed_dpi
+            return Inches(min(natural_in, max_in))
+    except Exception:
+        pass
+    try:
+        kb = os.path.getsize(img_path) / 1024
+        if kb < 10:
+            return Inches(1.5)
+        if kb < 50:
+            return Inches(3.0)
+    except Exception:
+        pass
+    return Inches(max_in)
+
+
 _CAPTION_RE = re.compile(
     r'^(\*\*)?(TABELLE|Tabelle|ABBILDUNG|Abbildung|TABLE|FIGURE|Figure|Abb\.|Tab\.)\b',
     re.IGNORECASE
@@ -967,7 +999,7 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None,
             img_path = os.path.join(base_path, img_rel) if base_path else img_rel
             if os.path.exists(img_path):
                 try:
-                    doc.add_picture(img_path, width=Inches(5.5))
+                    doc.add_picture(img_path, width=_image_display_width(img_path))
                     doc.add_paragraph()
                 except Exception:
                     doc.add_paragraph(f"[Bild nicht eingebettet: {img_rel}]")
@@ -1150,6 +1182,7 @@ def build_translation_word_document(translated_text: str, output_path: str, base
 
     text = _strip_kontrollliste(translated_text)
     text = normalize_heading_levels(text)
+    text = _strip_ocr_y_prefix(text)
     text = _compress_heading_levels(text)
     sections = parse_sections(text)
 
@@ -1241,7 +1274,9 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
 
     # --- Heading-Level normalisieren & Sections parsen ---
     translated_text = normalize_heading_levels(translated_text)
+    translated_text = _strip_ocr_y_prefix(translated_text)
     summary_text    = normalize_heading_levels(summary_text)
+    summary_text    = _strip_ocr_y_prefix(summary_text)
     orig_sections   = parse_sections(translated_text)
     sum_sections    = parse_sections(summary_text)
 
@@ -1468,7 +1503,7 @@ if __name__ == "__main__":
 
         # --- Zwischenschritt: Übersetzung als eigenes Word-Dokument ---
         kap_infix = f"_kap{chapter_safe}" if chapter_safe else ""
-        transl_docx_path = cache_dir / f"{pdf_stem}{kap_infix}_Uebersetzung.docx"
+        transl_docx_path = Path(OUTPUT_BASE) / f"{pdf_stem}{kap_infix}_Uebersetzung.docx"
         if args.force or not transl_docx_path.exists():
             build_translation_word_document(working_text, str(transl_docx_path), base_path=str(out_dir))
         else:
@@ -1510,7 +1545,7 @@ if __name__ == "__main__":
 
         # --- Word-Dokument zusammensetzen ---
         suffix = f"_Einbetten_{args.parent_chapter.replace('.', '-')}" if args.parent_chapter else "_Lernskript"
-        final_docx_path = cache_dir / f"{pdf_stem}{kap_infix}{suffix}.docx"
+        final_docx_path = Path(OUTPUT_BASE) / f"{pdf_stem}{kap_infix}{suffix}.docx"
         build_interleaved_word_document(
             working_text, summary_result, qa_result,
             str(final_docx_path), base_path=str(out_dir),
