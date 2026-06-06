@@ -1294,6 +1294,19 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         if s['heading'] != '__preamble__'
     )
 
+    # Häufigkeit unnummerierter Überschriften zählen.
+    # Einzigartige (freq=1) sind echte Kapitelthemen (z.B. "Agilität", "Analytisches Denken").
+    # Wiederkehrende (freq>1) sind Frage-Muster unter jedem Unterkapitel ("Was ist das?").
+    _unnumbered_freq: dict[str, int] = {}
+    for _s in orig_sections:
+        if _s['heading'] == '__preamble__':
+            continue
+        _k = normalize_heading(_clean_heading_text(_s['heading']))
+        if not re.match(r'^\d', _k):
+            _unnumbered_freq[_k] = _unnumbered_freq.get(_k, 0) + 1
+    _auto_parent: str | None = None  # z. B. "5.3" – aktuelles nummeriertes Elternkapitel
+    _auto_counter: int = 0
+
     # --- Interleaved Aufbau ---
     for idx, section in enumerate(orig_sections):
         if section['heading'] == '__preamble__':
@@ -1327,6 +1340,21 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         sum_body = sum_lookup.get(lookup_key, '')
         originally_numbered = bool(re.match(r'^\d', lookup_key))
 
+        # Auto-Nummerierung: einzigartige unnummerierte Überschriften (freq=1) nach einem
+        # nummerierten Kapitel erhalten automatisch eine Unterkapitelnummer (z.B. 5.3.1).
+        # Wiederkehrende Überschriften ("Was ist das?" etc.) bleiben unnummeriert.
+        if has_numbered_chapters:
+            if originally_numbered:
+                _m = re.match(r'^([\d.]+)', lookup_key)
+                _auto_parent = _m.group(1) if _m else None
+                _auto_counter = 0
+            elif _auto_parent is not None and _unnumbered_freq.get(lookup_key, 0) == 1:
+                _auto_counter += 1
+                clean_heading = f"{_auto_parent}.{_auto_counter} {clean_heading}"
+                originally_numbered = True
+                _dots = clean_heading.split()[0].count('.')
+                display_level = min(_dots + 1, 9)
+
         _next_sec = orig_sections[idx + 1] if idx + 1 < len(orig_sections) else None
         _next_is_unnumbered = (
             _next_sec is not None and
@@ -1338,10 +1366,9 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             _next_sec['heading'] != '__preamble__' and
             (_next_sec['level'] > level or _next_is_unnumbered)
         )
-        # Unnummerierte Sections ohne Summary: immer überspringen.
-        # has_children wird bewusst ignoriert – ein "tieferes" nummeriertes Nachbar-Kapitel
-        # (z. B. 4.3.2 auf H4 nach "• Einordnung" auf H3) ist kein echtes Kind.
-        if not originally_numbered and not sum_body.strip():
+        # Unnummerierte Sections ohne Summary UND ohne Originaltext überspringen.
+        # Originaltext (orig_body) bleibt erhalten, z. B. Kompetenzdefinitionen unter "Was ist das?".
+        if not originally_numbered and not sum_body.strip() and not orig_body.strip():
             continue
         # Nummerierte leere Sections ohne Kinder/Body ebenfalls weglassen
         if originally_numbered and not sum_body.strip() and not has_children and not orig_body.strip():

@@ -874,3 +874,50 @@ def test_numbered_section_not_skipped_when_followed_by_unnumbered():
     assert heading_para is not None, "5.3 Überblick soll nicht übersprungen werden (has_children via unnummerierte Folgesektion)"
     assert 'Heading' in heading_para.style.name or heading_para.style.name.startswith('berschrift'), \
         f"5.3 soll Heading-Style haben, erhalten: {heading_para.style.name!r}"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 26: Auto-Nummerierung einzigartiger Unterkapitel + Skip-Fix für Orig-Body
+# ---------------------------------------------------------------------------
+
+def test_auto_numbering_unique_heading_gets_number_and_nav():
+    """Einzigartige unnummerierte Überschrift nach numm. Kapitel → auto 5.3.1, in Nav."""
+    orig_md = "## 5.3 Überblick\n\n## Agilität\n\nAgilität ist die Fähigkeit..."
+    sum_md = "## Agilität\n\nZusammenfassung Agilität."
+    paras = _run_interleaved(orig_md, sum_md)
+    heading_para = next((p for p in paras if "5.3.1" in p.text and "Agilität" in p.text), None)
+    assert heading_para is not None, "Einzigartige Überschrift soll als '5.3.1 Agilität' erscheinen"
+    assert 'Heading' in heading_para.style.name or heading_para.style.name.startswith('berschrift'), \
+        f"Auto-nummerierte Überschrift soll Heading-Style haben, erhalten: {heading_para.style.name!r}"
+
+
+def test_auto_numbering_recurring_heading_stays_bold_not_nav():
+    """Wiederkehrende unnummerierte Überschrift → Normal+Bold, keine Auto-Nummerierung."""
+    orig_md = (
+        "## 5.3 Überblick\n\n"
+        "## Agilität\n\n"
+        "## Was ist das?\n\nDefinition Agilität.\n\n"
+        "## Analytisches Denken\n\n"
+        "## Was ist das?\n\nDefinition Analytik."
+    )
+    sum_md = "## Agilität\n\nAgilität-Zusammenfassung.\n\n## Analytisches Denken\n\nAnalytik-Zusammenfassung."
+    paras = _run_interleaved(orig_md, sum_md)
+    # "Was ist das?" erscheint mehr als einmal → nicht auto-nummeriert, kein Heading-Style
+    was_paras = [p for p in paras if "Was ist das?" in p.text]
+    assert len(was_paras) >= 1, "Mindestens eine 'Was ist das?'-Überschrift soll im Dokument erscheinen"
+    for wp in was_paras:
+        assert wp.style.name == 'Normal', \
+            f"'Was ist das?' soll Normal-Style haben (wiederkehrend), erhalten: {wp.style.name!r}"
+
+
+def test_unnumbered_section_with_orig_body_not_skipped():
+    """Unnummerierte Section mit Originaltext aber ohne Summary erscheint im Dokument."""
+    orig_md = (
+        "## 5.3 Überblick\n\n"
+        "## Was ist das?\n\nDefinition hier vorhanden.\n\n"
+        "## Was ist das?\n\nNoch eine Definition."
+    )
+    sum_md = ""  # kein Summary
+    paras = _run_interleaved(orig_md, sum_md)
+    body_para = next((p for p in paras if "Definition hier vorhanden" in p.text), None)
+    assert body_para is not None, "Abschnitt mit orig_body soll nicht übersprungen werden, auch ohne Summary"
