@@ -1377,7 +1377,8 @@ if __name__ == "__main__":
             working_text = transl_path.read_text(encoding="utf-8")
 
         # --- Zwischenschritt: Übersetzung als eigenes Word-Dokument ---
-        transl_docx_path = cache_dir / f"{pdf_stem}_Uebersetzung.docx"
+        kap_infix = f"_kap{chapter_safe}" if chapter_safe else ""
+        transl_docx_path = cache_dir / f"{pdf_stem}{kap_infix}_Uebersetzung.docx"
         if args.force or not transl_docx_path.exists():
             build_translation_word_document(working_text, str(transl_docx_path), base_path=str(out_dir))
         else:
@@ -1419,7 +1420,7 @@ if __name__ == "__main__":
 
         # --- Word-Dokument zusammensetzen ---
         suffix = f"_Einbetten_{args.parent_chapter.replace('.', '-')}" if args.parent_chapter else "_Lernskript"
-        final_docx_path = cache_dir / f"{pdf_stem}{suffix}.docx"
+        final_docx_path = cache_dir / f"{pdf_stem}{kap_infix}{suffix}.docx"
         build_interleaved_word_document(
             working_text, summary_result, qa_result,
             str(final_docx_path), base_path=str(out_dir),
