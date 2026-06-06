@@ -22,6 +22,9 @@ from pipeline import (
     split_into_level1_chapters,
     add_formatted_text,
     process_markdown_to_docx,
+    _strip_kontrollliste,
+    _compress_heading_levels,
+    _fix_concatenated_stats_cells,
 )
 
 
@@ -344,3 +347,147 @@ def test_split_into_level1_chapters():
     headings = [c['heading'] for c in chapters]
     assert any("1 Einleitung" in h for h in headings)
     assert any("2 Methoden" in h for h in headings)
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 7: _strip_kontrollliste
+# ---------------------------------------------------------------------------
+
+def test_strip_kontrollliste_removes_block_with_hr():
+    text = "Übersetzungstext.\n\n---\n**Kontrollliste**\n- Absätze: 5\n- Hinweise: Keine.\n\n## Kapitel 2\nWeiterer Text."
+    result = _strip_kontrollliste(text)
+    assert "Kontrollliste" not in result
+    assert "Kapitel 2" in result
+    assert "Übersetzungstext" in result
+
+
+def test_strip_kontrollliste_no_hr():
+    text = "Text.\n\n**Kontrollliste**\n- Absätze: 3\n- Hinweise: Keine.\n\n## Nächstes Kapitel\nText."
+    result = _strip_kontrollliste(text)
+    assert "Kontrollliste" not in result
+    assert "Nächstes Kapitel" in result
+
+
+def test_strip_kontrollliste_no_kontrollliste():
+    text = "# Kapitel\n\nNormaler Text ohne Kontrollliste."
+    result = _strip_kontrollliste(text)
+    assert result == text
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 8: _compress_heading_levels
+# ---------------------------------------------------------------------------
+
+def test_compress_heading_levels_siblings():
+    """H1 gefolgt von drei H4-Geschwistern → H1, H2, H2, H2."""
+    md = "# Titel\n\n#### Sub A\n\n#### Sub B\n\n#### Sub C\n"
+    result = _compress_heading_levels(md)
+    lines = [l for l in result.split('\n') if l.startswith('#')]
+    assert lines[0] == '# Titel'
+    assert lines[1] == '## Sub A'
+    assert lines[2] == '## Sub B'
+    assert lines[3] == '## Sub C'
+
+
+def test_compress_heading_levels_no_change_needed():
+    """Korrekte Hierarchie bleibt unverändert."""
+    md = "# H1\n\n## H2\n\n### H3\n"
+    result = _compress_heading_levels(md)
+    assert result == md
+
+
+def test_compress_heading_levels_resets_on_new_h1():
+    """Nach einem neuen H1 wird die Mapping-Logik neu berechnet."""
+    md = "# Abschnitt A\n\n#### Sub A1\n\n# Abschnitt B\n\n#### Sub B1\n"
+    result = _compress_heading_levels(md)
+    lines = [l for l in result.split('\n') if l.startswith('#')]
+    assert lines[0] == '# Abschnitt A'
+    assert lines[1] == '## Sub A1'
+    assert lines[2] == '# Abschnitt B'
+    assert lines[3] == '## Sub B1'
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 9: _is_skip_heading Erweiterungen
+# ---------------------------------------------------------------------------
+
+def test_is_skip_heading_history():
+    assert _is_skip_heading("History") is True
+    assert _is_skip_heading("Historie") is True
+
+
+def test_is_skip_heading_author_email():
+    assert _is_skip_heading("Timo Kortsch t.kortsch@tu-bs.de") is True
+
+
+def test_is_skip_heading_msc():
+    assert _is_skip_heading("Timo Kortsch, M.Sc. Prof. Dr. Simone Kauffeld") is True
+
+
+def test_is_skip_heading_normal_not_skipped():
+    assert _is_skip_heading("Theoretischer Hintergrund") is False
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 10: process_markdown_to_docx – HTML-Stripping
+# ---------------------------------------------------------------------------
+
+def test_process_strips_sup_tags():
+    doc = Document()
+    process_markdown_to_docx(doc, "Text mit Fußnote<sup>1</sup> hier.")
+    texts = [p.text for p in doc.paragraphs]
+    combined = ' '.join(texts)
+    assert '<sup>' not in combined
+    assert 'Text mit Fußnote' in combined
+    assert '1' in combined
+
+
+def test_process_strips_span_tags():
+    doc = Document()
+    process_markdown_to_docx(doc, "Ein <span id='x'>wichtiger</span> Begriff.")
+    texts = ' '.join(p.text for p in doc.paragraphs)
+    assert '<span' not in texts
+    assert 'wichtiger' in texts
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 11: Bildfilterung in process_markdown_to_docx
+# ---------------------------------------------------------------------------
+
+def test_image_filter_skips_picture(tmp_path):
+    """Bild mit 'Picture' im Namen wird übersprungen (kein Paragraph mit Pfad)."""
+    fake_img = tmp_path / "_page_0_Picture_2.jpeg"
+    fake_img.write_bytes(b"")
+    doc = Document()
+    process_markdown_to_docx(doc, f"![]({fake_img.name})", base_path=str(tmp_path))
+    texts = ' '.join(p.text for p in doc.paragraphs)
+    assert fake_img.name not in texts
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 12: _fix_concatenated_stats_cells
+# ---------------------------------------------------------------------------
+
+def test_fix_concatenated_stats_cells_left_right_empty():
+    """Werte links und rechts leer → auf drei Spalten verteilen."""
+    rows = [['Item', 'Übersetzung', '', '3.44 1.00 .49', '']]
+    result = _fix_concatenated_stats_cells(rows)
+    assert result[0][2] == '3.44'
+    assert result[0][3] == '1.00'
+    assert result[0][4] == '.49'
+
+
+def test_fix_concatenated_stats_cells_right_empty():
+    """Werte nur rechts leer → auf rechte drei Spalten verteilen."""
+    rows = [['Item', '3.44 1.00 .49', '', '']]
+    result = _fix_concatenated_stats_cells(rows)
+    assert result[0][1] == '3.44'
+    assert result[0][2] == '1.00'
+    assert result[0][3] == '.49'
+
+
+def test_fix_concatenated_stats_cells_no_change_needed():
+    """Zeile ohne OCR-Artefakt bleibt unverändert."""
+    rows = [['Item', 'Übersetzung', '3.44', '1.00', '.49']]
+    result = _fix_concatenated_stats_cells(rows)
+    assert result[0] == ['Item', 'Übersetzung', '3.44', '1.00', '.49']

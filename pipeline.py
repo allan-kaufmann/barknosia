@@ -328,12 +328,7 @@ def translate_text(text: str) -> str:
         "- Bildverweise, Tabellenverweise und Abbildungsbeschriftungen erhalten.\n"
         "- Markdown-Struktur beibehalten.\n\n"
         "Ausgabeformat:\n"
-        "1. Nur die deutsche Übersetzung.\n"
-        "2. Danach eine kurze Kontrollliste:\n"
-        "   - Anzahl erkannter Absätze im Original\n"
-        "   - Anzahl übersetzter Absätze\n"
-        "   - Hinweise auf unklare Stellen\n"
-        "   - Hinweise auf mögliche fehlende Tabellen/Bildinhalte"
+        "Nur die deutsche Übersetzung, kein Kommentar, keine Kontrollliste danach."
     )
 
     chunks = split_text_by_headings(text)
@@ -693,6 +688,28 @@ def _shade_cell(cell, fill_hex: str):
     tcPr.append(shd)
 
 
+_STATS_RE = re.compile(r'^(\d+\.\d+)\s+(\d+\.\d+)\s+(\.?\d+\.?\d*)$')
+
+def _fix_concatenated_stats_cells(rows_data: list) -> list:
+    """
+    Korrigiert OCR-Artefakt: M, SD und ritc werden manchmal in einer Zelle
+    zusammengefasst (z.B. '3.44 1.00 .49'). Wenn links und rechts der
+    betreffenden Zelle leere Nachbarzellen existieren, werden die drei Werte
+    auf die drei Zellen verteilt.
+    """
+    for row in rows_data:
+        for j in range(len(row)):
+            m = _STATS_RE.match(row[j].strip())
+            if not m:
+                continue
+            # Prüfen ob Nachbarzellen leer sind (links+rechts oder nur rechts+rechts)
+            if j >= 1 and j + 1 < len(row) and row[j - 1] == '' and row[j + 1] == '':
+                row[j - 1], row[j], row[j + 1] = m.group(1), m.group(2), m.group(3)
+            elif j + 2 < len(row) and row[j + 1] == '' and row[j + 2] == '':
+                row[j], row[j + 1], row[j + 2] = m.group(1), m.group(2), m.group(3)
+    return rows_data
+
+
 def add_markdown_table_to_doc(doc, table_lines: list):
     """
     Konvertiert eine Liste von Markdown-Pipe-Zeilen in eine Word-Tabelle.
@@ -717,12 +734,15 @@ def add_markdown_table_to_doc(doc, table_lines: list):
         return
 
     num_cols = max(len(r) for r in rows_data)
-    num_rows = len(rows_data)
 
     # Zellinhalt normieren (alle Zeilen auf gleiche Spaltenanzahl)
     for r in rows_data:
         while len(r) < num_cols:
             r.append('')
+
+    rows_data = _fix_concatenated_stats_cells(rows_data)
+    num_cols = max(len(r) for r in rows_data)
+    num_rows = len(rows_data)
 
     table = doc.add_table(rows=num_rows, cols=num_cols)
     table.style = 'Table Grid'
@@ -767,6 +787,53 @@ def _clean_for_hidden(text: str) -> str:
     return text
 
 
+def _strip_kontrollliste(text: str) -> str:
+    """Entfernt Kontrolllisten-Blöcke aus der übersetzten Markdown-Datei.
+    Muster: (optionales ---) gefolgt von **Kontrollliste** und Bullet-Zeilen."""
+    text = re.sub(
+        r'(?m)^---\s*\n\*\*Kontrollliste\*\*.*?(?=\n#{1,6}\s|\Z)',
+        '',
+        text,
+        flags=re.DOTALL
+    )
+    # Kontrollliste ohne vorangehendes ---
+    text = re.sub(
+        r'(?m)^\*\*Kontrollliste\*\*.*?(?=\n#{1,6}\s|\Z)',
+        '',
+        text,
+        flags=re.DOTALL
+    )
+    return text
+
+
+def _compress_heading_levels(text: str) -> str:
+    """
+    Korrigiert inkonsistente OCR-Heading-Ebenen.
+    Verhindert Sprünge > 1 Ebene; Geschwister-Überschriften (gleiche OCR-Ebene)
+    erhalten denselben tatsächlichen Level – kein Kaskadeneffekt.
+    """
+    ocr_to_actual: dict = {}
+    prev_actual = 0
+    result = []
+    for line in text.split('\n'):
+        m = re.match(r'^(#{1,9})\s', line)
+        if m:
+            ocr_level = len(m.group(1))
+            if ocr_level in ocr_to_actual:
+                actual = ocr_to_actual[ocr_level]
+            elif ocr_level > prev_actual + 1:
+                actual = prev_actual + 1
+                ocr_to_actual[ocr_level] = actual
+            else:
+                actual = ocr_level
+                ocr_to_actual[ocr_level] = actual
+            prev_actual = actual
+            result.append('#' * actual + line[ocr_level:])
+        else:
+            result.append(line)
+    return '\n'.join(result)
+
+
 _CAPTION_RE = re.compile(
     r'^(\*\*)?(TABELLE|Tabelle|ABBILDUNG|Abbildung|TABLE|FIGURE|Figure|Abb\.|Tab\.)\b',
     re.IGNORECASE
@@ -808,6 +875,10 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
         line = lines[i]
         stripped = line.strip()
 
+        # ── HTML-Tags aus Fließtext entfernen (außer Bildzeilen) ──
+        if not stripped.startswith('!'):
+            stripped = re.sub(r'<[^>]+>', '', stripped)
+
         # ── Horizontale Linie überspringen (--- / *** / ___) ──
         if _HRULE_RE.match(stripped):
             i += 1
@@ -822,10 +893,14 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
             add_markdown_table_to_doc(doc, table_lines)
             continue
 
-        # ── Bild: immer sichtbar ──
+        # ── Bild: immer sichtbar, außer dekorative Logo-Bilder ──
         img_m = re.match(r'^!\[([^\]]*)\]\(([^)]+)\)$', stripped)
         if img_m:
             img_rel = img_m.group(2)
+            img_lower = img_rel.lower()
+            if 'picture' in img_lower and 'figure' not in img_lower and 'abbildung' not in img_lower:
+                i += 1
+                continue  # Logo/dekoratives Bild überspringen
             img_path = os.path.join(base_path, img_rel) if base_path else img_rel
             if os.path.exists(img_path):
                 try:
@@ -936,12 +1011,17 @@ _SKIP_HEADINGS = frozenset([
     'orcid', 'interessenkonflikt', 'conflict of interest',
     'erklärung zur datenverfügbarkeit', 'data availability statement',
     'danksagung', 'acknowledgments', 'kontrollliste',
+    'history', 'historie',
 ])
+
+_SKIP_HEADING_PATTERNS = ('m.sc', 'prof. dr', '@')
 
 def _is_skip_heading(heading: str) -> bool:
     """Gibt True zurück, wenn diese Überschrift standardmäßig übersprungen werden soll."""
     key = normalize_heading(heading)
-    return key in _SKIP_HEADINGS
+    if key in _SKIP_HEADINGS:
+        return True
+    return any(pat in key for pat in _SKIP_HEADING_PATTERNS)
 
 
 def _advance_counter(counters: list, level: int) -> str:
@@ -980,14 +1060,45 @@ def _prefix_chapter_number(heading_text: str, prefix: str) -> str:
 
 
 def build_translation_word_document(translated_text: str, output_path: str, base_path: str = None):
-    """Zwischenschritt: Erstellt ein einfaches Word-Dokument aus dem übersetzten Text (kein Grau, keine Zusammenfassung)."""
+    """Erstellt ein Word-Dokument aus dem übersetzten Text.
+    Preamble (Abstract) eingerückt; Skip-Headings (Referenzen, Historie, Autor) gefiltert.
+    """
     print(f"--- Erstelle Übersetzungs-Word-Dokument -> {output_path} ---")
+
+    text = _strip_kontrollliste(translated_text)
+    text = normalize_heading_levels(text)
+    text = _compress_heading_levels(text)
+    sections = parse_sections(text)
+
     doc = Document()
     style = doc.styles['Normal']
     style.font.name = 'Arial'
     style.font.size = Pt(11)
     style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-    process_markdown_to_docx(doc, normalize_heading_levels(translated_text), hide_text=False, base_path=base_path)
+
+    for section in sections:
+        heading = section['heading']
+        body    = section['body']
+        level   = section['level']
+
+        if heading == '__preamble__':
+            if body.strip():
+                before = len(doc.paragraphs)
+                process_markdown_to_docx(doc, body, hide_text=False, base_path=base_path)
+                for p in doc.paragraphs[before:]:
+                    p.paragraph_format.left_indent = Cm(1.5)
+            continue
+
+        clean = _clean_heading_text(heading)
+        if _is_skip_heading(clean):
+            continue
+
+        h = doc.add_heading(clean, level=level)
+        _set_heading_color(h, MM_HEADING_COLORS.get(level, MM_HEADING_COLORS[9]))
+
+        if body.strip():
+            process_markdown_to_docx(doc, body, hide_text=False, base_path=base_path)
+
     doc.save(output_path)
     print("Übersetzungs-Word-Dokument erstellt.")
 
