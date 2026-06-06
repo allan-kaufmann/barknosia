@@ -1212,6 +1212,9 @@ if __name__ == "__main__":
                         help="Nur dieses Kapitel extrahieren, z.B. '4.2' oder '3'. "
                              "Sucht im OCR-Markdown nach der Überschrift und extrahiert das Kapitel "
                              "inkl. aller Unterkapitel bis zur nächsten gleichrangigen Überschrift.")
+    parser.add_argument("--no-summary", action="store_true",
+                        help="Nur Übersetzung ausgeben – keine Zusammenfassung, kein ausgeblendeter Text, "
+                             "kein interleaved-Dokument. Das Übersetzungs-Docx ist das finale Ergebnis.")
 
     args = parser.parse_args()
     OUTPUT_BASE = "workspace/output"
@@ -1264,6 +1267,12 @@ if __name__ == "__main__":
             build_translation_word_document(working_text, str(transl_docx_path), base_path=str(out_dir))
         else:
             print(f"[SKIP] Übersetzungs-Docx – bereits vorhanden: {transl_docx_path}")
+
+        if args.no_summary:
+            print(f"\n=== PIPELINE ERFOLGREICH BEENDET (nur Übersetzung) ===")
+            print(f"Zwischenergebnisse: {out_dir}")
+            print(f"Fertiges Dokument:  {transl_docx_path}")
+            sys.exit(0)
 
         # --- Schritt 4: Zusammenfassung (kapitelweise) ---
         sum_path = out_dir / "zusammenfassung.md"
