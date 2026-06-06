@@ -1334,7 +1334,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         if originally_numbered and not sum_body.strip() and not has_children and not orig_body.strip():
             continue
 
-        if originally_numbered or display_level <= 2:
+        if originally_numbered:
             h = doc.add_heading(clean_heading, level=display_level)
             _set_heading_color(h, MM_HEADING_COLORS.get(display_level, MM_HEADING_COLORS[9]))
         else:

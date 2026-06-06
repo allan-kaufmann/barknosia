@@ -834,13 +834,15 @@ def test_interleaved_numbered_heading_in_nav():
     )
 
 
-def test_interleaved_unnumbered_h2_in_nav():
-    """Unnummerierte H2-Sektion → Heading-Style (strukturelles Kapitel erscheint in Nav)."""
+def test_interleaved_unnumbered_h2_not_in_nav():
+    """Unnummerierte H2-Sektion → Normal+Bold (auch H2 unnummeriert erscheint NICHT in Nav)."""
     orig_md = "## Einführung\n\nHier steht der Originaltext."
     sum_md = "## Einführung\n\nKurze Zusammenfassung."
     paras = _run_interleaved(orig_md, sum_md)
     heading_para = next((p for p in paras if "Einführung" in p.text), None)
     assert heading_para is not None, "Überschrift 'Einführung' nicht im Dokument gefunden"
-    assert 'Heading' in heading_para.style.name or heading_para.style.name.startswith('berschrift'), (
-        f"Unnummerierte H2-Überschrift soll Heading-Style haben (display_level<=2), erhalten: {heading_para.style.name!r}"
+    assert heading_para.style.name == 'Normal', (
+        f"Unnummerierte H2-Überschrift soll Normal-Style haben (nicht in Nav), erhalten: {heading_para.style.name!r}"
     )
+    assert heading_para.runs and heading_para.runs[0].bold, \
+        "Unnummerierte Überschrift soll bold=True sein"
