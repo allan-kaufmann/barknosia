@@ -1430,8 +1430,13 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                     _add_comment_range_end(last_para, cid)
                     comment_list.append((cid, ctext))
 
-        if orig_body.strip():
-            process_markdown_to_docx(doc, orig_body, hide_text=True, base_path=base_path)
+            if orig_body.strip():
+                process_markdown_to_docx(doc, orig_body, hide_text=True, base_path=base_path)
+        else:
+            # Keine Zusammenfassung vorhanden: Originaltext sichtbar anzeigen.
+            # Kein leerer Gliederungspunkt — besser echten Inhalt zeigen als nichts.
+            if orig_body.strip():
+                process_markdown_to_docx(doc, orig_body, hide_text=False, base_path=base_path)
 
     # --- Fragentext laden (optional) ---
     questions_map: dict = {}
