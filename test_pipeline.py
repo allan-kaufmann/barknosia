@@ -30,6 +30,7 @@ from pipeline import (
     add_markdown_table_to_doc,
     _set_cell_text,
     _strip_ocr_y_prefix,
+    build_interleaved_word_document,
 )
 
 
@@ -781,3 +782,42 @@ def test_strip_y_prefix_multiline():
     assert lines[1] == "Normaler Text mit y drin."
     assert lines[2] == "- Bullet"
     assert lines[3] == "- Normales Bullet"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 24: build_interleaved_word_document – unnummerierte Headings in Nav
+# ---------------------------------------------------------------------------
+
+def test_interleaved_unnumbered_heading_not_in_nav():
+    """Unnummerierte Sektion mit Summary → Normal-Style (kein Heading), erster Run bold."""
+    orig_md = "## Was ist das?\n\nHier steht der Originaltext."
+    sum_lookup = {"Was ist das?": "Kurze Zusammenfassung des Inhalts."}
+    doc = build_interleaved_word_document(
+        translated_text=orig_md,
+        summary_text="## Was ist das?\n\nKurze Zusammenfassung des Inhalts.",
+        qa_result="",
+        output_path=None,
+    )
+    non_empty = [p for p in doc.paragraphs if p.text.strip()]
+    heading_para = non_empty[0]
+    assert heading_para.style.name == 'Normal', (
+        f"Unnummerierte Überschrift soll Normal-Style haben, erhalten: {heading_para.style.name!r}"
+    )
+    assert heading_para.runs and heading_para.runs[0].bold, \
+        "Unnummerierte Überschrift soll bold=True sein"
+
+
+def test_interleaved_numbered_heading_in_nav():
+    """Nummerierte Sektion mit Summary → Heading-Style (erscheint in Nav)."""
+    orig_md = "## 5.1 Einführung\n\nHier steht der Originaltext."
+    doc = build_interleaved_word_document(
+        translated_text=orig_md,
+        summary_text="## 5.1 Einführung\n\nKurze Zusammenfassung.",
+        qa_result="",
+        output_path=None,
+    )
+    non_empty = [p for p in doc.paragraphs if p.text.strip()]
+    heading_para = non_empty[0]
+    assert 'Heading' in heading_para.style.name or heading_para.style.name.startswith('berschrift'), (
+        f"Nummerierte Überschrift soll Heading-Style haben, erhalten: {heading_para.style.name!r}"
+    )
