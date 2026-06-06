@@ -646,10 +646,15 @@ def _set_cell_text(cell, raw_text: str, bold: bool = False, font_size: Pt = None
     """Schreibt Text in eine Word-Tabellenzelle.
     Kopfzeilen (bold=True): <br> → Leerzeichen (kein Umbruch).
     Datenzellen: <br> → eigener Absatz je Teil.
+    Bullet-Concatenation (•A•B•C) → separate Absätze je Eintrag.
     """
     font_size = font_size or Pt(9.5)
     raw_text = _clean_unklar_cell(raw_text)
     raw_text = _html_entities(raw_text)
+
+    if not bold and raw_text.count('•') > 1:
+        bullet_parts = [p.strip() for p in raw_text.split('•') if p.strip()]
+        raw_text = '\n'.join(bullet_parts)
 
     if bold:
         # Kopfzeile: alle Umbrüche als Leerzeichen, einzeiliger Text
@@ -772,6 +777,11 @@ def add_markdown_table_to_doc(doc, table_lines: list):
     num_cols = max(len(r) for r in rows_data)
     num_rows = len(rows_data)
 
+    # Titel-Zeile erkennen: Zeile 0 hat ≤1 Non-Empty-Cell bei mehreren Spalten
+    non_empty_row0 = sum(1 for c in rows_data[0] if c.strip())
+    has_title_row = (num_rows > 1 and num_cols > 1 and non_empty_row0 <= 1)
+    header_row_idx = 1 if has_title_row else 0
+
     table = doc.add_table(rows=num_rows, cols=num_cols)
     table.style = 'Table Grid'
 
@@ -786,10 +796,17 @@ def add_markdown_table_to_doc(doc, table_lines: list):
     for r_idx, row in enumerate(rows_data):
         for c_idx, cell_text in enumerate(row):
             cell = table.cell(r_idx, c_idx)
-            is_header = (r_idx == 0)
-            _set_cell_text(cell, cell_text, bold=is_header, font_size=font_size)
+            is_header = (r_idx == header_row_idx)
+            is_title  = (has_title_row and r_idx == 0)
+            _set_cell_text(cell, cell_text, bold=(is_header or is_title), font_size=font_size)
             if is_header:
                 _shade_cell(cell, 'D9E2F3')
+
+    # Titelzeile: alle Zellen in Zeile 0 zusammenführen
+    if has_title_row:
+        anchor = table.cell(0, 0)
+        for c in range(1, num_cols):
+            anchor.merge(table.cell(0, c))
 
     # Leere Zellen vertikal zusammenführen (Spanning-Simulation)
     for c in range(num_cols):
@@ -876,11 +893,14 @@ _HRULE_RE = re.compile(r'^-{3,}$|^\*{3,}$|^_{3,}$')
 
 def _hide_paragraph(p, indent_cm: float = 1.5):
     """Setzt alle Runs eines Absatzes auf hidden + fügt Einrückung hinzu.
-    Setzt w:vanish in w:pPr/w:rPr um das Aufzählungszeichen auszublenden."""
+    Entfernt w:numPr (Bullet-Label) und setzt w:vanish in w:pPr/w:rPr."""
     p.paragraph_format.left_indent = Cm(indent_cm)
     for run in p.runs:
         run.font.hidden = True
     pPr = p._p.get_or_add_pPr()
+    numPr = pPr.find(qn('w:numPr'))
+    if numPr is not None:
+        pPr.remove(numPr)
     rPr = pPr.find(qn('w:rPr'))
     if rPr is None:
         rPr = OxmlElement('w:rPr')
@@ -889,12 +909,15 @@ def _hide_paragraph(p, indent_cm: float = 1.5):
     rPr.append(vanish)
 
 
-def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None, skip_images=False):
+def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None,
+                             skip_images=False, headings_as_bold=False):
     """
     Interpretiert Markdown und fügt Inhalte dem Word-Dokument hinzu.
     - Tabellen und Bilder: IMMER sichtbar (nie ausgeblendet).
     - Abbildungs-/Tabellenbeschriftungen: sichtbar, auch wenn hide_text=True.
     - hide_text=True: Text wird hidden (nicht druckbar) + eingerückt; grau für Sichtbarkeit.
+    - headings_as_bold=True: Markdown-Headings als fetter Normal-Text statt Word-Heading-Style
+      (verhindert Einträge in der Navigationsleiste bei Summary-Body-Text).
     - Horizontale Linien (---) werden übersprungen.
     """
     color_map = {
@@ -991,29 +1014,49 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None, s
 
         # ── Überschriften ──
         if stripped.startswith('#### '):
-            p = doc.add_heading(level=4)
-            color = color_map['hidden_heading'] if do_hide else color_map['heading4']
-            add_formatted_text(p, stripped[5:], default_color=color)
-            if do_hide:
-                _hide_paragraph(p)
+            hdg_text = stripped[5:]
+            if headings_as_bold and not do_hide:
+                p = doc.add_paragraph(style='Normal')
+                p.add_run(hdg_text).bold = True
+            else:
+                p = doc.add_heading(level=4)
+                color = color_map['hidden_heading'] if do_hide else color_map['heading4']
+                add_formatted_text(p, hdg_text, default_color=color)
+                if do_hide:
+                    _hide_paragraph(p)
         elif stripped.startswith('### '):
-            p = doc.add_heading(level=3)
-            color = color_map['hidden_heading'] if do_hide else color_map['heading3']
-            add_formatted_text(p, stripped[4:], default_color=color)
-            if do_hide:
-                _hide_paragraph(p)
+            hdg_text = stripped[4:]
+            if headings_as_bold and not do_hide:
+                p = doc.add_paragraph(style='Normal')
+                p.add_run(hdg_text).bold = True
+            else:
+                p = doc.add_heading(level=3)
+                color = color_map['hidden_heading'] if do_hide else color_map['heading3']
+                add_formatted_text(p, hdg_text, default_color=color)
+                if do_hide:
+                    _hide_paragraph(p)
         elif stripped.startswith('## '):
-            p = doc.add_heading(level=2)
-            color = color_map['hidden_heading'] if do_hide else color_map['heading2']
-            add_formatted_text(p, stripped[3:], default_color=color)
-            if do_hide:
-                _hide_paragraph(p)
+            hdg_text = stripped[3:]
+            if headings_as_bold and not do_hide:
+                p = doc.add_paragraph(style='Normal')
+                p.add_run(hdg_text).bold = True
+            else:
+                p = doc.add_heading(level=2)
+                color = color_map['hidden_heading'] if do_hide else color_map['heading2']
+                add_formatted_text(p, hdg_text, default_color=color)
+                if do_hide:
+                    _hide_paragraph(p)
         elif stripped.startswith('# '):
-            p = doc.add_heading(level=1)
-            color = color_map['hidden_heading'] if do_hide else color_map['heading1']
-            add_formatted_text(p, stripped[2:], default_color=color)
-            if do_hide:
-                _hide_paragraph(p)
+            hdg_text = stripped[2:]
+            if headings_as_bold and not do_hide:
+                p = doc.add_paragraph(style='Normal')
+                p.add_run(hdg_text).bold = True
+            else:
+                p = doc.add_heading(level=1)
+                color = color_map['hidden_heading'] if do_hide else color_map['heading1']
+                add_formatted_text(p, hdg_text, default_color=color)
+                if do_hide:
+                    _hide_paragraph(p)
         # ── Aufzählung ──
         elif stripped.startswith('* ') or stripped.startswith('- '):
             bullet_m = re.match(r'^[*-]\s+(.*)', stripped)
@@ -1259,7 +1302,8 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         # Zusammenfassung + Kommentar-Erkennung
         if sum_body.strip():
             before = len(doc.paragraphs)
-            process_markdown_to_docx(doc, sum_body, hide_text=False, base_path=base_path)
+            process_markdown_to_docx(doc, sum_body, hide_text=False, base_path=base_path,
+                                     headings_as_bold=True)
             new_paras = doc.paragraphs[before:]
             first_para = next((p for p in new_paras if p.text.strip()), None)
             last_para  = next((p for p in reversed(new_paras) if p.text.strip()), first_para)

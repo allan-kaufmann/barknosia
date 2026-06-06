@@ -27,6 +27,8 @@ from pipeline import (
     _fix_concatenated_stats_cells,
     _drop_empty_columns,
     _hide_paragraph,
+    add_markdown_table_to_doc,
+    _set_cell_text,
 )
 
 
@@ -604,3 +606,121 @@ def test_hide_paragraph_hides_bullet():
     assert rPr is not None, "rPr in pPr fehlt"
     vanish = rPr.find(_qn('w:vanish'))
     assert vanish is not None, "w:vanish fehlt – Bullet-Zeichen wird nicht ausgeblendet"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 18: _hide_paragraph – w:numPr wird entfernt
+# ---------------------------------------------------------------------------
+
+def test_hide_paragraph_removes_numpr():
+    """_hide_paragraph entfernt w:numPr, damit das List-Label (• + Tab) nicht sichtbar bleibt."""
+    from docx.oxml.ns import qn as _qn
+    doc = Document()
+    p = doc.add_paragraph(style='List Bullet')
+    p.add_run("Bullet Text")
+    # List Bullet-Style setzt w:numPr → muss nach _hide_paragraph weg sein
+    _hide_paragraph(p)
+    pPr = p._p.find(_qn('w:pPr'))
+    assert pPr is not None, "pPr fehlt"
+    numPr = pPr.find(_qn('w:numPr'))
+    assert numPr is None, "w:numPr ist noch vorhanden – Bullet-Label bleibt sichtbar"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 19: add_markdown_table_to_doc – Titel-Zeile erkennen
+# ---------------------------------------------------------------------------
+
+def test_table_title_row_merged():
+    """Erste Zeile mit nur 1 Non-Empty-Cell → wird zur gemergten Titelzeile; Zeile 1 bekommt Shading."""
+    from docx.oxml.ns import qn as _qn
+    doc = Document()
+    table_lines = [
+        "| Lange Fragestellung |  |  |",
+        "|---------------------|--|--|",
+        "| Spalte A | Spalte B | Spalte C |",
+        "| Wert 1   | Wert 2   | Wert 3   |",
+    ]
+    add_markdown_table_to_doc(doc, table_lines)
+    # Zuletzt eingefügte Tabelle
+    tbl = doc.tables[-1]
+    # Zeile 0 soll nach merge nur noch 1 Zelle haben (alle zusammengeführt)
+    row0_cells = tbl.rows[0].cells
+    assert row0_cells[0] is row0_cells[-1], "Titelzeile wurde nicht zusammengeführt (Zellen nicht identisch)"
+    # Zeile 1 (echter Header) soll Shading haben
+    tc1 = tbl.rows[1].cells[0]._tc
+    tcPr = tc1.find(_qn('w:tcPr'))
+    assert tcPr is not None, "tcPr in Header-Zeile fehlt"
+    shd = tcPr.find(_qn('w:shd'))
+    assert shd is not None, "w:shd fehlt – Header-Zeile hat kein Shading"
+
+
+def test_table_normal_header_unchanged():
+    """Tabelle mit mehreren Non-Empty-Cells in Zeile 0 → normale Header-Logik (Zeile 0 = Header)."""
+    from docx.oxml.ns import qn as _qn
+    doc = Document()
+    table_lines = [
+        "| Name | Wert |",
+        "|------|------|",
+        "| A    | 1    |",
+    ]
+    add_markdown_table_to_doc(doc, table_lines)
+    tbl = doc.tables[-1]
+    # Zeile 0 soll Shading haben (normaler Header)
+    tc0 = tbl.rows[0].cells[0]._tc
+    tcPr = tc0.find(_qn('w:tcPr'))
+    assert tcPr is not None
+    shd = tcPr.find(_qn('w:shd'))
+    assert shd is not None, "w:shd fehlt in Zeile 0 – normaler Header nicht erkannt"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 20: _set_cell_text – Bullet-Concatenation
+# ---------------------------------------------------------------------------
+
+def test_set_cell_text_splits_bullets():
+    """•A•B•C in einer Zelle → 3 separate Paragraphen."""
+    doc = Document()
+    tbl = doc.add_table(rows=1, cols=1)
+    cell = tbl.cell(0, 0)
+    _set_cell_text(cell, "•Wiedererkennen•Benennen•Abrufen")
+    texts = [p.text.strip() for p in cell.paragraphs if p.text.strip()]
+    assert len(texts) == 3, f"Erwartet 3 Paragraphen, erhalten: {texts}"
+    assert "Wiedererkennen" in texts
+    assert "Benennen" in texts
+    assert "Abrufen" in texts
+
+
+def test_set_cell_text_single_bullet_unchanged():
+    """Einzelnes • am Anfang (kein Concat) → kein Split."""
+    doc = Document()
+    tbl = doc.add_table(rows=1, cols=1)
+    cell = tbl.cell(0, 0)
+    _set_cell_text(cell, "•Eintrag ohne Split")
+    texts = [p.text.strip() for p in cell.paragraphs if p.text.strip()]
+    assert len(texts) == 1, f"Kein Split erwartet, erhalten: {texts}"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 21: process_markdown_to_docx – headings_as_bold
+# ---------------------------------------------------------------------------
+
+def test_process_markdown_headings_as_bold():
+    """headings_as_bold=True → ### Titel wird als Normal-Paragraph mit bold=True eingefügt."""
+    doc = Document()
+    process_markdown_to_docx(doc, "### Durchführung\nText darunter.", headings_as_bold=True)
+    # Erster Nicht-Leer-Paragraph soll Normal-Style (kein Heading) sein
+    paras = [p for p in doc.paragraphs if p.text.strip()]
+    assert len(paras) >= 1
+    first = paras[0]
+    assert first.style.name == 'Normal', f"Erwartet Normal, erhalten: {first.style.name}"
+    assert first.runs and first.runs[0].bold, "Heading-Text soll bold=True sein"
+
+
+def test_process_markdown_headings_default_uses_heading_style():
+    """headings_as_bold=False (Standard) → ### Titel wird als Heading 3 eingefügt."""
+    doc = Document()
+    process_markdown_to_docx(doc, "### Titel", headings_as_bold=False)
+    paras = [p for p in doc.paragraphs if p.text.strip()]
+    assert len(paras) >= 1
+    assert 'Heading' in paras[0].style.name or paras[0].style.name.startswith('berschrift'), \
+        f"Erwartet Heading-Style, erhalten: {paras[0].style.name}"
