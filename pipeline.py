@@ -1287,6 +1287,13 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             continue
         sum_lookup[normalize_heading(s['heading'])] = s['body']
 
+    # Dokument-Typ bestimmen: hat es nummerierte Kapitel?
+    has_numbered_chapters = any(
+        re.match(r'^\d', _clean_heading_text(s['heading']).strip())
+        for s in orig_sections
+        if s['heading'] != '__preamble__'
+    )
+
     # --- Interleaved Aufbau ---
     for idx, section in enumerate(orig_sections):
         if section['heading'] == '__preamble__':
@@ -1334,7 +1341,8 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         if originally_numbered and not sum_body.strip() and not has_children and not orig_body.strip():
             continue
 
-        if originally_numbered:
+        nav_worthy = originally_numbered if has_numbered_chapters else (display_level <= 2)
+        if nav_worthy:
             h = doc.add_heading(clean_heading, level=display_level)
             _set_heading_color(h, MM_HEADING_COLORS.get(display_level, MM_HEADING_COLORS[9]))
         else:

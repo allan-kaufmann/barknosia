@@ -834,15 +834,26 @@ def test_interleaved_numbered_heading_in_nav():
     )
 
 
-def test_interleaved_unnumbered_h2_not_in_nav():
-    """Unnummerierte H2-Sektion → Normal+Bold (auch H2 unnummeriert erscheint NICHT in Nav)."""
+def test_interleaved_unnumbered_h2_in_nav_when_no_numbered():
+    """Unnummerierte H2 in Dokument OHNE nummerierte Kapitel → Heading-Style (smart nav)."""
     orig_md = "## Einführung\n\nHier steht der Originaltext."
     sum_md = "## Einführung\n\nKurze Zusammenfassung."
     paras = _run_interleaved(orig_md, sum_md)
     heading_para = next((p for p in paras if "Einführung" in p.text), None)
     assert heading_para is not None, "Überschrift 'Einführung' nicht im Dokument gefunden"
-    assert heading_para.style.name == 'Normal', (
-        f"Unnummerierte H2-Überschrift soll Normal-Style haben (nicht in Nav), erhalten: {heading_para.style.name!r}"
+    assert 'Heading' in heading_para.style.name or heading_para.style.name.startswith('berschrift'), (
+        f"Unnummerierte H2 (kein nummeriertes Dokument) soll Heading-Style haben, erhalten: {heading_para.style.name!r}"
     )
-    assert heading_para.runs and heading_para.runs[0].bold, \
-        "Unnummerierte Überschrift soll bold=True sein"
+
+
+def test_interleaved_unnumbered_h2_not_in_nav_when_numbered_doc():
+    """Unnummerierte H2 in Dokument MIT nummerierten Kapiteln → Normal+Bold (nicht in Nav)."""
+    orig_md = "## 5.1 Einführung\n\nKapiteltext.\n\n## Woran erkenne ich das?\n\nSubsektionstext."
+    sum_md = "## 5.1 Einführung\n\nZusammenfassung.\n\n## Woran erkenne ich das?\n\nSub-Zusammenfassung."
+    paras = _run_interleaved(orig_md, sum_md)
+    heading_para = next((p for p in paras if "Woran erkenne ich" in p.text), None)
+    assert heading_para is not None, "Überschrift 'Woran erkenne ich das?' nicht gefunden"
+    assert heading_para.style.name == 'Normal', (
+        f"Unnummerierte H2 in numm. Dokument soll Normal-Style haben, erhalten: {heading_para.style.name!r}"
+    )
+    assert heading_para.runs and heading_para.runs[0].bold, "Soll bold=True sein"
