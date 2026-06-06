@@ -1311,7 +1311,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     for idx, section in enumerate(orig_sections):
         if section['heading'] == '__preamble__':
             if section['body']:
-                process_markdown_to_docx(doc, section['body'], base_path=base_path)
+                process_markdown_to_docx(doc, section['body'], base_path=base_path, skip_images=True)
             continue
 
         level     = section['level']
@@ -1386,7 +1386,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         if sum_body.strip():
             before = len(doc.paragraphs)
             process_markdown_to_docx(doc, sum_body, hide_text=False, base_path=base_path,
-                                     headings_as_bold=True)
+                                     skip_images=True, headings_as_bold=True)
             new_paras = doc.paragraphs[before:]
             first_para = next((p for p in new_paras if p.text.strip()), None)
             last_para  = next((p for p in reversed(new_paras) if p.text.strip()), first_para)
@@ -1411,7 +1411,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                     comment_list.append((cid, ctext))
 
         if orig_body.strip():
-            process_markdown_to_docx(doc, orig_body, hide_text=True, base_path=base_path)
+            process_markdown_to_docx(doc, orig_body, hide_text=True, base_path=base_path, skip_images=True)
 
     # --- Fragentext laden (optional) ---
     questions_map: dict = {}
