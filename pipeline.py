@@ -359,12 +359,15 @@ def split_into_level1_chapters(text: str) -> list:
     Jeder Eintrag: {'heading': str, 'full_text': str}.
     """
     lines = text.split('\n')
+    _html_re = re.compile(r'<[^>]+>')
 
-    numbered_levels = [
-        len(m.group(1))
-        for line in lines
-        if (m := re.match(r'^(#{1,6})\s+(?:\*\*)?(\d+(?:\.\d+)*)\s', line))
-    ]
+    def _numbered_level(line: str):
+        """Gibt den #-Level zurück wenn die Zeile eine nummerierte Überschrift ist (HTML-ignorant)."""
+        stripped = _html_re.sub('', line).replace('**', '')
+        m = re.match(r'^(#{1,6})\s+(\d+(?:\.\d+)*)\s', stripped)
+        return len(m.group(1)) if m else None
+
+    numbered_levels = [nl for line in lines if (nl := _numbered_level(line)) is not None]
 
     if not numbered_levels:
         return []
@@ -373,18 +376,17 @@ def split_into_level1_chapters(text: str) -> list:
     top_count = sum(1 for l in numbered_levels if l == min_level)
     # Einziges Top-Kapitel → eine Ebene tiefer splitten (z.B. extrahiertes Kapitel 4)
     split_level = min_level + 1 if top_count == 1 else min_level
-    split_hashes = '#' * split_level
-    pattern = re.compile(rf'^{re.escape(split_hashes)}\s+(?:\*\*)?(\d+(?:\.\d+)*)\s')
 
     chapters = []
     current_heading = None
     current_lines = []
 
     for line in lines:
-        if pattern.match(line):
+        if _numbered_level(line) == split_level:
             if current_heading is not None:
                 chapters.append({'heading': current_heading, 'full_text': '\n'.join(current_lines)})
-            current_heading = line[split_level:].strip().replace('**', '').strip()
+            stripped = _html_re.sub('', line).replace('**', '')
+            current_heading = re.sub(r'^#{1,6}\s+', '', stripped).strip()
             current_lines = [line]
         else:
             current_lines.append(line)
@@ -576,7 +578,8 @@ def normalize_heading_levels(text: str) -> str:
         if m:
             content = m.group(2).strip()
             clean = content.replace('**', '').strip()
-            num_m = re.match(r'^(\d+(?:\.\d+)*)(\s|$)', clean)
+            clean_nohtml = re.sub(r'<[^>]+>', '', clean)
+            num_m = re.match(r'^(\d+(?:\.\d+)*)(\s|$)', clean_nohtml)
             if num_m:
                 dots = num_m.group(1).count('.')
                 new_level = '#' * min(dots + 2, 6)
@@ -845,7 +848,7 @@ def _compress_heading_levels(text: str) -> str:
         if m:
             ocr_level = len(m.group(1))
             # Nummerierte Headings wurden bereits von normalize_heading_levels korrekt gesetzt
-            if re.match(r'^#{1,9}\s+\*{0,2}\d', line):
+            if re.match(r'^#{1,9}\s+\*{0,2}\d', re.sub(r'<[^>]+>', '', line)):
                 result.append(line)
                 prev_actual = ocr_level
                 continue
