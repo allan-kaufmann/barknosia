@@ -25,6 +25,8 @@ from pipeline import (
     _strip_kontrollliste,
     _compress_heading_levels,
     _fix_concatenated_stats_cells,
+    _drop_empty_columns,
+    _hide_paragraph,
 )
 
 
@@ -498,3 +500,107 @@ def test_fix_concatenated_stats_cells_no_change_needed():
     rows = [['Item', 'Übersetzung', '3.44', '1.00', '.49']]
     result = _fix_concatenated_stats_cells(rows)
     assert result[0] == ['Item', 'Übersetzung', '3.44', '1.00', '.49']
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 13: normalize_heading_levels – beliebige Tiefe
+# ---------------------------------------------------------------------------
+
+def test_normalize_4level_depth():
+    """4.1.1.1 (3 Punkte) → H5 (#####)."""
+    result = normalize_heading_levels("# 4.1.1.1 Tief\nText")
+    assert result.startswith("##### 4.1.1.1 Tief")
+
+
+def test_normalize_5level_depth():
+    """5 Punkte → max H6 (######)."""
+    result = normalize_heading_levels("# 1.2.3.4.5 Sehr tief\nText")
+    assert result.startswith("###### 1.2.3.4.5 Sehr tief")
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 14: _compress_heading_levels – nummerierte Headings unverändert
+# ---------------------------------------------------------------------------
+
+def test_compress_skips_numbered():
+    """Nummerierte Headings (nach normalize) werden von _compress nicht verändert."""
+    md = "## 4 Kapitel\n### 4.1 Sub\n#### 4.1.1 SubSub\n### 4.2 Sub2\n"
+    result = _compress_heading_levels(md)
+    assert "## 4 Kapitel" in result
+    assert "### 4.1 Sub" in result
+    assert "#### 4.1.1 SubSub" in result
+    assert "### 4.2 Sub2" in result
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 15: split_into_level1_chapters – adaptiver Split
+# ---------------------------------------------------------------------------
+
+def test_split_chapters_adaptive_h3():
+    """Extrahiertes Kapitel: einziges ## → Unterkapitel auf ### werden gesplittet."""
+    md = (
+        "## 4 Vorgehen\nText\n"
+        "### 4.1 Bedarfserhebung\nText 4.1\n"
+        "### 4.2 Konzeptentwicklung\nText 4.2\n"
+    )
+    chapters = split_into_level1_chapters(md)
+    headings = [c['heading'] for c in chapters]
+    assert len(chapters) == 2
+    assert any("4.1" in h for h in headings)
+    assert any("4.2" in h for h in headings)
+
+
+def test_split_chapters_multi_top_stays_at_h2():
+    """Mehrere ## Kapitel → weiterhin an ## splitten, nicht tiefer."""
+    md = (
+        "## 1 Einleitung\nText Kap 1\n"
+        "### 1.1 Unterkapitel\nText 1.1\n"
+        "## 2 Methoden\nText Kap 2\n"
+    )
+    chapters = split_into_level1_chapters(md)
+    assert len(chapters) == 2
+    headings = [c['heading'] for c in chapters]
+    assert any("1 Einleitung" in h for h in headings)
+    assert any("2 Methoden" in h for h in headings)
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 16: _drop_empty_columns
+# ---------------------------------------------------------------------------
+
+def test_drop_empty_columns_removes_blank():
+    """Spalte, die in allen Zeilen leer ist, wird entfernt."""
+    rows = [['A', 'B', ''], ['1', '2', ''], ['3', '4', '']]
+    result = _drop_empty_columns(rows)
+    assert all(len(r) == 2 for r in result)
+    assert result[0] == ['A', 'B']
+
+
+def test_drop_empty_columns_keeps_nonempty():
+    """Spalte mit mindestens einem nicht-leeren Wert bleibt erhalten."""
+    rows = [['A', 'B', 'C'], ['1', '', '3']]
+    result = _drop_empty_columns(rows)
+    assert all(len(r) == 3 for r in result)
+
+
+def test_drop_empty_columns_empty_input():
+    assert _drop_empty_columns([]) == []
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 17: _hide_paragraph – Aufzählungszeichen ausblenden
+# ---------------------------------------------------------------------------
+
+def test_hide_paragraph_hides_bullet():
+    """_hide_paragraph setzt w:vanish in pPr/rPr, um das Bullet-Zeichen auszublenden."""
+    from docx.oxml.ns import qn as _qn
+    doc = Document()
+    p = doc.add_paragraph(style='List Bullet')
+    p.add_run("Bullet Text")
+    _hide_paragraph(p)
+    pPr = p._p.find(_qn('w:pPr'))
+    assert pPr is not None, "pPr fehlt"
+    rPr = pPr.find(_qn('w:rPr'))
+    assert rPr is not None, "rPr in pPr fehlt"
+    vanish = rPr.find(_qn('w:vanish'))
+    assert vanish is not None, "w:vanish fehlt – Bullet-Zeichen wird nicht ausgeblendet"

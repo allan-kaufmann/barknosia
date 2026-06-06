@@ -353,22 +353,38 @@ def translate_text(text: str) -> str:
 
 def split_into_level1_chapters(text: str) -> list:
     """
-    Splittet den (bereits normalisierten) Markdown-Text an nummerierten ## Kapitelüberschriften.
+    Splittet den (bereits normalisierten) Markdown-Text an nummerierten Kapitelüberschriften.
+    Adaptiv: Bei einem einzigen Top-Level-Kapitel (z.B. extrahiertes Einzelkapitel) wird eine
+    Ebene tiefer gesplittet, sodass Unterkapitel als eigene Chunks erkannt werden.
     Jeder Eintrag: {'heading': str, 'full_text': str}.
-    Erkennt Zeilen wie '## **1 EINLEITUNG**' oder '## 4 INDIVIDUELLE FAKTOREN'.
     """
+    lines = text.split('\n')
+
+    numbered_levels = [
+        len(m.group(1))
+        for line in lines
+        if (m := re.match(r'^(#{1,6})\s+(?:\*\*)?(\d+(?:\.\d+)*)\s', line))
+    ]
+
+    if not numbered_levels:
+        return []
+
+    min_level = min(numbered_levels)
+    top_count = sum(1 for l in numbered_levels if l == min_level)
+    # Einziges Top-Kapitel → eine Ebene tiefer splitten (z.B. extrahiertes Kapitel 4)
+    split_level = min_level + 1 if top_count == 1 else min_level
+    split_hashes = '#' * split_level
+    pattern = re.compile(rf'^{re.escape(split_hashes)}\s+(?:\*\*)?(\d+(?:\.\d+)*)\s')
+
     chapters = []
     current_heading = None
     current_lines = []
 
-    for line in text.split('\n'):
-        # Nummeriertes ## -Kapitel: "## **1 ..." oder "## 1 ..."
-        m = re.match(r'^##\s+(?:\*\*)?(\d+)\s', line)
-        if m:
+    for line in lines:
+        if pattern.match(line):
             if current_heading is not None:
                 chapters.append({'heading': current_heading, 'full_text': '\n'.join(current_lines)})
-            # Heading-Text ohne Bold-Marker speichern
-            current_heading = line[3:].strip().replace('**', '').strip()
+            current_heading = line[split_level:].strip().replace('**', '').strip()
             current_lines = [line]
         else:
             current_lines.append(line)
@@ -560,14 +576,10 @@ def normalize_heading_levels(text: str) -> str:
         if m:
             content = m.group(2).strip()
             clean = content.replace('**', '').strip()
-            num_m = re.match(r'^(\d+)(\.(\d+)(\.(\d+))?)?(\s|$)', clean)
+            num_m = re.match(r'^(\d+(?:\.\d+)*)(\s|$)', clean)
             if num_m:
-                if num_m.group(3) is None:
-                    new_level = '##'
-                elif num_m.group(5) is None:
-                    new_level = '###'
-                else:
-                    new_level = '####'
+                dots = num_m.group(1).count('.')
+                new_level = '#' * min(dots + 2, 6)
                 result.append(f'{new_level} {content}')
             else:
                 result.append(line)
@@ -710,6 +722,18 @@ def _fix_concatenated_stats_cells(rows_data: list) -> list:
     return rows_data
 
 
+def _drop_empty_columns(rows_data: list) -> list:
+    """Entfernt Spalten, die in allen Zeilen leer sind (OCR-Artefakt)."""
+    if not rows_data:
+        return rows_data
+    num_cols = max(len(r) for r in rows_data)
+    keep = [
+        c for c in range(num_cols)
+        if any(c < len(r) and r[c].strip() for r in rows_data)
+    ]
+    return [[r[c] if c < len(r) else '' for c in keep] for r in rows_data]
+
+
 def add_markdown_table_to_doc(doc, table_lines: list):
     """
     Konvertiert eine Liste von Markdown-Pipe-Zeilen in eine Word-Tabelle.
@@ -741,6 +765,7 @@ def add_markdown_table_to_doc(doc, table_lines: list):
             r.append('')
 
     rows_data = _fix_concatenated_stats_cells(rows_data)
+    rows_data = _drop_empty_columns(rows_data)
     num_cols = max(len(r) for r in rows_data)
     num_rows = len(rows_data)
 
@@ -819,6 +844,11 @@ def _compress_heading_levels(text: str) -> str:
         m = re.match(r'^(#{1,9})\s', line)
         if m:
             ocr_level = len(m.group(1))
+            # Nummerierte Headings wurden bereits von normalize_heading_levels korrekt gesetzt
+            if re.match(r'^#{1,9}\s+\*{0,2}\d', line):
+                result.append(line)
+                prev_actual = ocr_level
+                continue
             if ocr_level in ocr_to_actual:
                 actual = ocr_to_actual[ocr_level]
             elif ocr_level > prev_actual + 1:
@@ -842,10 +872,18 @@ _HRULE_RE = re.compile(r'^-{3,}$|^\*{3,}$|^_{3,}$')
 
 
 def _hide_paragraph(p, indent_cm: float = 1.5):
-    """Setzt alle Runs eines Absatzes auf hidden + fügt Einrückung hinzu."""
+    """Setzt alle Runs eines Absatzes auf hidden + fügt Einrückung hinzu.
+    Setzt w:vanish in w:pPr/w:rPr um das Aufzählungszeichen auszublenden."""
     p.paragraph_format.left_indent = Cm(indent_cm)
     for run in p.runs:
         run.font.hidden = True
+    pPr = p._p.get_or_add_pPr()
+    rPr = pPr.find(qn('w:rPr'))
+    if rPr is None:
+        rPr = OxmlElement('w:rPr')
+        pPr.append(rPr)
+    vanish = OxmlElement('w:vanish')
+    rPr.append(vanish)
 
 
 def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None, skip_images=False):
@@ -1106,7 +1144,8 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                                     output_path: str, base_path: str = None,
                                     parent_chapter: str = None, parent_level: int = None,
                                     skip_references: bool = True,
-                                    questions_path: str = None):
+                                    questions_path: str = None,
+                                    doc_title: str = "Lernskript"):
     """
     Erstellt ein Word-Dokument, bei dem Zusammenfassung und Originaltext
     kapitelweise verschränkt sind.
@@ -1151,7 +1190,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
 
     # --- Lernskript-Titel (Standalone-Modus) ---
     if not parent_chapter:
-        h = doc.add_heading("Lernskript", level=1)
+        h = doc.add_heading(doc_title, level=1)
         _set_heading_color(h, MM_HEADING_COLORS[1])
 
     # --- Heading-Level normalisieren & Sections parsen ---
@@ -1336,8 +1375,9 @@ if __name__ == "__main__":
         if not os.path.exists(args.pdf_path):
             raise FileNotFoundError(f"Die Datei {args.pdf_path} wurde nicht gefunden.")
 
-        pdf_stem = Path(args.pdf_path).stem
-        out_dir  = Path(OUTPUT_BASE) / pdf_stem
+        pdf_stem  = Path(args.pdf_path).stem
+        doc_title = pdf_stem.replace('_', ' ')
+        out_dir   = Path(OUTPUT_BASE) / pdf_stem
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # Kapitel-spezifisches Cache-Verzeichnis (OCR-Markdown bleibt in out_dir)
@@ -1428,6 +1468,7 @@ if __name__ == "__main__":
             parent_level=args.parent_level,
             skip_references=not args.include_references,
             questions_path=args.questions,
+            doc_title=doc_title,
         )
 
         print(f"\n=== PIPELINE ERFOLGREICH BEENDET ===")
