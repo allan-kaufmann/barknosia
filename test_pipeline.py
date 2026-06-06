@@ -454,14 +454,21 @@ def test_process_strips_span_tags():
 # Gruppe 11: Bildfilterung in process_markdown_to_docx
 # ---------------------------------------------------------------------------
 
-def test_image_filter_skips_picture(tmp_path):
-    """Bild mit 'Picture' im Namen wird übersprungen (kein Paragraph mit Pfad)."""
-    fake_img = tmp_path / "_page_0_Picture_2.jpeg"
-    fake_img.write_bytes(b"")
+def test_image_skip_images_flag(tmp_path):
+    """skip_images=True: Bildzeile wird komplett ignoriert, kein Platzhalter."""
     doc = Document()
-    process_markdown_to_docx(doc, f"![]({fake_img.name})", base_path=str(tmp_path))
+    process_markdown_to_docx(doc, "![Logo](logo.png)", base_path=str(tmp_path), skip_images=True)
     texts = ' '.join(p.text for p in doc.paragraphs)
-    assert fake_img.name not in texts
+    assert 'logo.png' not in texts
+    assert 'Bild nicht' not in texts
+
+
+def test_image_skip_images_false_adds_placeholder(tmp_path):
+    """skip_images=False (Standard): fehlendes Bild → Platzhalter-Text."""
+    doc = Document()
+    process_markdown_to_docx(doc, "![Abb](missing.png)", base_path=str(tmp_path), skip_images=False)
+    texts = ' '.join(p.text for p in doc.paragraphs)
+    assert 'missing.png' in texts
 
 
 # ---------------------------------------------------------------------------

@@ -848,7 +848,7 @@ def _hide_paragraph(p, indent_cm: float = 1.5):
         run.font.hidden = True
 
 
-def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
+def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None, skip_images=False):
     """
     Interpretiert Markdown und fügt Inhalte dem Word-Dokument hinzu.
     - Tabellen und Bilder: IMMER sichtbar (nie ausgeblendet).
@@ -893,14 +893,13 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None):
             add_markdown_table_to_doc(doc, table_lines)
             continue
 
-        # ── Bild: immer sichtbar, außer dekorative Logo-Bilder ──
+        # ── Bild: immer sichtbar (außer wenn skip_images=True) ──
         img_m = re.match(r'^!\[([^\]]*)\]\(([^)]+)\)$', stripped)
         if img_m:
-            img_rel = img_m.group(2)
-            img_lower = img_rel.lower()
-            if 'picture' in img_lower and 'figure' not in img_lower and 'abbildung' not in img_lower:
+            if skip_images:
                 i += 1
-                continue  # Logo/dekoratives Bild überspringen
+                continue
+            img_rel = img_m.group(2)
             img_path = os.path.join(base_path, img_rel) if base_path else img_rel
             if os.path.exists(img_path):
                 try:
@@ -1084,7 +1083,7 @@ def build_translation_word_document(translated_text: str, output_path: str, base
         if heading == '__preamble__':
             if body.strip():
                 before = len(doc.paragraphs)
-                process_markdown_to_docx(doc, body, hide_text=False, base_path=base_path)
+                process_markdown_to_docx(doc, body, hide_text=False, base_path=base_path, skip_images=True)
                 for p in doc.paragraphs[before:]:
                     p.paragraph_format.left_indent = Cm(1.5)
             continue
@@ -1341,6 +1340,11 @@ if __name__ == "__main__":
         out_dir  = Path(OUTPUT_BASE) / pdf_stem
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        # Kapitel-spezifisches Cache-Verzeichnis (OCR-Markdown bleibt in out_dir)
+        chapter_safe = args.chapter.replace('.', '_') if args.chapter else None
+        cache_dir = out_dir / f"kap{chapter_safe}" if chapter_safe else out_dir
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
         # --- Schritt 1: OCR ---
         md_path = out_dir / f"{pdf_stem}.md"
         if args.force or not md_path.exists():
@@ -1356,7 +1360,7 @@ if __name__ == "__main__":
             raw_md = extract_chapter(raw_md, args.chapter)
 
         # --- Schritt 2: Sprache prüfen & Übersetzen ---
-        transl_path = out_dir / "de_uebersetzung.md"
+        transl_path = cache_dir / "de_uebersetzung.md"
         if args.force and transl_path.exists():
             transl_path.unlink()
 
@@ -1373,7 +1377,7 @@ if __name__ == "__main__":
             working_text = transl_path.read_text(encoding="utf-8")
 
         # --- Zwischenschritt: Übersetzung als eigenes Word-Dokument ---
-        transl_docx_path = out_dir / f"{pdf_stem}_Uebersetzung.docx"
+        transl_docx_path = cache_dir / f"{pdf_stem}_Uebersetzung.docx"
         if args.force or not transl_docx_path.exists():
             build_translation_word_document(working_text, str(transl_docx_path), base_path=str(out_dir))
         else:
@@ -1381,28 +1385,28 @@ if __name__ == "__main__":
 
         if args.no_summary:
             print(f"\n=== PIPELINE ERFOLGREICH BEENDET (nur Übersetzung) ===")
-            print(f"Zwischenergebnisse: {out_dir}")
+            print(f"Zwischenergebnisse: {cache_dir}")
             print(f"Fertiges Dokument:  {transl_docx_path}")
             sys.exit(0)
 
         # --- Schritt 4: Zusammenfassung (kapitelweise) ---
-        sum_path = out_dir / "zusammenfassung.md"
+        sum_path = cache_dir / "zusammenfassung.md"
         if args.force and sum_path.exists():
             sum_path.unlink()
-            for f in out_dir.glob("zusammenfassung_kap_*.md"):
+            for f in cache_dir.glob("zusammenfassung_kap_*.md"):
                 f.unlink()
 
         if sum_path.exists():
             print(f"[SKIP] Zusammenfassung – bereits vorhanden: {sum_path}")
             summary_result = sum_path.read_text(encoding="utf-8")
         else:
-            summary_result = generate_summary_by_chapter(working_text, out_dir)
+            summary_result = generate_summary_by_chapter(working_text, cache_dir)
 
         # --- Schritt 5: Qualitätssicherung (optional) ---
         qa_result = "Keine Leitfragen zur Prüfung übergeben."
         if args.questions:
             if os.path.exists(args.questions):
-                qa_path = out_dir / "qa_ergebnis.md"
+                qa_path = cache_dir / "qa_ergebnis.md"
                 if args.force and qa_path.exists():
                     qa_path.unlink()
                 qa_result = load_or_run(
@@ -1415,7 +1419,7 @@ if __name__ == "__main__":
 
         # --- Word-Dokument zusammensetzen ---
         suffix = f"_Einbetten_{args.parent_chapter.replace('.', '-')}" if args.parent_chapter else "_Lernskript"
-        final_docx_path = out_dir / f"{pdf_stem}{suffix}.docx"
+        final_docx_path = cache_dir / f"{pdf_stem}{suffix}.docx"
         build_interleaved_word_document(
             working_text, summary_result, qa_result,
             str(final_docx_path), base_path=str(out_dir),
@@ -1426,7 +1430,7 @@ if __name__ == "__main__":
         )
 
         print(f"\n=== PIPELINE ERFOLGREICH BEENDET ===")
-        print(f"Zwischenergebnisse:   {out_dir}")
+        print(f"Zwischenergebnisse:   {cache_dir}")
         print(f"Übersetzung (Word):   {transl_docx_path}")
         print(f"Fertiges Dokument:    {final_docx_path}")
         if args.parent_chapter:

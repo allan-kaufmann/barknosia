@@ -1,0 +1,12 @@
+
+
+
+# Extrahieren eines Kapitels mit Qualitätssicherung
+python pipeline.py Kortsch_Lernen_in_Unternehmen.pdf   --chapter "1"   --parent-chapter "1"   --questions fragen_kap1.txt
+
+# Extrahieren für Lernunterlagenkapitel
+python pipeline.py Ten_years_onA_review_of_recent_research_on_the_Job_DemandControl.pdf --parent-chapter "4.2.2.3"
+
+
+# Nur Übersetzung
+python pipeline.py kortsch-kauffeld-2019-validation-of-a-german-version-of-the-dimensions-of-the-learning-organization-questionnaire.pdf --no-summary
