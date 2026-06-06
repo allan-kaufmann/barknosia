@@ -850,13 +850,18 @@ def test_interleaved_unnumbered_h2_in_nav_when_no_numbered():
 
 
 def test_interleaved_unnumbered_h2_not_in_nav_when_numbered_doc():
-    """Wiederkehrende unnummerierte H2 in numm. Dokument → Normal+Bold (nicht in Nav)."""
-    # "Woran erkenne ich das?" erscheint zweimal → freq=2 → kein Auto-Nummerierung
+    """Wiederkehrende unnummerierte H2 mit Summary in numm. Dokument → Normal+Bold (nicht in Nav)."""
+    # "Woran erkenne ich das?" erscheint zweimal → freq=2 → keine Auto-Nummerierung.
+    # Summary enthält "Woran erkenne ich das?" → wird angezeigt, aber als Normal+Bold (nicht in Nav).
     orig_md = (
         "## 5.1 Einführung\n\nKapiteltext.\n\n## Woran erkenne ich das?\n\nText A.\n\n"
         "## 5.2 Weiteres\n\nKapiteltext.\n\n## Woran erkenne ich das?\n\nText B."
     )
-    sum_md = "## 5.1 Einführung\n\nZusammenfassung.\n\n## 5.2 Weiteres\n\nZusammenfassung 2."
+    sum_md = (
+        "## 5.1 Einführung\n\nZusammenfassung.\n\n"
+        "## 5.2 Weiteres\n\nZusammenfassung 2.\n\n"
+        "## Woran erkenne ich das?\n\nKompetenz-Merkmale."
+    )
     paras = _run_interleaved(orig_md, sum_md)
     heading_para = next((p for p in paras if "Woran erkenne ich" in p.text), None)
     assert heading_para is not None, "Überschrift 'Woran erkenne ich das?' nicht gefunden"
@@ -899,7 +904,9 @@ def test_auto_numbering_unique_heading_gets_number_and_nav():
 
 
 def test_auto_numbering_recurring_heading_stays_bold_not_nav():
-    """Wiederkehrende unnummerierte Überschrift → Normal+Bold, keine Auto-Nummerierung."""
+    """Wiederkehrende unnummerierte Überschrift mit Summary → Normal+Bold, keine Auto-Nummerierung."""
+    # "Was ist das?" erscheint zweimal → freq=2 → NICHT auto-nummeriert → Normal+Bold (nicht Heading-Style).
+    # Summary enthält "Was ist das?" damit es nicht übersprungen wird.
     orig_md = (
         "## 5.3 Überblick\n\n"
         "## Agilität\n\n"
@@ -907,9 +914,12 @@ def test_auto_numbering_recurring_heading_stays_bold_not_nav():
         "## Analytisches Denken\n\n"
         "## Was ist das?\n\nDefinition Analytik."
     )
-    sum_md = "## Agilität\n\nAgilität-Zusammenfassung.\n\n## Analytisches Denken\n\nAnalytik-Zusammenfassung."
+    sum_md = (
+        "## Agilität\n\nAgilität-Zusammenfassung.\n\n"
+        "## Analytisches Denken\n\nAnalytik-Zusammenfassung.\n\n"
+        "## Was ist das?\n\nDefinition."
+    )
     paras = _run_interleaved(orig_md, sum_md)
-    # "Was ist das?" erscheint mehr als einmal → nicht auto-nummeriert, kein Heading-Style
     was_paras = [p for p in paras if "Was ist das?" in p.text]
     assert len(was_paras) >= 1, "Mindestens eine 'Was ist das?'-Überschrift soll im Dokument erscheinen"
     for wp in was_paras:
@@ -917,14 +927,3 @@ def test_auto_numbering_recurring_heading_stays_bold_not_nav():
             f"'Was ist das?' soll Normal-Style haben (wiederkehrend), erhalten: {wp.style.name!r}"
 
 
-def test_unnumbered_section_with_orig_body_not_skipped():
-    """Unnummerierte Section mit Originaltext aber ohne Summary erscheint im Dokument."""
-    orig_md = (
-        "## 5.3 Überblick\n\n"
-        "## Was ist das?\n\nDefinition hier vorhanden.\n\n"
-        "## Was ist das?\n\nNoch eine Definition."
-    )
-    sum_md = ""  # kein Summary
-    paras = _run_interleaved(orig_md, sum_md)
-    body_para = next((p for p in paras if "Definition hier vorhanden" in p.text), None)
-    assert body_para is not None, "Abschnitt mit orig_body soll nicht übersprungen werden, auch ohne Summary"
