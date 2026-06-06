@@ -225,19 +225,19 @@ def test_triple_asterisk_in_bullet():
 # Gruppe 5: normalize_heading_levels + parse_sections
 # ---------------------------------------------------------------------------
 
-def test_normalize_level1_to_h2():
+def test_normalize_level1_to_h1():
     result = normalize_heading_levels("# 1 Einleitung\nText")
-    assert result.startswith("## 1 Einleitung")
+    assert result.startswith("# 1 Einleitung")
 
 
-def test_normalize_level2_to_h3():
+def test_normalize_level2_to_h2():
     result = normalize_heading_levels("# 1.1 Abschnitt\nText")
-    assert result.startswith("### 1.1 Abschnitt")
+    assert result.startswith("## 1.1 Abschnitt")
 
 
-def test_normalize_level3_to_h4():
+def test_normalize_level3_to_h3():
     result = normalize_heading_levels("# 1.1.1 Unterabschnitt\nText")
-    assert result.startswith("#### 1.1.1 Unterabschnitt")
+    assert result.startswith("### 1.1.1 Unterabschnitt")
 
 
 def test_normalize_non_numbered_unchanged():
@@ -511,15 +511,15 @@ def test_fix_concatenated_stats_cells_no_change_needed():
 # ---------------------------------------------------------------------------
 
 def test_normalize_4level_depth():
-    """4.1.1.1 (3 Punkte) → H5 (#####)."""
+    """4.1.1.1 (3 Punkte) → H4 (####)."""
     result = normalize_heading_levels("# 4.1.1.1 Tief\nText")
-    assert result.startswith("##### 4.1.1.1 Tief")
+    assert result.startswith("#### 4.1.1.1 Tief")
 
 
 def test_normalize_5level_depth():
-    """5 Punkte → max H6 (######)."""
+    """4 Punkte → H5 (#####)."""
     result = normalize_heading_levels("# 1.2.3.4.5 Sehr tief\nText")
-    assert result.startswith("###### 1.2.3.4.5 Sehr tief")
+    assert result.startswith("##### 1.2.3.4.5 Sehr tief")
 
 
 # ---------------------------------------------------------------------------
@@ -788,20 +788,35 @@ def test_strip_y_prefix_multiline():
 # Gruppe 24: build_interleaved_word_document – unnummerierte Headings in Nav
 # ---------------------------------------------------------------------------
 
+def _run_interleaved(orig_md: str, summary_md: str) -> list:
+    """Hilfsfunktion: build_interleaved_word_document in Temp-Datei ausführen, Paragraphs zurückgeben."""
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        build_interleaved_word_document(
+            translated_text=orig_md,
+            summary_text=summary_md,
+            qa_text="",
+            output_path=tmp_path,
+        )
+        from docx import Document as _Doc
+        doc = _Doc(tmp_path)
+        return [p for p in doc.paragraphs if p.text.strip()]
+    finally:
+        os.unlink(tmp_path)
+
+
 def test_interleaved_unnumbered_heading_not_in_nav():
-    """Unnummerierte Sektion mit Summary → Normal-Style (kein Heading), erster Run bold."""
-    orig_md = "## Was ist das?\n\nHier steht der Originaltext."
-    sum_lookup = {"Was ist das?": "Kurze Zusammenfassung des Inhalts."}
-    doc = build_interleaved_word_document(
-        translated_text=orig_md,
-        summary_text="## Was ist das?\n\nKurze Zusammenfassung des Inhalts.",
-        qa_result="",
-        output_path=None,
-    )
-    non_empty = [p for p in doc.paragraphs if p.text.strip()]
-    heading_para = non_empty[0]
+    """Unnummerierte H3-Sektion mit Summary → Normal-Style (kein Heading), erster Run bold."""
+    # H3 (###) unnummeriert: display_level=3 > 2 → Normal+bold, nicht in Nav
+    orig_md = "## 5.1 Kapitel\n\n### Was ist das?\n\nHier steht der Originaltext."
+    sum_md = "## 5.1 Kapitel\n\nZusammenfassung Kap.\n\n### Was ist das?\n\nKurze Zusammenfassung."
+    paras = _run_interleaved(orig_md, sum_md)
+    heading_para = next((p for p in paras if "Was ist das" in p.text), None)
+    assert heading_para is not None, "Überschrift 'Was ist das?' nicht im Dokument gefunden"
     assert heading_para.style.name == 'Normal', (
-        f"Unnummerierte Überschrift soll Normal-Style haben, erhalten: {heading_para.style.name!r}"
+        f"Unnummerierte H3-Überschrift soll Normal-Style haben, erhalten: {heading_para.style.name!r}"
     )
     assert heading_para.runs and heading_para.runs[0].bold, \
         "Unnummerierte Überschrift soll bold=True sein"
@@ -810,14 +825,22 @@ def test_interleaved_unnumbered_heading_not_in_nav():
 def test_interleaved_numbered_heading_in_nav():
     """Nummerierte Sektion mit Summary → Heading-Style (erscheint in Nav)."""
     orig_md = "## 5.1 Einführung\n\nHier steht der Originaltext."
-    doc = build_interleaved_word_document(
-        translated_text=orig_md,
-        summary_text="## 5.1 Einführung\n\nKurze Zusammenfassung.",
-        qa_result="",
-        output_path=None,
-    )
-    non_empty = [p for p in doc.paragraphs if p.text.strip()]
-    heading_para = non_empty[0]
+    sum_md = "## 5.1 Einführung\n\nKurze Zusammenfassung."
+    paras = _run_interleaved(orig_md, sum_md)
+    heading_para = next((p for p in paras if "5.1 Einführung" in p.text), None)
+    assert heading_para is not None, "Überschrift '5.1 Einführung' nicht im Dokument gefunden"
     assert 'Heading' in heading_para.style.name or heading_para.style.name.startswith('berschrift'), (
         f"Nummerierte Überschrift soll Heading-Style haben, erhalten: {heading_para.style.name!r}"
+    )
+
+
+def test_interleaved_unnumbered_h2_in_nav():
+    """Unnummerierte H2-Sektion → Heading-Style (strukturelles Kapitel erscheint in Nav)."""
+    orig_md = "## Einführung\n\nHier steht der Originaltext."
+    sum_md = "## Einführung\n\nKurze Zusammenfassung."
+    paras = _run_interleaved(orig_md, sum_md)
+    heading_para = next((p for p in paras if "Einführung" in p.text), None)
+    assert heading_para is not None, "Überschrift 'Einführung' nicht im Dokument gefunden"
+    assert 'Heading' in heading_para.style.name or heading_para.style.name.startswith('berschrift'), (
+        f"Unnummerierte H2-Überschrift soll Heading-Style haben (display_level<=2), erhalten: {heading_para.style.name!r}"
     )

@@ -582,7 +582,7 @@ def normalize_heading_levels(text: str) -> str:
             num_m = re.match(r'^(\d+(?:\.\d+)*)(\s|$)', clean_nohtml)
             if num_m:
                 dots = num_m.group(1).count('.')
-                new_level = '#' * min(dots + 2, 6)
+                new_level = '#' * min(dots + 1, 6)
                 result.append(f'{new_level} {content}')
             else:
                 result.append(line)
@@ -1334,7 +1334,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         if originally_numbered and not sum_body.strip() and not has_children and not orig_body.strip():
             continue
 
-        if originally_numbered:
+        if originally_numbered or display_level <= 2:
             h = doc.add_heading(clean_heading, level=display_level)
             _set_heading_color(h, MM_HEADING_COLORS.get(display_level, MM_HEADING_COLORS[9]))
         else:
