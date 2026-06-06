@@ -857,3 +857,20 @@ def test_interleaved_unnumbered_h2_not_in_nav_when_numbered_doc():
         f"Unnummerierte H2 in numm. Dokument soll Normal-Style haben, erhalten: {heading_para.style.name!r}"
     )
     assert heading_para.runs and heading_para.runs[0].bold, "Soll bold=True sein"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 25: has_children erkennt unnummerierte Folge-Sektion als konzept. Kind
+# ---------------------------------------------------------------------------
+
+def test_numbered_section_not_skipped_when_followed_by_unnumbered():
+    """Nummerierte Sektion ohne Body/Summary erscheint, wenn direkt danach unnummerierte Sektion folgt."""
+    # 5.3 hat keinen Body und kein Summary, aber "Agilität" (unnummeriert) folgt direkt
+    orig_md = "## 5.3 Überblick\n\n## Agilität\n\nKompetenz-Inhalt hier."
+    sum_md = "## Agilität\n\nAgilität-Zusammenfassung."
+    paras = _run_interleaved(orig_md, sum_md)
+    # 5.3 muss im Dokument erscheinen (nicht übersprungen)
+    heading_para = next((p for p in paras if "5.3 Überblick" in p.text), None)
+    assert heading_para is not None, "5.3 Überblick soll nicht übersprungen werden (has_children via unnummerierte Folgesektion)"
+    assert 'Heading' in heading_para.style.name or heading_para.style.name.startswith('berschrift'), \
+        f"5.3 soll Heading-Style haben, erhalten: {heading_para.style.name!r}"

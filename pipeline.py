@@ -1327,10 +1327,16 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         sum_body = sum_lookup.get(lookup_key, '')
         originally_numbered = bool(re.match(r'^\d', lookup_key))
 
+        _next_sec = orig_sections[idx + 1] if idx + 1 < len(orig_sections) else None
+        _next_is_unnumbered = (
+            _next_sec is not None and
+            _next_sec['heading'] != '__preamble__' and
+            not re.match(r'^\d', _clean_heading_text(_next_sec['heading']).strip())
+        )
         has_children = (
-            idx + 1 < len(orig_sections) and
-            orig_sections[idx + 1]['heading'] != '__preamble__' and
-            orig_sections[idx + 1]['level'] > level
+            _next_sec is not None and
+            _next_sec['heading'] != '__preamble__' and
+            (_next_sec['level'] > level or _next_is_unnumbered)
         )
         # Unnummerierte Sections ohne Summary: immer überspringen.
         # has_children wird bewusst ignoriert – ein "tieferes" nummeriertes Nachbar-Kapitel
