@@ -808,18 +808,21 @@ def _run_interleaved(orig_md: str, summary_md: str) -> list:
 
 
 def test_interleaved_unnumbered_heading_not_in_nav():
-    """Unnummerierte H3-Sektion mit Summary → Normal-Style (kein Heading), erster Run bold."""
-    # H3 (###) unnummeriert: display_level=3 > 2 → Normal+bold, nicht in Nav
-    orig_md = "## 5.1 Kapitel\n\n### Was ist das?\n\nHier steht der Originaltext."
-    sum_md = "## 5.1 Kapitel\n\nZusammenfassung Kap.\n\n### Was ist das?\n\nKurze Zusammenfassung."
+    """Wiederkehrende unnummerierte Überschrift (freq>1) → Normal+Bold, nicht in Nav."""
+    # "Was ist das?" erscheint unter 5.1 UND 5.2 → freq=2 → kein Auto-Nummerierung
+    orig_md = (
+        "## 5.1 Kapitel\n\n### Was ist das?\n\nDefinition A.\n\n"
+        "## 5.2 Anderes\n\n### Was ist das?\n\nDefinition B."
+    )
+    sum_md = "## 5.1 Kapitel\n\nZusammenfassung.\n\n### Was ist das?\n\nKurze Zusammenfassung."
     paras = _run_interleaved(orig_md, sum_md)
     heading_para = next((p for p in paras if "Was ist das" in p.text), None)
     assert heading_para is not None, "Überschrift 'Was ist das?' nicht im Dokument gefunden"
     assert heading_para.style.name == 'Normal', (
-        f"Unnummerierte H3-Überschrift soll Normal-Style haben, erhalten: {heading_para.style.name!r}"
+        f"Wiederkehrende Überschrift soll Normal-Style haben, erhalten: {heading_para.style.name!r}"
     )
     assert heading_para.runs and heading_para.runs[0].bold, \
-        "Unnummerierte Überschrift soll bold=True sein"
+        "Wiederkehrende Überschrift soll bold=True sein"
 
 
 def test_interleaved_numbered_heading_in_nav():
@@ -847,14 +850,18 @@ def test_interleaved_unnumbered_h2_in_nav_when_no_numbered():
 
 
 def test_interleaved_unnumbered_h2_not_in_nav_when_numbered_doc():
-    """Unnummerierte H2 in Dokument MIT nummerierten Kapiteln → Normal+Bold (nicht in Nav)."""
-    orig_md = "## 5.1 Einführung\n\nKapiteltext.\n\n## Woran erkenne ich das?\n\nSubsektionstext."
-    sum_md = "## 5.1 Einführung\n\nZusammenfassung.\n\n## Woran erkenne ich das?\n\nSub-Zusammenfassung."
+    """Wiederkehrende unnummerierte H2 in numm. Dokument → Normal+Bold (nicht in Nav)."""
+    # "Woran erkenne ich das?" erscheint zweimal → freq=2 → kein Auto-Nummerierung
+    orig_md = (
+        "## 5.1 Einführung\n\nKapiteltext.\n\n## Woran erkenne ich das?\n\nText A.\n\n"
+        "## 5.2 Weiteres\n\nKapiteltext.\n\n## Woran erkenne ich das?\n\nText B."
+    )
+    sum_md = "## 5.1 Einführung\n\nZusammenfassung.\n\n## 5.2 Weiteres\n\nZusammenfassung 2."
     paras = _run_interleaved(orig_md, sum_md)
     heading_para = next((p for p in paras if "Woran erkenne ich" in p.text), None)
     assert heading_para is not None, "Überschrift 'Woran erkenne ich das?' nicht gefunden"
     assert heading_para.style.name == 'Normal', (
-        f"Unnummerierte H2 in numm. Dokument soll Normal-Style haben, erhalten: {heading_para.style.name!r}"
+        f"Wiederkehrende H2 in numm. Dokument soll Normal-Style haben, erhalten: {heading_para.style.name!r}"
     )
     assert heading_para.runs and heading_para.runs[0].bold, "Soll bold=True sein"
 
