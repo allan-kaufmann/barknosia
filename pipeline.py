@@ -1386,21 +1386,27 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             _next_sec['heading'] != '__preamble__' and
             (_next_sec['level'] > level or _next_is_unnumbered)
         )
-        # Unnummerierte Sections ohne Zusammenfassung überspringen.
-        # Ihr Inhalt ist typischerweise in der übergeordneten Sektion zusammengefasst.
-        if not originally_numbered and not sum_body.strip():
-            continue
-        # Nummerierte leere Sections ohne Kinder/Body ebenfalls weglassen
-        if originally_numbered and not sum_body.strip() and not has_children and not orig_body.strip():
+        # Nur wirklich leere Sektionen überspringen (kein Original, kein Summary, keine Kinder).
+        if not sum_body.strip() and not orig_body.strip() and not has_children:
             continue
 
-        nav_worthy = originally_numbered if has_numbered_chapters else (display_level <= 2)
-        if nav_worthy:
-            h = doc.add_heading(clean_heading, level=display_level)
-            _set_heading_color(h, MM_HEADING_COLORS.get(display_level, MM_HEADING_COLORS[9]))
+        # Überschrift sichtbar: wenn Zusammenfassung vorhanden ODER Elternkapitel mit Kindern.
+        # Sonst ausgeblendet — Originalinhalt bleibt im Dokument, ist im Summary-View aber
+        # unsichtbar → kein leerer Gliederungspunkt, kein verlorener Inhalt.
+        show_heading_visible = bool(sum_body.strip()) or has_children
+        if show_heading_visible:
+            nav_worthy = originally_numbered if has_numbered_chapters else (display_level <= 2)
+            if nav_worthy:
+                h = doc.add_heading(clean_heading, level=display_level)
+                _set_heading_color(h, MM_HEADING_COLORS.get(display_level, MM_HEADING_COLORS[9]))
+            else:
+                h = doc.add_paragraph(style='Normal')
+                h.add_run(clean_heading).bold = True
         else:
+            # Überschrift ausblenden wie den Originaltext darunter
             h = doc.add_paragraph(style='Normal')
             h.add_run(clean_heading).bold = True
+            _hide_paragraph(h, indent_cm=1.5)
 
         # Zusammenfassung + Kommentar-Erkennung
         if sum_body.strip():
