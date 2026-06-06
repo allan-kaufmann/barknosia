@@ -1290,11 +1290,14 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             orig_sections[idx + 1]['heading'] != '__preamble__' and
             orig_sections[idx + 1]['level'] > level
         )
-        if not sum_body.strip() and not has_children:
-            if not originally_numbered:
-                continue  # Nicht-nummerierte Sections (Beispiel, Exkurs etc.) ohne Summary weglassen
-            if not orig_body.strip():
-                continue  # Nummerierte leere Sections ebenfalls weglassen
+        # Unnummerierte Sections ohne Summary: immer überspringen.
+        # has_children wird bewusst ignoriert – ein "tieferes" nummeriertes Nachbar-Kapitel
+        # (z. B. 4.3.2 auf H4 nach "• Einordnung" auf H3) ist kein echtes Kind.
+        if not originally_numbered and not sum_body.strip():
+            continue
+        # Nummerierte leere Sections ohne Kinder/Body ebenfalls weglassen
+        if originally_numbered and not sum_body.strip() and not has_children and not orig_body.strip():
+            continue
 
         h = doc.add_heading(clean_heading, level=display_level)
         _set_heading_color(h, MM_HEADING_COLORS.get(display_level, MM_HEADING_COLORS[9]))
