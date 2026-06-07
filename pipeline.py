@@ -405,6 +405,77 @@ def split_into_level1_chapters(text: str) -> list:
     return chapters
 
 
+def _split_at_level2(chapter_text: str) -> tuple[str, list[dict]]:
+    """
+    Teilt einen Kapiteltext an ## Überschriften (genau 2 Rauten, nicht ###) auf.
+    Gibt zurück: (preamble_text, [{'heading': str, 'text': str}, ...])
+    Der preamble ist der Text vor der ersten ## Überschrift.
+    """
+    lines = chapter_text.split('\n')
+    preamble_lines: list[str] = []
+    sections: list[dict] = []
+    current_heading: str | None = None
+    current_lines: list[str] = []
+
+    for line in lines:
+        m = re.match(r'^##\s+(.+)$', line)
+        if m:
+            if current_heading is not None:
+                sections.append({'heading': current_heading, 'text': '\n'.join(current_lines)})
+            elif current_lines:
+                preamble_lines = current_lines[:]
+            current_heading = m.group(1).strip()
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+    if current_heading is not None:
+        sections.append({'heading': current_heading, 'text': '\n'.join(current_lines)})
+    elif current_lines and not preamble_lines:
+        preamble_lines = current_lines
+
+    return '\n'.join(preamble_lines), sections
+
+
+def _summarize_chapter_by_sections(ch: dict, out_dir: Path) -> str:
+    """
+    Für große Kapitel (> 3 Level-2-Sections): jede Section einzeln zusammenfassen.
+    Caching: je Section eine eigene Datei zusammenfassung_kap_XX_YY.md.
+    Kombinierter Output wird immer frisch aus Sub-Caches gebaut (kein äußeres load_or_run).
+    """
+    i = ch['index']
+    preamble, sections = _split_at_level2(ch['full_text'])
+    parts: list[str] = []
+
+    if preamble.strip():
+        preamble_file = out_dir / f"zusammenfassung_kap_{i:02d}_00.md"
+        needs_call = not preamble_file.exists()
+        preamble_summary = load_or_run(
+            preamble_file,
+            lambda: _summarize_single_chapter(ch['heading'], preamble),
+            f"Zusammenfassung Kap. {i} Einleitung: {ch['heading'][:50]}"
+        )
+        parts.append(preamble_summary)
+        if needs_call:
+            time.sleep(1)
+
+    for j, sec in enumerate(sections, start=1):
+        sec_file = out_dir / f"zusammenfassung_kap_{i:02d}_{j:02d}.md"
+        needs_call = not sec_file.exists()
+        sec_summary = load_or_run(
+            sec_file,
+            lambda s=sec: _summarize_single_chapter(s['heading'], s['text']),
+            f"Zusammenfassung Kap. {i}.{j:02d}: {sec['heading'][:50]}"
+        )
+        if not re.match(r'^#+\s', sec_summary.strip()):
+            sec_summary = f"## {sec['heading']}\n\n{sec_summary}"
+        parts.append(sec_summary)
+        if needs_call:
+            time.sleep(1)
+
+    return '\n\n'.join(parts)
+
+
 def _summarize_single_chapter(heading: str, chapter_text: str) -> str:
     """Erstellt eine lernorientierte Zusammenfassung für ein einzelnes Kapitel."""
     prompt = (
@@ -470,15 +541,27 @@ def generate_summary_by_chapter(text: str, out_dir: Path) -> str:
 
     summaries = []
     for i, chapter in enumerate(chapters, 1):
-        cache_path = out_dir / f"zusammenfassung_kap_{i:02d}.md"
-        label = f"Zusammenfassung Kap. {i}: {chapter['heading'][:60]}"
-        chapter_summary = load_or_run(
-            cache_path,
-            lambda ch=chapter: _summarize_single_chapter(ch['heading'], ch['full_text']),
-            label
-        )
+        chapter['index'] = i
+        _, level2_secs = _split_at_level2(chapter['full_text'])
+
+        if len(level2_secs) > 3:
+            # Großes Kapitel: 1 API-Call pro Level-2-Section (verhindert strukturell Auslassungen).
+            # Kein äußeres load_or_run – _summarize_chapter_by_sections cacht intern pro Section.
+            print(f"[INFO] Kap. {i} hat {len(level2_secs)} Level-2-Sections → Pro-Section-Modus")
+            chapter_summary = _summarize_chapter_by_sections(chapter, out_dir)
+            cache_path = out_dir / f"zusammenfassung_kap_{i:02d}.md"
+            cache_path.write_text(chapter_summary, encoding="utf-8")
+        else:
+            cache_path = out_dir / f"zusammenfassung_kap_{i:02d}.md"
+            label = f"Zusammenfassung Kap. {i}: {chapter['heading'][:60]}"
+            chapter_summary = load_or_run(
+                cache_path,
+                lambda ch=chapter: _summarize_single_chapter(ch['heading'], ch['full_text']),
+                label
+            )
+            time.sleep(1)
+
         summaries.append(chapter_summary)
-        time.sleep(1)  # kurze Pause zwischen API-Calls
 
     combined = "\n\n".join(summaries)
     (out_dir / "zusammenfassung.md").write_text(combined, encoding="utf-8")

@@ -31,6 +31,8 @@ from pipeline import (
     _set_cell_text,
     _strip_ocr_y_prefix,
     build_interleaved_word_document,
+    _split_at_level2,
+    _summarize_chapter_by_sections,
 )
 
 
@@ -1116,4 +1118,137 @@ def test_placeholder_section_skipped():
     )
     # "Wo finde ich" darf erscheinen (hat Summary)
     assert any("Wo finde ich" in t for t in all_texts), "'Wo finde ich' fehlt im Dokument"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 31: _split_at_level2 – Splitting-Funktion
+# ---------------------------------------------------------------------------
+
+def test_split_at_level2_with_preamble():
+    """Preamble-Text vor erstem ## wird korrekt separiert."""
+    text = "Intro text.\n\n## Agilität\nContent A.\n\n## Belastbarkeit\nContent B."
+    preamble, sections = _split_at_level2(text)
+    assert "Intro text" in preamble
+    assert len(sections) == 2
+    assert sections[0]['heading'] == 'Agilität'
+    assert sections[1]['heading'] == 'Belastbarkeit'
+    assert 'Content A' in sections[0]['text']
+    assert 'Content B' in sections[1]['text']
+
+
+def test_split_at_level2_no_preamble():
+    """Text ohne Preamble liefert leeren Preamble-String."""
+    text = "## Agilität\nContent A.\n\n## Belastbarkeit\nContent B."
+    preamble, sections = _split_at_level2(text)
+    assert preamble.strip() == ''
+    assert len(sections) == 2
+
+
+def test_split_at_level2_preserves_sub_headings():
+    """### Unter-Headings bleiben innerhalb ihrer Section (kein Split daran)."""
+    text = "## Agilität\n### On the job\nOTJ.\n### Off the job\nOFJ.\n\n## Belastbarkeit\nText."
+    preamble, sections = _split_at_level2(text)
+    assert len(sections) == 2
+    assert '### On the job' in sections[0]['text']
+    assert '### Off the job' in sections[0]['text']
+
+
+def test_split_at_level2_empty_text():
+    """Leerer Text liefert leeren Preamble und keine Sections."""
+    preamble, sections = _split_at_level2('')
+    assert preamble == ''
+    assert sections == []
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 32: _summarize_chapter_by_sections – Pro-Section-Summarisierung
+# ---------------------------------------------------------------------------
+
+def test_summarize_chapter_by_sections_calls_per_section(tmp_path, monkeypatch):
+    """Jede Level-2-Section bekommt einen eigenen _summarize_single_chapter-Call."""
+    calls = []
+
+    def fake_summarize(heading, text):
+        calls.append(heading)
+        return f"## {heading}\n- Zusammenfassung."
+
+    monkeypatch.setattr('pipeline._summarize_single_chapter', fake_summarize)
+    monkeypatch.setattr('pipeline.time.sleep', lambda _: None)
+
+    ch = {
+        'index': 0,
+        'heading': '5.3 Kompetenzen',
+        'full_text': (
+            '## Agilität\nText.\n\n'
+            '## Belastbarkeit\nText.\n\n'
+            '## Durchsetzung\nText.\n\n'
+            '## Einfühlungsvermögen\nText.'
+        )
+    }
+    result = _summarize_chapter_by_sections(ch, tmp_path)
+    assert len(calls) == 4
+    assert 'Agilität' in calls
+    assert 'Belastbarkeit' in calls
+    assert 'Agilität' in result
+    assert 'Belastbarkeit' in result
+
+
+def test_summarize_chapter_by_sections_preamble_included(tmp_path, monkeypatch):
+    """Preamble-Text vor erster Section wird separat zusammengefasst."""
+    calls = []
+
+    def fake_summarize(heading, text):
+        calls.append(heading)
+        return f"## {heading}\n- Summary."
+
+    monkeypatch.setattr('pipeline._summarize_single_chapter', fake_summarize)
+    monkeypatch.setattr('pipeline.time.sleep', lambda _: None)
+
+    ch = {
+        'index': 1,
+        'heading': 'Kapitel 5',
+        'full_text': 'Einleitungstext zum Kapitel.\n\n## Agilität\nText.\n\n## Belastbarkeit\nText.\n\n## Durchsetzung\nText.\n\n## Ausdauer\nText.'
+    }
+    result = _summarize_chapter_by_sections(ch, tmp_path)
+    # 4 Sections + 1 Preamble = 5 calls
+    assert len(calls) == 5
+    assert calls[0] == 'Kapitel 5'  # Preamble-Call nutzt Kapitel-Heading
+
+
+def test_summarize_chapter_by_sections_caching(tmp_path, monkeypatch):
+    """Zweiter Aufruf überspringt API-Calls für bereits gecachte Sub-Sections."""
+    call_count = [0]
+
+    def counting_summarize(heading, text):
+        call_count[0] += 1
+        return f"## {heading}\n- Cached."
+
+    monkeypatch.setattr('pipeline._summarize_single_chapter', counting_summarize)
+    monkeypatch.setattr('pipeline.time.sleep', lambda _: None)
+
+    ch = {
+        'index': 0,
+        'heading': 'X',
+        'full_text': '## A\nT.\n\n## B\nT.\n\n## C\nT.\n\n## D\nT.'
+    }
+    _summarize_chapter_by_sections(ch, tmp_path)
+    assert call_count[0] == 4
+
+    call_count[0] = 0
+    _summarize_chapter_by_sections(ch, tmp_path)  # alle gecacht → kein API-Call
+    assert call_count[0] == 0
+
+
+def test_summarize_chapter_by_sections_combined_contains_all(tmp_path, monkeypatch):
+    """Kombinierter Output enthält alle Section-Headings."""
+    monkeypatch.setattr('pipeline._summarize_single_chapter',
+                        lambda h, t: f"## {h}\n- Punkt 1.\n- Punkt 2.")
+    monkeypatch.setattr('pipeline.time.sleep', lambda _: None)
+
+    headings = [f'Kompetenz{i}' for i in range(1, 8)]
+    full_text = '\n\n'.join(f'## {h}\nText.' for h in headings)
+    ch = {'index': 3, 'heading': '5.3', 'full_text': full_text}
+    result = _summarize_chapter_by_sections(ch, tmp_path)
+    for h in headings:
+        assert h in result, f"'{h}' fehlt im kombinierten Output"
 
