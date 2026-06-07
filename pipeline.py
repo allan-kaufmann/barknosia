@@ -505,11 +505,16 @@ def _summarize_single_chapter(heading: str, chapter_text: str) -> str:
             f"als eigene Überschrift erscheinen:\n{_rlist}\n"
             "Jeder Abschnitt benötigt mindestens 1 Stichpunkt. Keiner darf fehlen!\n"
         )
+    # Große Kapitel brauchen mehr Output-Token – Default ~8192 reicht nicht für 100+ Abschnitte.
+    _out_tokens = 65536 if len(_required) > 10 else 8192
     try:
         response = call_gemini_with_retry(
             model_name='gemini-2.5-pro',
             contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.2)
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=_out_tokens
+            )
         )
         return response.text
     except Exception as e:
@@ -541,27 +546,15 @@ def generate_summary_by_chapter(text: str, out_dir: Path) -> str:
 
     summaries = []
     for i, chapter in enumerate(chapters, 1):
-        chapter['index'] = i
-        _, level2_secs = _split_at_level2(chapter['full_text'])
-
-        if len(level2_secs) > 3:
-            # Großes Kapitel: 1 API-Call pro Level-2-Section (verhindert strukturell Auslassungen).
-            # Kein äußeres load_or_run – _summarize_chapter_by_sections cacht intern pro Section.
-            print(f"[INFO] Kap. {i} hat {len(level2_secs)} Level-2-Sections → Pro-Section-Modus")
-            chapter_summary = _summarize_chapter_by_sections(chapter, out_dir)
-            cache_path = out_dir / f"zusammenfassung_kap_{i:02d}.md"
-            cache_path.write_text(chapter_summary, encoding="utf-8")
-        else:
-            cache_path = out_dir / f"zusammenfassung_kap_{i:02d}.md"
-            label = f"Zusammenfassung Kap. {i}: {chapter['heading'][:60]}"
-            chapter_summary = load_or_run(
-                cache_path,
-                lambda ch=chapter: _summarize_single_chapter(ch['heading'], ch['full_text']),
-                label
-            )
-            time.sleep(1)
-
+        cache_path = out_dir / f"zusammenfassung_kap_{i:02d}.md"
+        label = f"Zusammenfassung Kap. {i}: {chapter['heading'][:60]}"
+        chapter_summary = load_or_run(
+            cache_path,
+            lambda ch=chapter: _summarize_single_chapter(ch['heading'], ch['full_text']),
+            label
+        )
         summaries.append(chapter_summary)
+        time.sleep(1)
 
     combined = "\n\n".join(summaries)
     (out_dir / "zusammenfassung.md").write_text(combined, encoding="utf-8")

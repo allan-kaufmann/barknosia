@@ -33,6 +33,7 @@ from pipeline import (
     build_interleaved_word_document,
     _split_at_level2,
     _summarize_chapter_by_sections,
+    _summarize_single_chapter,
 )
 
 
@@ -1251,4 +1252,42 @@ def test_summarize_chapter_by_sections_combined_contains_all(tmp_path, monkeypat
     result = _summarize_chapter_by_sections(ch, tmp_path)
     for h in headings:
         assert h in result, f"'{h}' fehlt im kombinierten Output"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 33: max_output_tokens – Token-Limit je Kapitelgröße
+# ---------------------------------------------------------------------------
+
+def test_summarize_single_chapter_large_uses_high_token_limit(monkeypatch):
+    """Bei > 10 Level-2-Sections wird max_output_tokens=65536 gesetzt."""
+    captured_config = []
+
+    def fake_call(model_name, contents, config, **kwargs):
+        captured_config.append(config)
+        class R:
+            text = "## Agilität\n- Punkt."
+        return R()
+
+    monkeypatch.setattr('pipeline.call_gemini_with_retry', fake_call)
+    chapter_text = '\n\n'.join(f'## Kompetenz{i}\nText.' for i in range(15))
+    _summarize_single_chapter('5.3 Test', chapter_text)
+    assert len(captured_config) == 1
+    assert captured_config[0].max_output_tokens == 65536
+
+
+def test_summarize_single_chapter_small_uses_default_token_limit(monkeypatch):
+    """Bei ≤ 10 Level-2-Sections wird max_output_tokens=8192 gesetzt."""
+    captured_config = []
+
+    def fake_call(model_name, contents, config, **kwargs):
+        captured_config.append(config)
+        class R:
+            text = "## Intro\n- Punkt."
+        return R()
+
+    monkeypatch.setattr('pipeline.call_gemini_with_retry', fake_call)
+    chapter_text = '\n\n'.join(f'## Abschnitt{i}\nText.' for i in range(5))
+    _summarize_single_chapter('Kap. 1', chapter_text)
+    assert len(captured_config) == 1
+    assert captured_config[0].max_output_tokens == 8192
 
