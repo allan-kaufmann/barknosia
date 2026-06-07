@@ -930,17 +930,22 @@ def test_auto_numbering_recurring_heading_stays_bold_not_nav():
 def test_unnumbered_sibling_heading_hidden_when_no_summary():
     """Unnummerierte Geschwister-Sektion ohne Summary → Überschrift ausgeblendet.
 
-    'Off the job' und 'On the job' sind gleichrangige Geschwister (selbe Ebene, beide unnummeriert).
-    Keine Zusammenfassung → show_heading_visible=False → Überschrift ausgeblendet (w:vanish).
-    Die vorherige falsche Logik setzte has_children=True für jede unnummerierte Folge-Sektion,
-    was diese Geschwister sichtbar machte.
+    'Off the job' und 'On the job' erscheinen mehrfach (freq>1) → keine Auto-Nummerierung.
+    Ohne Summary → show_heading_visible=False → Überschrift ausgeblendet (w:vanish).
+    Die vorherige falsche Logik setzte has_children=True für jede unnummerierte Folge-Sektion
+    (auch Geschwister), was diese sichtbar machte.
     """
     orig_md = (
         "## 5.3.1 Durchsetzen\n\n"
         "## Off the job\n\nMaßnahme A.\n\n"
-        "## On the job\n\nMaßnahme B."
+        "## On the job\n\nMaßnahme B.\n\n"
+        "## 5.3.2 Empathie\n\n"
+        "## Off the job\n\nMaßnahme C."
     )
-    sum_md = "## 5.3.1 Durchsetzen\n\nZusammenfassung Durchsetzen."
+    sum_md = (
+        "## 5.3.1 Durchsetzen\n\nZusammenfassung Durchsetzen.\n\n"
+        "## 5.3.2 Empathie\n\nZusammenfassung Empathie."
+    )
     paras = _run_interleaved(orig_md, sum_md)
 
     from lxml import etree
