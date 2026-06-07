@@ -495,8 +495,7 @@ def _summarize_single_chapter(heading: str, chapter_text: str) -> str:
         "- Markiere fehlende Unterkapitel oder fehlende Studienergebnisse\n\n"
         f"Kapiteltext:\n{chapter_text}"
     )
-    # Pflichtliste aller Level-2-Unterkapitel hinzufügen (vor allem bei großen Kapiteln wie 5.3
-    # mit 50+ Kompetenzen, damit die KI keine weglässt).
+    # Pflichtliste aller Level-2-Unterkapitel (verhindert Auslassungen durch die KI).
     _required = re.findall(r'^##\s+\*?\*?(.+?)\*?\*?\s*$', chapter_text, re.MULTILINE)
     if len(_required) > 3:
         _rlist = '\n'.join(f'- {_h}' for _h in _required[:80])
@@ -505,19 +504,25 @@ def _summarize_single_chapter(heading: str, chapter_text: str) -> str:
             f"als eigene Überschrift erscheinen:\n{_rlist}\n"
             "Jeder Abschnitt benötigt mindestens 1 Stichpunkt. Keiner darf fehlen!\n"
         )
+    # Große Kapitel: strenge Längenbeschränkung pro Abschnitt damit alle in den Output passen.
+    # 263 Abschnitte × 3 Bullets × 15 Wörter ≈ 12.000 Wörter → passt in 65.536 Output-Token.
+    if len(_required) > 10:
+        prompt += (
+            f"\n\nWICHTIG FÜR DIESES GROSSE KAPITEL ({len(_required)} Abschnitte):\n"
+            "- Maximal 3 Stichpunkte pro Unterabschnitt (Ausnahme: Definition immer vollständig)\n"
+            "- Maximal 20 Wörter pro Stichpunkt\n"
+            "- Vollständigkeit (alle Abschnitte vorhanden) hat ABSOLUTEN Vorrang vor Ausführlichkeit\n"
+            "- Keinen Abschnitt auslassen, lieber sehr kurz als gar nicht!\n"
+        )
     # Große Kapitel brauchen mehr Output-Token – Default ~8192 reicht nicht für 100+ Abschnitte.
-    # thinking_budget=0 deaktiviert Geminis internes Denken: alle Token gehen in den Output,
-    # nicht in interne Reasoning-Schritte (die sonst 40.000+ Token verbrauchen).
     _out_tokens = 65536 if len(_required) > 10 else 8192
-    _thinking = types.ThinkingConfig(thinking_budget=0) if len(_required) > 10 else None
     try:
         response = call_gemini_with_retry(
             model_name='gemini-2.5-pro',
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.2,
-                max_output_tokens=_out_tokens,
-                thinking_config=_thinking
+                max_output_tokens=_out_tokens
             )
         )
         return response.text
