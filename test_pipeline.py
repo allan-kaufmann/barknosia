@@ -1028,3 +1028,92 @@ def test_numbered_parent_hidden_when_all_children_have_no_summary():
     ), "Agilität mit Summary muss sichtbar sein"
 
 
+# ---------------------------------------------------------------------------
+# Gruppe 28: Sequentielle Nummerierung (keine Lücken)
+# ---------------------------------------------------------------------------
+
+def test_sequential_numbering_no_gaps():
+    """3 Kompetenzen, nur 2 in Summary → Navigation zeigt 5.3.1, 5.3.2 statt 5.3.1, 5.3.3."""
+    orig_md = (
+        "## 5.3 Überblick\n\nEinleitungstext.\n\n"
+        "## Agilität\n\nAgilität Originaltext.\n\n"
+        "## Belastbarkeit\n\nBelastbarkeit Originaltext.\n\n"
+        "## Durchsetzungsvermögen\n\nDurchsetzung Originaltext."
+    )
+    sum_md = (
+        "## 5.3 Überblick\n\nÜberblick-Zusammenfassung.\n\n"
+        "## Agilität\n\nAgilität-Zusammenfassung.\n\n"
+        # Belastbarkeit fehlt im Summary
+        "## Durchsetzungsvermögen\n\nDurchsetzung-Zusammenfassung."
+    )
+    paras = _run_interleaved(orig_md, sum_md)
+    visible_texts = [p.text for p in paras]
+
+    # 5.3.1 und 5.3.2 müssen vorhanden sein (keine Lücke 5.3.1, 5.3.3)
+    assert any("5.3.1" in t for t in visible_texts), "5.3.1 fehlt"
+    assert any("5.3.2" in t for t in visible_texts), "5.3.2 fehlt (Lücke statt sequentiell)"
+    # 5.3.3 darf nicht existieren (es gibt nur 2 sichtbare Kompetenzen)
+    assert not any("5.3.3" in t for t in visible_texts), "5.3.3 sollte nicht existieren"
+    # Belastbarkeit bekommt keine sichtbare Nummer – darf nicht in Nav erscheinen
+    belastbarkeit_nav = [t for t in visible_texts if "5.3.2 Belastbarkeit" in t or "5.3.3 Belastbarkeit" in t]
+    assert len(belastbarkeit_nav) == 0, "Belastbarkeit ohne Summary darf keine Nummer haben"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 29: Scoped Lookup (Sub-Sections kompetenzbezogen)
+# ---------------------------------------------------------------------------
+
+def test_scoped_lookup_off_the_job_scoped_per_competency():
+    """'Off the job' unter Kompetenz A soll Inhalt von A zeigen, nicht von B."""
+    orig_md = (
+        "## 5.3 Überblick\n\nEinleitungstext.\n\n"
+        "## Agilität\n\nAgilität Originaltext.\n\n"
+        "## Off the job\n\nMaßnahme Agilität original.\n\n"
+        "## Belastbarkeit\n\nBelastbarkeit Originaltext.\n\n"
+        "## Off the job\n\nMaßnahme Belastbarkeit original."
+    )
+    sum_md = (
+        "## 5.3 Überblick\n\nÜberblick-Zusammenfassung.\n\n"
+        "## Agilität\n\nAgilität-Zusammenfassung.\n\n"
+        "#### Off the job\n\nAgilität-Maßnahme-A.\n\n"
+        "## Belastbarkeit\n\nBelastbarkeit-Zusammenfassung.\n\n"
+        "#### Off the job\n\nBelastbarkeit-Maßnahme-B."
+    )
+    paras = _run_interleaved(orig_md, sum_md)
+    all_texts = " | ".join(p.text for p in paras)
+
+    # Beide Kompetenzen müssen vorhanden sein
+    assert "Agilität" in all_texts, "Agilität fehlt"
+    assert "Belastbarkeit" in all_texts, "Belastbarkeit fehlt"
+    # Beide Off-the-job-Inhalte müssen vorhanden sein (nicht nur der letzte)
+    assert "Agilität-Maßnahme-A" in all_texts, "Agilität Off-the-job-Inhalt fehlt"
+    assert "Belastbarkeit-Maßnahme-B" in all_texts, "Belastbarkeit Off-the-job-Inhalt fehlt"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 30: Platzhalter-Sektionen überspringen
+# ---------------------------------------------------------------------------
+
+def test_placeholder_section_skipped():
+    """Section mit \\_\\_\\_ im Body (OCR-Notizlinien) wird komplett übersprungen."""
+    orig_md = (
+        "## 5.3 Überblick\n\nEinleitungstext.\n\n"
+        "## Agilität\n\nAgilität Originaltext.\n\n"
+        "## Meine persönlichen Anmerkungen\n\n\\_\\_\\_\\_\\_\\_\\_\\_\\_\\_\n\n"
+        "## Wo finde ich noch mehr darüber\n\nLiteraturliste."
+    )
+    sum_md = (
+        "## 5.3 Überblick\n\nÜberblick-Zusammenfassung.\n\n"
+        "## Agilität\n\nAgilität-Zusammenfassung.\n\n"
+        "## Wo finde ich noch mehr darüber\n\nBuch A, Buch B."
+    )
+    paras = _run_interleaved(orig_md, sum_md)
+    all_texts = [p.text for p in paras]
+
+    # "Meine persönlichen Anmerkungen" darf weder sichtbar noch als Heading erscheinen
+    assert not any("Meine persönlichen Anmerkungen" in t for t in all_texts), (
+        "'Meine persönlichen Anmerkungen' (Platzhalter) darf nicht im Dokument erscheinen"
+    )
+    # "Wo finde ich" darf erscheinen (hat Summary)
+    assert any("Wo finde ich" in t for t in all_texts), "'Wo finde ich' fehlt im Dokument"
+

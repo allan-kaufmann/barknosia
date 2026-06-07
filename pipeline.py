@@ -34,11 +34,19 @@ MM_HEADING_COLORS = {
 # Lädt die Umgebungsvariablen aus der .env-Datei
 load_dotenv()
 
-# Gemini API-Client mit der offiziellen Bibliothek initialisieren
-client = genai.Client()
+# Gemini API-Client: lazy initialisiert beim ersten API-Aufruf (nicht beim Import).
+# Verhindert dass Tests ohne API-Key scheitern.
+_gemini_client = None
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        _gemini_client = genai.Client()
+    return _gemini_client
 
 def call_gemini_with_retry(model_name: str, contents, config, max_retries: int = 5, delay: int = 5):
     """Hilfsfunktion: Ruft Gemini auf und wiederholt den Versuch bei Serverüberlastung (503)."""
+    client = _get_gemini_client()
     for attempt in range(1, max_retries + 1):
         try:
             response = client.models.generate_content(
@@ -416,6 +424,16 @@ def _summarize_single_chapter(heading: str, chapter_text: str) -> str:
         "- Markiere fehlende Unterkapitel oder fehlende Studienergebnisse\n\n"
         f"Kapiteltext:\n{chapter_text}"
     )
+    # Pflichtliste aller Level-2-Unterkapitel hinzufügen (vor allem bei großen Kapiteln wie 5.3
+    # mit 50+ Kompetenzen, damit die KI keine weglässt).
+    _required = re.findall(r'^##\s+\*?\*?(.+?)\*?\*?\s*$', chapter_text, re.MULTILINE)
+    if len(_required) > 3:
+        _rlist = '\n'.join(f'- {_h}' for _h in _required[:80])
+        prompt += (
+            f"\n\nPFLICHT-VOLLSTÄNDIGKEIT – folgende {len(_required)} Unterabschnitte MÜSSEN ALLE "
+            f"als eigene Überschrift erscheinen:\n{_rlist}\n"
+            "Jeder Abschnitt benötigt mindestens 1 Stichpunkt. Keiner darf fehlen!\n"
+        )
     try:
         response = call_gemini_with_retry(
             model_name='gemini-2.5-pro',
@@ -1337,6 +1355,21 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             continue
         sum_lookup[normalize_heading(s['heading'])] = s['body']
 
+    # Scoped lookup: parent_key → {child_key → body}
+    # Verhindert Conflation gleichnamiger Sub-Headings (z.B. "Off the job" unter jeder Kompetenz).
+    # Ohne Scoping liefert sum_lookup["off the job"] immer den letzten Eintrag (letzte Kompetenz).
+    sum_scoped: dict[str, dict[str, str]] = {}
+    _scp_parent: str | None = None
+    for _ss in sum_sections:
+        if _ss['heading'] == '__preamble__':
+            continue
+        _ssk = normalize_heading(_ss['heading'])
+        if _ss['level'] <= 2:
+            _scp_parent = _ssk
+            sum_scoped[_ssk] = {'__self__': _ss['body']}
+        elif _scp_parent is not None:
+            sum_scoped[_scp_parent][_ssk] = _ss['body']
+
     # Dokument-Typ bestimmen: hat es nummerierte Kapitel?
     has_numbered_chapters = any(
         re.match(r'^\d', _clean_heading_text(s['heading']).strip())
@@ -1389,6 +1422,21 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                 _any_visible_desc[_pi] = True
                 break
 
+    # Pre-pass: welche Sections werden sichtbar? Nur diese erhalten sequentielle Auto-Nummern.
+    # Ohne diesen Pre-pass entstehen Lücken wie 5.3.1, 5.3.5, 5.3.8 weil unsichtbare Sections
+    # trotzdem nummeriert werden.
+    _visible_section_indices: set[int] = set()
+    for _vi, _vs in enumerate(orig_sections):
+        if _vs['heading'] == '__preamble__':
+            continue
+        if re.search(r'^(?:\\_)+\s*$', _vs['body'], re.MULTILINE):
+            continue  # Platzhalter-Section
+        _vk = normalize_heading(_clean_heading_text(_vs['heading']))
+        if sum_lookup.get(_vk, '').strip() or _any_visible_desc[_vi]:
+            _visible_section_indices.add(_vi)
+
+    _current_competency_key: str | None = None  # aktuell verarbeitete Kompetenz für Scoped Lookup
+
     # --- Interleaved Aufbau ---
     for idx, section in enumerate(orig_sections):
         if section['heading'] == '__preamble__':
@@ -1416,6 +1464,10 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         if skip_references and _is_skip_heading(clean_heading):
             continue
 
+        # Platzhalter-Sektionen (OCR-Notizlinien \_\_\_ im Body) komplett überspringen
+        if re.search(r'^(?:\\_)+\s*$', orig_body, re.MULTILINE):
+            continue
+
         if parent_chapter:
             if re.match(r'^\d', clean_heading):
                 clean_heading = _prefix_chapter_number(clean_heading, parent_chapter)
@@ -1435,17 +1487,28 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         # Auto-Nummerierung: einzigartige unnummerierte Überschriften (freq=1) nach einem
         # nummerierten Kapitel erhalten automatisch eine Unterkapitelnummer (z.B. 5.3.1).
         # Wiederkehrende Überschriften ("Was ist das?" etc.) bleiben unnummeriert.
+        # Nur sichtbare Sections (_visible_section_indices) erhalten eine Nummer → keine Lücken.
         if has_numbered_chapters:
             if originally_numbered:
                 _m = re.match(r'^([\d.]+)', lookup_key)
                 _auto_parent = _m.group(1) if _m else None
                 _auto_counter = 0
+                _current_competency_key = None
             elif _auto_parent is not None and _unnumbered_freq.get(lookup_key, 0) == 1:
-                _auto_counter += 1
-                clean_heading = f"{_auto_parent}.{_auto_counter} {clean_heading}"
                 originally_numbered = True
+                _current_competency_key = lookup_key
+                if idx in _visible_section_indices:
+                    _auto_counter += 1
+                    clean_heading = f"{_auto_parent}.{_auto_counter} {clean_heading}"
                 _dots = clean_heading.split()[0].count('.')
                 display_level = min(_dots + 1, 9)
+
+        # Scoped lookup: Sub-Sections (freq>1, wiederkehrend) unter der aktuellen Kompetenz.
+        # Verhindert dass sum_lookup["off the job"] immer den letzten Summary-Eintrag liefert.
+        if not originally_numbered and _current_competency_key:
+            _scoped = sum_scoped.get(_current_competency_key, {}).get(lookup_key, '')
+            if _scoped.strip():
+                sum_body = _scoped
 
         _next_sec = orig_sections[idx + 1] if idx + 1 < len(orig_sections) else None
         _next_is_unnumbered = (
