@@ -531,7 +531,17 @@ def generate_summary_by_chapter(text: str, out_dir: Path) -> str:
     print("--- Schritt 4: Erstelle kapitelweise Zusammenfassung (via Gemini 2.5 Pro) ---")
 
     text = normalize_heading_levels(text)
+
+    # Preamble-Text (vor erstem nummerierten Heading) extrahieren.
+    # split_into_level1_chapters() verwirft diesen Text sonst kommentarlos.
+    _first_num = re.search(r'^#{1,6}\s+\d', text, re.MULTILINE)
+    _preamble_text = text[:_first_num.start()].strip() if _first_num and _first_num.start() > 0 else ''
+
     chapters = split_into_level1_chapters(text)
+
+    # Preamble zum ersten Kapitel hinzufügen damit Gemini es mitfasst.
+    if _preamble_text and chapters:
+        chapters[0]['full_text'] = _preamble_text + '\n\n' + chapters[0]['full_text']
 
     if not chapters:
         print("   Keine Level-1-Kapitel gefunden, fasse Gesamttext zusammen...")

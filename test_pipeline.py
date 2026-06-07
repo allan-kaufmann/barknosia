@@ -34,6 +34,7 @@ from pipeline import (
     _split_at_level2,
     _summarize_chapter_by_sections,
     _summarize_single_chapter,
+    generate_summary_by_chapter,
 )
 
 
@@ -1290,4 +1291,51 @@ def test_summarize_single_chapter_small_uses_default_token_limit(monkeypatch):
     _summarize_single_chapter('Kap. 1', chapter_text)
     assert len(captured_config) == 1
     assert captured_config[0].max_output_tokens == 8192
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 34: generate_summary_by_chapter – Preamble-Inklusion
+# ---------------------------------------------------------------------------
+
+def test_generate_summary_includes_preamble_in_first_chapter(tmp_path, monkeypatch):
+    """Preamble-Text vor erstem nummerierten Heading landet im ersten Kapitel-Call."""
+    captured_texts = []
+
+    def fake_summarize(heading, text):
+        captured_texts.append(text)
+        return f"## {heading}\n- Summary."
+
+    monkeypatch.setattr('pipeline._summarize_single_chapter', fake_summarize)
+    monkeypatch.setattr('pipeline.time.sleep', lambda _: None)
+
+    md = (
+        "# Kompetenzen wirksam entwickeln\n\nEinleitungstext zum Buch.\n\n"
+        "## 5.1 Anregungen\n\nAnregungstext.\n\n"
+        "## 5.2 Kompetenzen\n\nKompetenztext."
+    )
+    generate_summary_by_chapter(md, tmp_path)
+
+    assert len(captured_texts) >= 1, "Kein Kapitel wurde zusammengefasst"
+    assert (
+        "Kompetenzen wirksam entwickeln" in captured_texts[0]
+        or "Einleitungstext" in captured_texts[0]
+    ), "Preamble-Text fehlt im ersten Kapitel-Call"
+
+
+def test_generate_summary_no_preamble_unchanged(tmp_path, monkeypatch):
+    """Text ohne Preamble (beginnt direkt mit nummiertem Heading) läuft normal durch."""
+    captured_texts = []
+
+    def fake_summarize(heading, text):
+        captured_texts.append(text)
+        return f"## {heading}\n- Summary."
+
+    monkeypatch.setattr('pipeline._summarize_single_chapter', fake_summarize)
+    monkeypatch.setattr('pipeline.time.sleep', lambda _: None)
+
+    md = "## 5.1 Anregungen\n\nAnregungstext.\n\n## 5.2 Kompetenzen\n\nKompetenztext."
+    generate_summary_by_chapter(md, tmp_path)
+
+    assert len(captured_texts) == 2, f"Erwartet 2 Kapitel-Calls, bekam {len(captured_texts)}"
+    assert "Anregungstext" in captured_texts[0]
 
