@@ -927,3 +927,35 @@ def test_auto_numbering_recurring_heading_stays_bold_not_nav():
             f"'Was ist das?' soll Normal-Style haben (wiederkehrend), erhalten: {wp.style.name!r}"
 
 
+def test_unnumbered_sibling_heading_hidden_when_no_summary():
+    """Unnummerierte Geschwister-Sektion ohne Summary → Überschrift ausgeblendet.
+
+    'Off the job' und 'On the job' sind gleichrangige Geschwister (selbe Ebene, beide unnummeriert).
+    Keine Zusammenfassung → show_heading_visible=False → Überschrift ausgeblendet (w:vanish).
+    Die vorherige falsche Logik setzte has_children=True für jede unnummerierte Folge-Sektion,
+    was diese Geschwister sichtbar machte.
+    """
+    orig_md = (
+        "## 5.3.1 Durchsetzen\n\n"
+        "## Off the job\n\nMaßnahme A.\n\n"
+        "## On the job\n\nMaßnahme B."
+    )
+    sum_md = "## 5.3.1 Durchsetzen\n\nZusammenfassung Durchsetzen."
+    paras = _run_interleaved(orig_md, sum_md)
+
+    from lxml import etree
+    from docx.oxml.ns import qn
+
+    off_paras = [p for p in paras if "Off the job" in p.text]
+    assert len(off_paras) >= 1, "'Off the job' muss im Dokument vorhanden sein (Originaltext erhalten)"
+    for p in off_paras:
+        pPr = p._p.find(qn('w:pPr'))
+        has_vanish = False
+        if pPr is not None:
+            rPr = pPr.find(qn('w:rPr'))
+            if rPr is not None and rPr.find(qn('w:vanish')) is not None:
+                has_vanish = True
+        assert has_vanish, \
+            f"'Off the job' ohne Summary soll ausgeblendet (w:vanish) sein, Style: {p.style.name!r}"
+
+

@@ -851,6 +851,18 @@ def _strip_kontrollliste(text: str) -> str:
     return text
 
 
+def _strip_selbstpruefung(text: str) -> str:
+    """Entfernt KI-interne Selbstprüfungs-Blöcke aus der Zusammenfassung.
+    Diese Abschnitte sind KI-Validierungsartefakte und kein Lerninhalt."""
+    text = re.sub(
+        r'(?m)^\*{0,3}\*?\*?Selbstprüfung\*?\*?\*?.*?(?=\n#{1,6}\s|\n\*{3,}|\Z)',
+        '',
+        text,
+        flags=re.DOTALL | re.IGNORECASE
+    )
+    return text
+
+
 def _compress_heading_levels(text: str) -> str:
     """
     Korrigiert inkonsistente OCR-Heading-Ebenen.
@@ -889,8 +901,10 @@ def _strip_ocr_y_prefix(text: str) -> str:
     OCR-Artefakt: Sonderzeichen (Bullet-Pfeil) einer Sonderzeichenschrift wird als 'y' gelesen."""
     lines = []
     for line in text.split('\n'):
-        line = re.sub(r'^(#{1,6}\s+)y\s+', r'\1', line)   # ## y **Titel** → ## **Titel**
-        line = re.sub(r'^([-*]\s+)y\s+', r'\1', line)      # - y Text → - Text
+        # Heading: ## y Titel  ODER  ## **y Titel** (y innerhalb Bold-Marker, wie KI es erzeugt)
+        line = re.sub(r'^(#{1,6}\s+)(\**)y\s+', r'\1\2', line)
+        # Bullet: beliebige Einrückung + Bullet-Marker + y (inkl. eingerückte Sublisten)
+        line = re.sub(r'^(\s*[-*]\s+)y\s+', r'\1', line)
         lines.append(line)
     return '\n'.join(lines)
 
@@ -918,16 +932,17 @@ def _image_display_width(img_path: str, max_in: float = 5.5, assumed_dpi: int = 
 
 def _is_decorative_image(img_path: str, min_px: int = 100) -> bool:
     """True wenn das Bild wahrscheinlich dekorativ ist (Icon, Logo, Randsymbol).
-    Kriterium: kleinste Seite < min_px Pixel → dekorativ, nicht einbetten.
-    Fallback ohne PIL: Dateigröße < 8 KB."""
+    Kriterium: kleinste Seite < min_px ODER Gesamtfläche < 30.000 px² (Krönchen, Symbole).
+    Fallback ohne PIL: Dateigröße < 20 KB."""
     try:
         from PIL import Image as _PILImage
         with _PILImage.open(img_path) as im:
-            return min(im.width, im.height) < min_px
+            w, h = im.width, im.height
+            return min(w, h) < min_px or (w * h) < 30_000
     except Exception:
         pass
     try:
-        return os.path.getsize(img_path) < 8 * 1024
+        return os.path.getsize(img_path) < 20 * 1024
     except Exception:
         return False
 
@@ -1293,8 +1308,11 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         _set_heading_color(h, MM_HEADING_COLORS[1])
 
     # --- Heading-Level normalisieren & Sections parsen ---
+    translated_text = _strip_kontrollliste(translated_text)
     translated_text = normalize_heading_levels(translated_text)
     translated_text = _strip_ocr_y_prefix(translated_text)
+    summary_text    = _strip_kontrollliste(summary_text)
+    summary_text    = _strip_selbstpruefung(summary_text)
     summary_text    = normalize_heading_levels(summary_text)
     summary_text    = _strip_ocr_y_prefix(summary_text)
     orig_sections   = parse_sections(translated_text)
@@ -1330,8 +1348,18 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     # --- Interleaved Aufbau ---
     for idx, section in enumerate(orig_sections):
         if section['heading'] == '__preamble__':
+            sum_preamble = next(
+                (s['body'] for s in sum_sections if s['heading'] == '__preamble__'), ''
+            )
+            # KI-Metatext ("Absolut! Hier ist...") aus Summary-Preamble entfernen
+            sum_preamble = re.sub(
+                r'^[^\n]*(?:absolut|hier ist|lernorientierte)[^\n]*\n?',
+                '', sum_preamble, flags=re.IGNORECASE
+            ).strip()
+            if sum_preamble:
+                process_markdown_to_docx(doc, sum_preamble, hide_text=False, base_path=base_path)
             if section['body']:
-                process_markdown_to_docx(doc, section['body'], base_path=base_path)
+                process_markdown_to_docx(doc, section['body'], hide_text=True, base_path=base_path)
             continue
 
         level     = section['level']
@@ -1384,7 +1412,9 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         has_children = (
             _next_sec is not None and
             _next_sec['heading'] != '__preamble__' and
-            (_next_sec['level'] > level or _next_is_unnumbered)
+            # Echte Kinder: tiefere Ebene ODER nummerierte Section mit unnummeriertem Folger.
+            # Geschwister (unnummeriert → unnummeriert gleicher Ebene) zählen NICHT als Kinder.
+            (_next_sec['level'] > level or (originally_numbered and _next_is_unnumbered))
         )
         # Nur wirklich leere Sektionen überspringen (kein Original, kein Summary, keine Kinder).
         if not sum_body.strip() and not orig_body.strip() and not has_children:
