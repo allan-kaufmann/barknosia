@@ -506,14 +506,18 @@ def _summarize_single_chapter(heading: str, chapter_text: str) -> str:
             "Jeder Abschnitt benötigt mindestens 1 Stichpunkt. Keiner darf fehlen!\n"
         )
     # Große Kapitel brauchen mehr Output-Token – Default ~8192 reicht nicht für 100+ Abschnitte.
+    # thinking_budget=0 deaktiviert Geminis internes Denken: alle Token gehen in den Output,
+    # nicht in interne Reasoning-Schritte (die sonst 40.000+ Token verbrauchen).
     _out_tokens = 65536 if len(_required) > 10 else 8192
+    _thinking = types.ThinkingConfig(thinking_budget=0) if len(_required) > 10 else None
     try:
         response = call_gemini_with_retry(
             model_name='gemini-2.5-pro',
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.2,
-                max_output_tokens=_out_tokens
+                max_output_tokens=_out_tokens,
+                thinking_config=_thinking
             )
         )
         return response.text

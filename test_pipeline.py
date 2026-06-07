@@ -1294,6 +1294,43 @@ def test_summarize_single_chapter_small_uses_default_token_limit(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Gruppe 35: thinking_budget – Thinking deaktiviert für große Kapitel
+# ---------------------------------------------------------------------------
+
+def test_summarize_single_chapter_large_disables_thinking(monkeypatch):
+    """Bei > 10 Level-2-Sections wird thinking_budget=0 gesetzt."""
+    captured_config = []
+
+    def fake_call(model_name, contents, config, **kwargs):
+        captured_config.append(config)
+        class R:
+            text = "## A\n- Punkt."
+        return R()
+
+    monkeypatch.setattr('pipeline.call_gemini_with_retry', fake_call)
+    chapter_text = '\n\n'.join(f'## Kompetenz{i}\nText.' for i in range(15))
+    _summarize_single_chapter('5.3 Test', chapter_text)
+    assert captured_config[0].thinking_config is not None
+    assert captured_config[0].thinking_config.thinking_budget == 0
+
+
+def test_summarize_single_chapter_small_keeps_thinking_default(monkeypatch):
+    """Bei ≤ 10 Level-2-Sections bleibt thinking_config=None (SDK-Standard)."""
+    captured_config = []
+
+    def fake_call(model_name, contents, config, **kwargs):
+        captured_config.append(config)
+        class R:
+            text = "## A\n- Punkt."
+        return R()
+
+    monkeypatch.setattr('pipeline.call_gemini_with_retry', fake_call)
+    chapter_text = '\n\n'.join(f'## Abschnitt{i}\nText.' for i in range(5))
+    _summarize_single_chapter('Kap. 1', chapter_text)
+    assert captured_config[0].thinking_config is None
+
+
+# ---------------------------------------------------------------------------
 # Gruppe 34: generate_summary_by_chapter – Preamble-Inklusion
 # ---------------------------------------------------------------------------
 
