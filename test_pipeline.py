@@ -964,3 +964,62 @@ def test_unnumbered_sibling_heading_hidden_when_no_summary():
             f"'Off the job' ohne Summary soll ausgeblendet (w:vanish) sein, Style: {p.style.name!r}"
 
 
+# ---------------------------------------------------------------------------
+# Gruppe 27: _any_visible_desc – kein sichtbarer Elternknoten ohne sichtbare Kinder
+# ---------------------------------------------------------------------------
+
+def test_numbered_parent_hidden_when_all_children_have_no_summary():
+    """Nummerierter Parent ohne eigenes Summary und ohne Summary in Kindern → komplett hidden.
+
+    Szenario analog zu '5.3.27 Rückmeldung zu Konfliktverhalten' im echten Dokument:
+    Das OCR hat 'Rückmeldung zu Konfliktverhalten' als eigene Kompetenz, die KI-Summary
+    enthält sie NICHT als eigene Überschrift. Auch 'Off the job'/'On the job' haben kein
+    Summary. Früher: has_children=True → sichtbare goldene Leer-Überschrift.
+    Nach Fix: _any_visible_desc=False → has_children=False → hidden.
+    """
+    orig_md = (
+        "## 5.3 Überblick\n\n"
+        "## Rückmeldung zu Konfliktverhalten\n\n"
+        "## Off the job\n\nMaßnahme A.\n\n"
+        "## On the job\n\nMaßnahme B.\n\n"
+        "## Agilität\n\n"
+        "## Off the job\n\nMaßnahme C.\n\n"
+        "## On the job\n\nMaßnahme D."
+    )
+    # Summary hat KEINE Einträge für Rückmeldung, Off/On the job.
+    # Agilität hat ein Summary → Elternknoten "5.3 Überblick" bleibt sichtbar (hat sichtbares Kind).
+    sum_md = (
+        "## 5.3 Überblick\n\nÜberblick-Text.\n\n"
+        "## Agilität\n\nAgilität-Zusammenfassung."
+    )
+    paras = _run_interleaved(orig_md, sum_md)
+
+    from docx.oxml.ns import qn
+
+    # "Rückmeldung zu Konfliktverhalten" muss im Dokument vorhanden sein (Original erhalten)
+    rueckmeldung_paras = [p for p in paras if "Rückmeldung zu Konfliktverhalten" in p.text]
+    assert len(rueckmeldung_paras) >= 1, "'Rückmeldung zu Konfliktverhalten' fehlt im Dokument"
+
+    # Muss als hidden (w:vanish) markiert sein – keine sichtbare Leer-Überschrift
+    for p in rueckmeldung_paras:
+        pPr = p._p.find(qn('w:pPr'))
+        has_vanish = False
+        if pPr is not None:
+            rPr = pPr.find(qn('w:rPr'))
+            if rPr is not None and rPr.find(qn('w:vanish')) is not None:
+                has_vanish = True
+        assert has_vanish, (
+            "'Rückmeldung zu Konfliktverhalten' ohne Summary und ohne sichtbare Kinder "
+            f"soll ausgeblendet sein, Style: {p.style.name!r}"
+        )
+
+    # Zur Sicherheit: "Agilität" MUSS sichtbar sein (hat Summary)
+    agilitat_paras = [p for p in paras if "Agilität" in p.text and "Zusammenfassung" not in p.text]
+    assert any(
+        p._p.find(qn('w:pPr')) is None or
+        (p._p.find(qn('w:pPr')).find(qn('w:rPr')) is None) or
+        (p._p.find(qn('w:pPr')).find(qn('w:rPr')).find(qn('w:vanish')) is None)
+        for p in agilitat_paras
+    ), "Agilität mit Summary muss sichtbar sein"
+
+

@@ -853,12 +853,19 @@ def _strip_kontrollliste(text: str) -> str:
 
 def _strip_selbstpruefung(text: str) -> str:
     """Entfernt KI-interne Selbstprüfungs-Blöcke aus der Zusammenfassung.
-    Diese Abschnitte sind KI-Validierungsartefakte und kein Lerninhalt."""
+    Diese Abschnitte sind KI-Validierungsartefakte und kein Lerninhalt.
+    Unterstützt Varianten: '### **Selbstprüfung**', '**Selbstprüfung**', 'Selbstprüfung'."""
+    # Vorangehendes --- wegstreifen (erscheint typischerweise direkt vor dem Block)
     text = re.sub(
-        r'(?m)^\*{0,3}\*?\*?Selbstprüfung\*?\*?\*?.*?(?=\n#{1,6}\s|\n\*{3,}|\Z)',
+        r'(?m)^---\s*\n(?=(?:#{1,6}\s+)?\*{0,3}\*?\*?[Ss]elbstpr)',
+        '',
+        text
+    )
+    text = re.sub(
+        r'(?m)^(?:#{1,6}\s+)?\*{0,3}\*?\*?[Ss]elbstpr[uü]fung\*?\*?\*?.*?(?=\n#{1,6}\s|\Z)',
         '',
         text,
-        flags=re.DOTALL | re.IGNORECASE
+        flags=re.DOTALL
     )
     return text
 
@@ -898,9 +905,13 @@ def _compress_heading_levels(text: str) -> str:
 
 def _strip_ocr_y_prefix(text: str) -> str:
     """Entfernt isoliertes 'y '-Präfix aus Headings und Bullet-Items.
-    OCR-Artefakt: Sonderzeichen (Bullet-Pfeil) einer Sonderzeichenschrift wird als 'y' gelesen."""
+    OCR-Artefakt: Sonderzeichen (Bullet-Pfeil) einer Sonderzeichenschrift wird als 'y' gelesen.
+    Bereinigt außerdem trailing \\_ Sequenzen in Heading-Zeilen (OCR-Artefakt für Unterstriche)."""
     lines = []
     for line in text.split('\n'):
+        if re.match(r'^#{1,6}\s', line):
+            # Trailing \_ Sequenzen aus Heading-Text entfernen (z.B. "# Titel: \_ \_ \_")
+            line = re.sub(r'(\s*\\_)+\s*$', '', line).rstrip()
         # Heading: ## y Titel  ODER  ## **y Titel** (y innerhalb Bold-Marker, wie KI es erzeugt)
         line = re.sub(r'^(#{1,6}\s+)(\**)y\s+', r'\1\2', line)
         # Bullet: beliebige Einrückung + Bullet-Marker + y (inkl. eingerückte Sublisten)
@@ -931,18 +942,19 @@ def _image_display_width(img_path: str, max_in: float = 5.5, assumed_dpi: int = 
 
 
 def _is_decorative_image(img_path: str, min_px: int = 100) -> bool:
-    """True wenn das Bild wahrscheinlich dekorativ ist (Icon, Logo, Randsymbol).
-    Kriterium: kleinste Seite < min_px ODER Gesamtfläche < 30.000 px² (Krönchen, Symbole).
-    Fallback ohne PIL: Dateigröße < 20 KB."""
+    """True wenn das Bild wahrscheinlich dekorativ ist (Icon, Randsymbol).
+    Kriterium: kleinste Seite < min_px (alle Kronen-Icons haben min ≤ 100 px;
+    Inhaltsbilder wie 'Was ist das?'-Grafiken haben min > 100 px).
+    Fallback ohne PIL: Dateigröße < 10 KB."""
     try:
         from PIL import Image as _PILImage
         with _PILImage.open(img_path) as im:
             w, h = im.width, im.height
-            return min(w, h) < min_px or (w * h) < 30_000
+            return min(w, h) < min_px
     except Exception:
         pass
     try:
-        return os.path.getsize(img_path) < 20 * 1024
+        return os.path.getsize(img_path) < 10 * 1024
     except Exception:
         return False
 
@@ -1345,6 +1357,24 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     _auto_parent: str | None = None  # z. B. "5.3" – aktuelles nummeriertes Elternkapitel
     _auto_counter: int = 0
 
+    # Vorberechnung: hat jede Section mindestens einen Nachfolger mit Summary-Inhalt?
+    # Verhindert sichtbare Leer-Überschriften bei Elternkapiteln, deren Kinder alle
+    # kein Summary haben (z.B. "5.3.27 Rückmeldung zu Konfliktverhalten" → nur Off/On the job).
+    _any_visible_desc: list[bool] = [False] * len(orig_sections)
+    for _pi in range(len(orig_sections)):
+        _ps = orig_sections[_pi]
+        if _ps['heading'] == '__preamble__':
+            continue
+        _plevel = _ps['level']
+        for _ci in range(_pi + 1, len(orig_sections)):
+            _cs = orig_sections[_ci]
+            if _cs['level'] <= _plevel:
+                break  # Nicht mehr im Scope dieses Elternknotens
+            _clk = normalize_heading(_clean_heading_text(_cs['heading']))
+            if sum_lookup.get(_clk, '').strip():
+                _any_visible_desc[_pi] = True
+                break
+
     # --- Interleaved Aufbau ---
     for idx, section in enumerate(orig_sections):
         if section['heading'] == '__preamble__':
@@ -1414,7 +1444,10 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             _next_sec['heading'] != '__preamble__' and
             # Echte Kinder: tiefere Ebene ODER nummerierte Section mit unnummeriertem Folger.
             # Geschwister (unnummeriert → unnummeriert gleicher Ebene) zählen NICHT als Kinder.
-            (_next_sec['level'] > level or (originally_numbered and _next_is_unnumbered))
+            (_next_sec['level'] > level or (originally_numbered and _next_is_unnumbered)) and
+            # Nur als Elternknoten sichtbar wenn min. ein Nachfolger Summary-Inhalt hat —
+            # verhindert goldene Leer-Überschriften ohne sichtbaren Folgeinhalt.
+            _any_visible_desc[idx]
         )
         # Nur wirklich leere Sektionen überspringen (kein Original, kein Summary, keine Kinder).
         if not sum_body.strip() and not orig_body.strip() and not has_children:
