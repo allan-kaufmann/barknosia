@@ -969,20 +969,25 @@ def test_unnumbered_sibling_heading_hidden_when_no_summary():
 # ---------------------------------------------------------------------------
 
 def test_numbered_parent_hidden_when_all_children_have_no_summary():
-    """Nummerierter Parent ohne eigenes Summary und ohne Summary in Kindern → komplett hidden.
+    """Nummerierter Parent ohne eigenes Summary und ohne Summary in Kindern → nicht sichtbar.
 
     Szenario analog zu '5.3.27 Rückmeldung zu Konfliktverhalten' im echten Dokument:
-    Das OCR hat 'Rückmeldung zu Konfliktverhalten' als eigene Kompetenz, die KI-Summary
-    enthält sie NICHT als eigene Überschrift. Auch 'Off the job'/'On the job' haben kein
-    Summary. Früher: has_children=True → sichtbare goldene Leer-Überschrift.
-    Nach Fix: _any_visible_desc=False → has_children=False → hidden.
+    Das OCR hat 'Rückmeldung zu Konfliktverhalten' als eigene Kompetenz mit Originaltext,
+    die KI-Summary enthält sie NICHT als eigene Überschrift. Auch Kinder ('Off the job',
+    'On the job') haben kein Summary.
+    Früher: has_children=True → sichtbare goldene Leer-Überschrift.
+    Nach Fix: _any_visible_desc=False → has_children=False → Überschrift ausgeblendet.
+
+    Außerdem: '5.3 Überblick' hat 'Agilität' als konzeptuelles Kind (gleiche Ebene,
+    nummerierter Parent + unnummerierter Folger). 'Agilität' hat Summary →
+    _any_visible_desc[5.3]=True → '5.3 Überblick' bleibt sichtbar (kein Rückschritt).
     """
     orig_md = (
         "## 5.3 Überblick\n\n"
-        "## Rückmeldung zu Konfliktverhalten\n\n"
+        "## Rückmeldung zu Konfliktverhalten\n\nWas ist das? Originaltext hier.\n\n"
         "## Off the job\n\nMaßnahme A.\n\n"
         "## On the job\n\nMaßnahme B.\n\n"
-        "## Agilität\n\n"
+        "## Agilität\n\nAgilität ist die Fähigkeit...\n\n"
         "## Off the job\n\nMaßnahme C.\n\n"
         "## On the job\n\nMaßnahme D."
     )
@@ -996,7 +1001,7 @@ def test_numbered_parent_hidden_when_all_children_have_no_summary():
 
     from docx.oxml.ns import qn
 
-    # "Rückmeldung zu Konfliktverhalten" muss im Dokument vorhanden sein (Original erhalten)
+    # "Rückmeldung zu Konfliktverhalten" muss im Dokument vorhanden sein (Originaltext erhalten)
     rueckmeldung_paras = [p for p in paras if "Rückmeldung zu Konfliktverhalten" in p.text]
     assert len(rueckmeldung_paras) >= 1, "'Rückmeldung zu Konfliktverhalten' fehlt im Dokument"
 

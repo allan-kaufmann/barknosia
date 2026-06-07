@@ -1360,16 +1360,30 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     # Vorberechnung: hat jede Section mindestens einen Nachfolger mit Summary-Inhalt?
     # Verhindert sichtbare Leer-Überschriften bei Elternkapiteln, deren Kinder alle
     # kein Summary haben (z.B. "5.3.27 Rückmeldung zu Konfliktverhalten" → nur Off/On the job).
+    # Spiegelt dieselbe Kinder-Logik wie has_children:
+    #   a) tiefere Ebene gilt immer als Nachfolger
+    #   b) nummerierter Parent + unnummerierter Geschwister → konzeptuelles Kind
+    #      (z.B. "5.3 Überblick" → "Agilität" auf gleicher Ebene)
     _any_visible_desc: list[bool] = [False] * len(orig_sections)
     for _pi in range(len(orig_sections)):
         _ps = orig_sections[_pi]
         if _ps['heading'] == '__preamble__':
             continue
         _plevel = _ps['level']
+        _ps_numbered = bool(re.match(r'^\d', normalize_heading(_clean_heading_text(_ps['heading']))))
         for _ci in range(_pi + 1, len(orig_sections)):
             _cs = orig_sections[_ci]
-            if _cs['level'] <= _plevel:
-                break  # Nicht mehr im Scope dieses Elternknotens
+            _cs_level = _cs['level']
+            if _cs_level < _plevel:
+                break  # Aufgestiegen = außerhalb des Scopes
+            if _cs_level == _plevel:
+                # Gleiche Ebene: nur als konzeptuelles Kind wenn parent nummeriert und
+                # dieses Section unnummeriert ist (nummerierter → unnummerierter Folger).
+                _cs_k = normalize_heading(_clean_heading_text(_cs['heading']))
+                _cs_numbered = bool(re.match(r'^\d', _cs_k))
+                if _cs_numbered or not _ps_numbered:
+                    break  # Nummeriertes Geschwister oder keine konzeptuelle Eltern-Kind-Relation
+                # Unnummeriert nach nummeriertem Parent → zählt als Kind, weiter suchen
             _clk = normalize_heading(_clean_heading_text(_cs['heading']))
             if sum_lookup.get(_clk, '').strip():
                 _any_visible_desc[_pi] = True
