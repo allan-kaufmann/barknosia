@@ -388,6 +388,7 @@ def split_into_level1_chapters(text: str) -> list:
     chapters = []
     current_heading = None
     current_lines = []
+    pre_split_lines: list[str] = []
 
     for line in lines:
         if _numbered_level(line) == split_level:
@@ -397,10 +398,21 @@ def split_into_level1_chapters(text: str) -> list:
             current_heading = re.sub(r'^#{1,6}\s+', '', stripped).strip()
             current_lines = [line]
         else:
-            current_lines.append(line)
+            if current_heading is None:
+                pre_split_lines.append(line)
+            else:
+                current_lines.append(line)
 
     if current_heading is not None:
         chapters.append({'heading': current_heading, 'full_text': '\n'.join(current_lines)})
+
+    # Im adaptiven Modus (split_level = min_level+1) landet Text vor dem ersten Unterkapitel
+    # (z.B. Einleitungstext nach "# 5 Kompetenzen..." vor "## 5.1 ...") in pre_split_lines.
+    # Diesen ans erste Kapitel hängen, damit er mitverdichtet wird.
+    if pre_split_lines and chapters:
+        preamble_str = '\n'.join(pre_split_lines).strip()
+        if preamble_str:
+            chapters[0]['full_text'] = preamble_str + '\n\n' + chapters[0]['full_text']
 
     return chapters
 
@@ -435,6 +447,81 @@ def _split_at_level2(chapter_text: str) -> tuple[str, list[dict]]:
         preamble_lines = current_lines
 
     return '\n'.join(preamble_lines), sections
+
+
+def _split_at_level(chapter_text: str, level: int) -> tuple[str, list[dict]]:
+    """Teilt text an Überschriften der angegebenen #-Tiefe. Gibt (preamble, sections) zurück."""
+    prefix = '#' * level + ' '
+    avoid_prefix = '#' * level + '##'
+    lines = chapter_text.split('\n')
+    preamble_lines: list[str] = []
+    sections: list[dict] = []
+    current_heading: str | None = None
+    current_lines: list[str] = []
+
+    for line in lines:
+        if line.startswith(prefix) and not line.startswith(avoid_prefix):
+            if current_heading is not None:
+                sections.append({'heading': current_heading, 'text': '\n'.join(current_lines)})
+            elif current_lines:
+                preamble_lines = current_lines[:]
+            current_heading = line[len(prefix):].strip()
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+    if current_heading is not None:
+        sections.append({'heading': current_heading, 'text': '\n'.join(current_lines)})
+    elif current_lines and not preamble_lines:
+        preamble_lines = current_lines
+
+    return '\n'.join(preamble_lines), sections
+
+
+def _detect_chapter_level(text: str) -> int:
+    """Gibt den #-Level der ersten Heading-Zeile zurück (Fallback: 2)."""
+    for line in text.splitlines():
+        m = re.match(r'^(#{1,6})\s', line)
+        if m:
+            return len(m.group(1))
+    return 2
+
+
+def _find_sublevel(text: str, chapter_heading_level: int) -> int | None:
+    """Findet die nächste Heading-Ebene unterhalb chapter_heading_level, oder None."""
+    for level in range(chapter_heading_level + 1, 7):
+        prefix = '#' * level + ' '
+        avoid = '#' * level + '##'
+        if any(line.startswith(prefix) and not line.startswith(avoid) for line in text.splitlines()):
+            return level
+    return None
+
+
+def _group_into_chunks(preamble: str, sections: list[dict], max_chars: int = 15_000) -> list[dict]:
+    """
+    Fasst sections greedy zu Chunks von max max_chars Zeichen zusammen.
+    Sections werden NIE in der Mitte geteilt – immer vollständig in einem Chunk.
+    Preamble geht immer in den ersten Chunk.
+    """
+    chunks: list[dict] = []
+    current_secs: list[dict] = []
+    current_len = len(preamble)
+
+    for sec in sections:
+        sec_len = len(sec['text'])
+        if current_secs and current_len + sec_len > max_chars:
+            chunks.append({'preamble': preamble if not chunks else '', 'sections': current_secs})
+            current_secs = []
+            current_len = 0
+        current_secs.append(sec)
+        current_len += sec_len
+
+    if current_secs:
+        chunks.append({'preamble': preamble if not chunks else '', 'sections': current_secs})
+    elif not chunks:
+        chunks.append({'preamble': preamble, 'sections': []})
+
+    return chunks
 
 
 def _summarize_chapter_by_sections(ch: dict, out_dir: Path) -> str:
@@ -496,8 +583,8 @@ def _summarize_single_chapter(heading: str, chapter_text: str) -> str:
         f"Kapiteltext:\n{chapter_text}"
     )
     # Pflichtliste aller Level-2-Unterkapitel (verhindert Auslassungen durch die KI).
-    _required = re.findall(r'^##\s+\*?\*?(.+?)\*?\*?\s*$', chapter_text, re.MULTILINE)
-    if len(_required) > 3:
+    _required = re.findall(r'^#{2,6}\s+\*?\*?(.+?)\*?\*?\s*$', chapter_text, re.MULTILINE)
+    if len(_required) >= 1:
         _rlist = '\n'.join(f'- {_h}' for _h in _required[:80])
         prompt += (
             f"\n\nPFLICHT-VOLLSTÄNDIGKEIT – folgende {len(_required)} Unterabschnitte MÜSSEN ALLE "
@@ -563,13 +650,59 @@ def generate_summary_by_chapter(text: str, out_dir: Path) -> str:
         (out_dir / "zusammenfassung.md").write_text(result, encoding="utf-8")
         return result
 
+    _CHUNK_LIMIT = 15_000  # ~30 Seiten; Kapitel über diesem Limit werden chunk-weise verarbeitet
+
+    def _summarize_chapter_smart(ch: dict, ci: int) -> str:
+        """Fasst ein Kapitel zusammen: direkt wenn klein, chunk-weise wenn groß."""
+        chap_level = _detect_chapter_level(ch['full_text'])
+        sublevel = _find_sublevel(ch['full_text'], chap_level)
+
+        if sublevel is None or len(ch['full_text']) <= _CHUNK_LIMIT:
+            return _summarize_single_chapter(ch['heading'], ch['full_text'])
+
+        preamble, sections = _split_at_level(ch['full_text'], sublevel)
+        chunks = _group_into_chunks(preamble, sections, _CHUNK_LIMIT)
+
+        if len(chunks) <= 1:
+            return _summarize_single_chapter(ch['heading'], ch['full_text'])
+
+        print(f"   Kapitel {ci} ({ch['heading'][:40]}) → {len(chunks)} Chunks à max {_CHUNK_LIMIT} Zeichen")
+        parts: list[str] = []
+        for j, chunk in enumerate(chunks, start=1):
+            chunk_file = out_dir / f"zusammenfassung_kap_{ci:02d}_{j:02d}.md"
+            chunk_body = '\n\n'.join(s['text'] for s in chunk['sections'])
+            chunk_text = (chunk['preamble'] + '\n\n' + chunk_body).strip()
+            is_first = (j == 1)
+            continuation_hint = (
+                '' if is_first else
+                f'\n\nHINWEIS: Dies ist Teil {j} von {len(chunks)} dieses Kapitels. '
+                'Beginne direkt mit den Unterkapitelüberschriften ohne das übergeordnete Kapitelheading zu wiederholen.'
+            )
+
+            def _chunk_gen(ct=chunk_text, hd=ch['heading'], hint=continuation_hint):
+                return _summarize_single_chapter(hd, ct + hint)
+
+            chunk_label = f"Zusammenfassung Kap. {ci} Teil {j}/{len(chunks)}: {ch['heading'][:40]}"
+            chunk_summary = load_or_run(chunk_file, _chunk_gen, chunk_label)
+
+            # Doppeltes Kapitel-Heading aus Chunks 2+ entfernen (falls KI es wiederholt)
+            if not is_first and chunk_summary.strip():
+                first_line = chunk_summary.strip().splitlines()[0]
+                if re.match(r'^#{1,3}\s', first_line) and ch['heading'][:15] in first_line:
+                    chunk_summary = chunk_summary.strip()[len(first_line):].lstrip('\n')
+
+            parts.append(chunk_summary)
+            time.sleep(1)
+
+        return '\n\n'.join(parts)
+
     summaries = []
     for i, chapter in enumerate(chapters, 1):
         cache_path = out_dir / f"zusammenfassung_kap_{i:02d}.md"
         label = f"Zusammenfassung Kap. {i}: {chapter['heading'][:60]}"
         chapter_summary = load_or_run(
             cache_path,
-            lambda ch=chapter: _summarize_single_chapter(ch['heading'], ch['full_text']),
+            lambda ch=chapter, ci=i: _summarize_chapter_smart(ch, ci),
             label
         )
         summaries.append(chapter_summary)
