@@ -393,7 +393,7 @@ def split_into_level1_chapters(text: str) -> list:
     for line in lines:
         if _numbered_level(line) == split_level:
             if current_heading is not None:
-                chapters.append({'heading': current_heading, 'full_text': '\n'.join(current_lines)})
+                chapters.append({'heading': current_heading, 'full_text': '\n'.join(current_lines), 'level': split_level})
             stripped = _html_re.sub('', line).replace('**', '')
             current_heading = re.sub(r'^#{1,6}\s+', '', stripped).strip()
             current_lines = [line]
@@ -404,7 +404,7 @@ def split_into_level1_chapters(text: str) -> list:
                 current_lines.append(line)
 
     if current_heading is not None:
-        chapters.append({'heading': current_heading, 'full_text': '\n'.join(current_lines)})
+        chapters.append({'heading': current_heading, 'full_text': '\n'.join(current_lines), 'level': split_level})
 
     # Im adaptiven Modus (split_level = min_level+1) landet Text vor dem ersten Unterkapitel
     # (z.B. Einleitungstext nach "# 5 Kompetenzen..." vor "## 5.1 ...") in pre_split_lines.
@@ -582,8 +582,10 @@ def _summarize_single_chapter(heading: str, chapter_text: str) -> str:
         "- Markiere fehlende Unterkapitel oder fehlende Studienergebnisse\n\n"
         f"Kapiteltext:\n{chapter_text}"
     )
-    # Pflichtliste aller Level-2-Unterkapitel (verhindert Auslassungen durch die KI).
-    _required = re.findall(r'^#{2,6}\s+\*?\*?(.+?)\*?\*?\s*$', chapter_text, re.MULTILINE)
+    # Pflichtliste aller Unterkapitel: alle Headings außer dem Kapitel-Heading selbst.
+    _all_headings = re.findall(r'^#{2,6}\s+\*?\*?(.+?)\*?\*?\s*$', chapter_text, re.MULTILINE)
+    _heading_norm = normalize_heading(heading)
+    _required = [h for h in _all_headings if normalize_heading(h) != _heading_norm]
     if len(_required) >= 1:
         _rlist = '\n'.join(f'- {_h}' for _h in _required[:80])
         prompt += (
@@ -654,7 +656,8 @@ def generate_summary_by_chapter(text: str, out_dir: Path) -> str:
 
     def _summarize_chapter_smart(ch: dict, ci: int) -> str:
         """Fasst ein Kapitel zusammen: direkt wenn klein, chunk-weise wenn groß."""
-        chap_level = _detect_chapter_level(ch['full_text'])
+        # 'level' wird von split_into_level1_chapters gesetzt; Fallback für manuell erstellte Dicts.
+        chap_level = ch.get('level', _detect_chapter_level(ch['full_text']))
         sublevel = _find_sublevel(ch['full_text'], chap_level)
 
         if sublevel is None or len(ch['full_text']) <= _CHUNK_LIMIT:

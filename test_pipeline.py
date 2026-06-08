@@ -32,6 +32,10 @@ from pipeline import (
     _strip_ocr_y_prefix,
     build_interleaved_word_document,
     _split_at_level2,
+    _split_at_level,
+    _detect_chapter_level,
+    _find_sublevel,
+    _group_into_chunks,
     _summarize_chapter_by_sections,
     _summarize_single_chapter,
     generate_summary_by_chapter,
@@ -1375,4 +1379,337 @@ def test_generate_summary_no_preamble_unchanged(tmp_path, monkeypatch):
 
     assert len(captured_texts) == 2, f"Erwartet 2 Kapitel-Calls, bekam {len(captured_texts)}"
     assert "Anregungstext" in captured_texts[0]
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 35: _split_at_level – verallgemeinerter Level-Split
+# ---------------------------------------------------------------------------
+
+def test_split_at_level_level3_basic():
+    """Splittet korrekt an ### Überschriften."""
+    text = "## 5.3 Thema\n\nEinleitung\n\n### Agilität\n\nText A\n\n### Resilienz\n\nText B"
+    preamble, sections = _split_at_level(text, 3)
+    assert "Einleitung" in preamble
+    assert len(sections) == 2
+    assert sections[0]['heading'] == "Agilität"
+    assert sections[1]['heading'] == "Resilienz"
+    assert "Text A" in sections[0]['text']
+    assert "Text B" in sections[1]['text']
+
+
+def test_split_at_level_no_sections():
+    """Nur Preamble, keine Sections – gibt leere sections-Liste zurück."""
+    text = "## 5.3 Thema\n\nNur Fließtext, keine Unterkapitel."
+    preamble, sections = _split_at_level(text, 3)
+    assert sections == []
+    assert "Nur Fließtext" in preamble
+
+
+def test_split_at_level_does_not_split_deeper():
+    """#### wird nicht als ### erkannt – bleibt im Text der übergeordneten Section."""
+    text = "### Agilität\n\n#### Unterebene\n\nTieferer Text\n\n### Resilienz\n\nText R"
+    preamble, sections = _split_at_level(text, 3)
+    assert len(sections) == 2
+    assert "#### Unterebene" in sections[0]['text']
+    assert "#### Unterebene" not in sections[1]['text']
+
+
+def test_split_at_level2_equivalent():
+    """_split_at_level(text, 2) muss identisch zu _split_at_level2(text) sein."""
+    text = "Preamble\n\n## A\n\nText A\n\n## B\n\nText B"
+    p1, s1 = _split_at_level2(text)
+    p2, s2 = _split_at_level(text, 2)
+    assert p1 == p2
+    assert [s['heading'] for s in s1] == [s['heading'] for s in s2]
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 36: _detect_chapter_level
+# ---------------------------------------------------------------------------
+
+def test_detect_chapter_level_double_hash():
+    assert _detect_chapter_level("## 5.3 Großes Thema\n\nText") == 2
+
+
+def test_detect_chapter_level_triple_hash():
+    assert _detect_chapter_level("### Agilität\n\nText") == 3
+
+
+def test_detect_chapter_level_fallback():
+    """Kein Heading → Fallback 2."""
+    assert _detect_chapter_level("Nur Fließtext ohne Heading.") == 2
+
+
+def test_detect_chapter_level_ignores_deeper_first():
+    """Erster Heading bestimmt Level, auch wenn tiefere folgen."""
+    text = "## Kapitel\n\n### Unterkapitel\n\nText"
+    assert _detect_chapter_level(text) == 2
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 37: _find_sublevel
+# ---------------------------------------------------------------------------
+
+def test_find_sublevel_finds_triple_hash():
+    text = "## 5.3 Thema\n\n### Agilität\n\nText"
+    assert _find_sublevel(text, 2) == 3
+
+
+def test_find_sublevel_finds_quad_hash():
+    text = "### Agilität\n\n#### Detail\n\nText"
+    assert _find_sublevel(text, 3) == 4
+
+
+def test_find_sublevel_returns_none_when_no_deeper():
+    text = "## 5.3 Thema\n\nNur Fließtext, keine Unterkapitel."
+    assert _find_sublevel(text, 2) is None
+
+
+def test_find_sublevel_skips_same_level():
+    """Gleiche Ebene wird nicht als sublevel erkannt."""
+    text = "## 5.1 A\n\n## 5.2 B\n\nText"
+    assert _find_sublevel(text, 2) is None
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 38: _group_into_chunks – Greedy Grouping
+# ---------------------------------------------------------------------------
+
+def _make_sections(names_and_sizes):
+    """Hilfsfunktion: erstellt sections-Liste mit kontrollierten Textgrößen."""
+    return [{'heading': name, 'text': 'x' * size} for name, size in names_and_sizes]
+
+
+def test_group_into_chunks_single_chunk_small():
+    """Kleine sections → ein Chunk."""
+    sections = _make_sections([("A", 1000), ("B", 1000), ("C", 1000)])
+    chunks = _group_into_chunks("", sections, max_chars=10_000)
+    assert len(chunks) == 1
+    assert len(chunks[0]['sections']) == 3
+
+
+def test_group_into_chunks_splits_at_boundary():
+    """Splittet sobald Limit überschritten wird."""
+    sections = _make_sections([("A", 8000), ("B", 8000), ("C", 8000)])
+    chunks = _group_into_chunks("", sections, max_chars=10_000)
+    assert len(chunks) == 3
+    assert chunks[0]['sections'][0]['heading'] == "A"
+    assert chunks[1]['sections'][0]['heading'] == "B"
+    assert chunks[2]['sections'][0]['heading'] == "C"
+
+
+def test_group_into_chunks_never_splits_single_section():
+    """Eine einzelne Section > max_chars darf nicht geteilt werden."""
+    sections = _make_sections([("Riesig", 20_000)])
+    chunks = _group_into_chunks("", sections, max_chars=10_000)
+    assert len(chunks) == 1
+    assert chunks[0]['sections'][0]['heading'] == "Riesig"
+
+
+def test_group_into_chunks_preamble_in_first_chunk():
+    """Preamble landet immer im ersten Chunk."""
+    sections = _make_sections([("A", 8000), ("B", 8000)])
+    chunks = _group_into_chunks("Einleitungstext", sections, max_chars=10_000)
+    assert chunks[0]['preamble'] == "Einleitungstext"
+    assert chunks[1]['preamble'] == ""
+
+
+def test_group_into_chunks_preamble_only():
+    """Nur Preamble, keine Sections → ein Chunk mit leerem sections-Array."""
+    chunks = _group_into_chunks("Nur Preamble", [], max_chars=10_000)
+    assert len(chunks) == 1
+    assert chunks[0]['preamble'] == "Nur Preamble"
+    assert chunks[0]['sections'] == []
+
+
+def test_group_into_chunks_sections_never_duplicated():
+    """Jede Section erscheint in genau einem Chunk."""
+    sections = _make_sections([(f"S{i}", 3000) for i in range(6)])
+    chunks = _group_into_chunks("", sections, max_chars=10_000)
+    all_headings = [s['heading'] for c in chunks for s in c['sections']]
+    assert len(all_headings) == 6
+    assert len(set(all_headings)) == 6  # keine Duplikate
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 39: split_into_level1_chapters – Preamble-Fix (adaptiver Modus)
+# ---------------------------------------------------------------------------
+
+def test_split_adaptive_preserves_intro_text():
+    """
+    Einleitungstext nach # 5 und vor ## 5.1 darf nicht verloren gehen.
+    Fix: pre_split_lines werden ans erste Kapitel gehängt.
+    """
+    md = (
+        "# 5 Kompetenzen wirksam entwickeln\n\n"
+        "Dieser Einleitungstext muss erhalten bleiben.\n\n"
+        "## 5.1 Lerntransfer\n\nTransfertext.\n\n"
+        "## 5.2 Methoden\n\nMethodentext."
+    )
+    chapters = split_into_level1_chapters(md)
+    assert len(chapters) == 2
+    # Einleitungstext muss im full_text des ersten Kapitels stecken
+    assert "Einleitungstext muss erhalten bleiben" in chapters[0]['full_text']
+
+
+def test_split_adaptive_intro_contains_parent_heading():
+    """Der # 5-Heading selbst landet ebenfalls im Preamble des ersten Kapitels."""
+    md = (
+        "# 5 Kompetenzen\n\nEinleitung.\n\n"
+        "## 5.1 Abschnitt\n\nText."
+    )
+    chapters = split_into_level1_chapters(md)
+    assert "# 5 Kompetenzen" in chapters[0]['full_text']
+
+
+def test_split_non_adaptive_no_regression():
+    """Normaler (nicht-adaptiver) Split bleibt unverändert – kein Preamble-Overhead."""
+    md = "# 4 Thema A\n\nText A.\n\n# 5 Thema B\n\nText B."
+    chapters = split_into_level1_chapters(md)
+    assert len(chapters) == 2
+    assert "Text A" in chapters[0]['full_text']
+    assert "Text B" in chapters[1]['full_text']
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 40: _summarize_single_chapter – _required erfasst ### und ####
+# ---------------------------------------------------------------------------
+
+def test_summarize_required_includes_triple_hash(monkeypatch):
+    """_required muss auch ### Überschriften erfassen, nicht nur ##."""
+    captured_prompts = []
+
+    def fake_call(model_name, contents, config):
+        captured_prompts.append(contents)
+        class R:
+            text = "## Heading\n- bullet"
+        return R()
+
+    monkeypatch.setattr('pipeline.call_gemini_with_retry', fake_call)
+
+    chapter_text = (
+        "## 5.3 Großes Thema\n\n"
+        "### Agilität\n\nText zu Agilität.\n\n"
+        "### Resilienz\n\nText zu Resilienz."
+    )
+    _summarize_single_chapter("5.3 Großes Thema", chapter_text)
+
+    prompt = captured_prompts[0]
+    assert "Agilität" in prompt, "### Heading fehlt in _required-Liste"
+    assert "Resilienz" in prompt, "### Heading fehlt in _required-Liste"
+    assert "PFLICHT-VOLLSTÄNDIGKEIT" in prompt
+
+
+def test_summarize_required_triggers_at_one_heading(monkeypatch):
+    """Bereits bei 1 Unterkapitel wird PFLICHT-VOLLSTÄNDIGKEIT eingefügt (>= 1)."""
+    captured_prompts = []
+
+    def fake_call(model_name, contents, config):
+        captured_prompts.append(contents)
+        class R:
+            text = "## Heading\n- bullet"
+        return R()
+
+    monkeypatch.setattr('pipeline.call_gemini_with_retry', fake_call)
+
+    chapter_text = "## 5.1 Thema\n\n### Einziges Unterkapitel\n\nText."
+    _summarize_single_chapter("5.1 Thema", chapter_text)
+
+    assert "PFLICHT-VOLLSTÄNDIGKEIT" in captured_prompts[0]
+
+
+def test_summarize_required_empty_for_flat_chapter(monkeypatch):
+    """Kapitel ohne Unterkapitel → kein PFLICHT-VOLLSTÄNDIGKEIT-Block."""
+    captured_prompts = []
+
+    def fake_call(model_name, contents, config):
+        captured_prompts.append(contents)
+        class R:
+            text = "## Heading\n- bullet"
+        return R()
+
+    monkeypatch.setattr('pipeline.call_gemini_with_retry', fake_call)
+
+    # Nur ## Kapitel-Heading, keine ### Unterkapitel → _required leer
+    chapter_text = "## 5.1 Thema\n\nNur Fließtext, keine Unterkapitel hier."
+    _summarize_single_chapter("5.1 Thema", chapter_text)
+
+    assert "PFLICHT-VOLLSTÄNDIGKEIT" not in captured_prompts[0], (
+        "Für ein Kapitel ohne Sub-Headings darf kein PFLICHT-Block erscheinen"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 41: generate_summary_by_chapter – Chunk-Splitting
+# ---------------------------------------------------------------------------
+
+def test_generate_chunks_large_chapter(tmp_path, monkeypatch):
+    """Ein Kapitel > 15.000 Zeichen mit ### Sections wird in mehrere Chunks aufgeteilt."""
+    call_log = []
+
+    def fake_summarize(heading, text):
+        call_log.append({'heading': heading, 'len': len(text)})
+        return f"## {heading}\n- Summary."
+
+    monkeypatch.setattr('pipeline._summarize_single_chapter', fake_summarize)
+    monkeypatch.setattr('pipeline.time.sleep', lambda _: None)
+
+    # Dokumentstruktur: # 5 → adaptive split bei ## → 5.3 als eigenes Kapitel
+    # 5.3 hat 6 Sections à ~4000 Zeichen = ~24.000 gesamt → sollte in Chunks aufgeteilt werden
+    sections_md = "\n\n".join(
+        f"### Section {i}\n\n{'x' * 4000}" for i in range(1, 7)
+    )
+    md = (
+        "# 5 Hauptthema\n\nEinleitung Hauptthema.\n\n"
+        f"## 5.3 Großes Thema\n\nEinleitung Abschnitt.\n\n{sections_md}"
+    )
+
+    generate_summary_by_chapter(md, tmp_path)
+
+    assert len(call_log) >= 2, f"Erwartet >= 2 Calls für großes Kapitel, bekam {len(call_log)}"
+    # Kein einzelner Call darf den vollen Text (~24k) bekommen haben
+    assert all(c['len'] < 20_000 for c in call_log), "Ein Chunk ist zu groß"
+
+
+def test_generate_chunks_small_chapter_single_call(tmp_path, monkeypatch):
+    """Ein Kapitel < 15.000 Zeichen → genau ein API-Call."""
+    call_log = []
+
+    def fake_summarize(heading, text):
+        call_log.append(heading)
+        return f"## {heading}\n- Summary."
+
+    monkeypatch.setattr('pipeline._summarize_single_chapter', fake_summarize)
+    monkeypatch.setattr('pipeline.time.sleep', lambda _: None)
+
+    md = "## 5.1 Kleines Thema\n\n### Unter A\n\nText.\n\n### Unter B\n\nText."
+    generate_summary_by_chapter(md, tmp_path)
+
+    assert len(call_log) == 1, f"Erwartet 1 Call, bekam {len(call_log)}"
+
+
+def test_generate_chunks_all_sections_covered(tmp_path, monkeypatch):
+    """Nach chunk-weiser Verarbeitung sind alle Section-Headings im kombinierten Output."""
+    import re as _re
+
+    def fake_summarize(heading, text):
+        found = _re.findall(r'^#{2,6}\s+(.+)$', text, _re.MULTILINE)
+        lines = [f"### {h}\n- bullet" for h in found] if found else [f"## {heading}\n- bullet"]
+        return "\n\n".join(lines)
+
+    monkeypatch.setattr('pipeline._summarize_single_chapter', fake_summarize)
+    monkeypatch.setattr('pipeline.time.sleep', lambda _: None)
+
+    sections_md = "\n\n".join(
+        f"### Section {i}\n\n{'x' * 4000}" for i in range(1, 7)
+    )
+    md = (
+        "# 5 Hauptthema\n\nEinleitung Hauptthema.\n\n"
+        f"## 5.3 Großes Thema\n\nEinleitung Abschnitt.\n\n{sections_md}"
+    )
+
+    result = generate_summary_by_chapter(md, tmp_path)
+
+    for i in range(1, 7):
+        assert f"Section {i}" in result, f"Section {i} fehlt im kombinierten Output"
 
