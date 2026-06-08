@@ -641,17 +641,6 @@ def generate_summary_by_chapter(text: str, out_dir: Path) -> str:
     if _preamble_text and chapters:
         chapters[0]['full_text'] = _preamble_text + '\n\n' + chapters[0]['full_text']
 
-    if not chapters:
-        print("   Keine Level-1-Kapitel gefunden, fasse Gesamttext zusammen...")
-        fallback_path = out_dir / "zusammenfassung_kap_00.md"
-        result = load_or_run(
-            fallback_path,
-            lambda: _summarize_single_chapter("Volltext", text),
-            "Zusammenfassung (Volltext)"
-        )
-        (out_dir / "zusammenfassung.md").write_text(result, encoding="utf-8")
-        return result
-
     _CHUNK_LIMIT = 15_000  # ~30 Seiten; Kapitel über diesem Limit werden chunk-weise verarbeitet
 
     def _summarize_chapter_smart(ch: dict, ci: int) -> str:
@@ -698,6 +687,18 @@ def generate_summary_by_chapter(text: str, out_dir: Path) -> str:
             time.sleep(1)
 
         return '\n\n'.join(parts)
+
+    if not chapters:
+        print("   Keine Level-1-Kapitel gefunden, fasse Gesamttext zusammen...")
+        fallback_path = out_dir / "zusammenfassung_kap_00.md"
+        fallback_ch = {'heading': 'Volltext', 'full_text': text, 'level': 1}
+        result = load_or_run(
+            fallback_path,
+            lambda: _summarize_chapter_smart(fallback_ch, 0),
+            "Zusammenfassung (Volltext)"
+        )
+        (out_dir / "zusammenfassung.md").write_text(result, encoding="utf-8")
+        return result
 
     summaries = []
     for i, chapter in enumerate(chapters, 1):
@@ -1766,7 +1767,12 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         # unsichtbar → kein leerer Gliederungspunkt, kein verlorener Inhalt.
         show_heading_visible = bool(sum_body.strip()) or has_children
         if show_heading_visible:
-            nav_worthy = originally_numbered if has_numbered_chapters else (display_level <= 2)
+            if has_numbered_chapters:
+                nav_worthy = originally_numbered
+            elif parent_chapter:
+                nav_worthy = True
+            else:
+                nav_worthy = display_level <= 2
             if nav_worthy:
                 h = doc.add_heading(clean_heading, level=display_level)
                 _set_heading_color(h, MM_HEADING_COLORS.get(display_level, MM_HEADING_COLORS[9]))
