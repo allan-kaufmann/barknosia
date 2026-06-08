@@ -1264,7 +1264,7 @@ def test_summarize_chapter_by_sections_combined_contains_all(tmp_path, monkeypat
 # ---------------------------------------------------------------------------
 
 def test_summarize_single_chapter_large_uses_high_token_limit(monkeypatch):
-    """Bei > 10 Level-2-Sections wird max_output_tokens=65536 gesetzt."""
+    """Bei > 50 Level-2-Sections wird max_output_tokens=65536 gesetzt."""
     captured_config = []
 
     def fake_call(model_name, contents, config, **kwargs):
@@ -1274,14 +1274,14 @@ def test_summarize_single_chapter_large_uses_high_token_limit(monkeypatch):
         return R()
 
     monkeypatch.setattr('pipeline.call_gemini_with_retry', fake_call)
-    chapter_text = '\n\n'.join(f'## Kompetenz{i}\nText.' for i in range(15))
+    chapter_text = '\n\n'.join(f'## Kompetenz{i}\nText.' for i in range(55))
     _summarize_single_chapter('5.3 Test', chapter_text)
     assert len(captured_config) == 1
     assert captured_config[0].max_output_tokens == 65536
 
 
 def test_summarize_single_chapter_small_uses_default_token_limit(monkeypatch):
-    """Bei ≤ 10 Level-2-Sections wird max_output_tokens=8192 gesetzt."""
+    """Bei ≤ 50 Level-2-Sections wird max_output_tokens=32768 gesetzt."""
     captured_config = []
 
     def fake_call(model_name, contents, config, **kwargs):
@@ -1294,7 +1294,7 @@ def test_summarize_single_chapter_small_uses_default_token_limit(monkeypatch):
     chapter_text = '\n\n'.join(f'## Abschnitt{i}\nText.' for i in range(5))
     _summarize_single_chapter('Kap. 1', chapter_text)
     assert len(captured_config) == 1
-    assert captured_config[0].max_output_tokens == 8192
+    assert captured_config[0].max_output_tokens == 32768
 
 
 # ---------------------------------------------------------------------------
@@ -1302,7 +1302,7 @@ def test_summarize_single_chapter_small_uses_default_token_limit(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_summarize_single_chapter_large_has_strict_length_instruction(monkeypatch):
-    """Bei > 10 Level-2-Sections enthält der Prompt die strenge Mengenbeschränkung."""
+    """Bei > 50 Level-2-Sections enthält der Prompt die strenge Mengenbeschränkung."""
     captured_prompt = []
 
     def fake_call(model_name, contents, config, **kwargs):
@@ -1312,7 +1312,7 @@ def test_summarize_single_chapter_large_has_strict_length_instruction(monkeypatc
         return R()
 
     monkeypatch.setattr('pipeline.call_gemini_with_retry', fake_call)
-    chapter_text = '\n\n'.join(f'## Kompetenz{i}\nText.' for i in range(15))
+    chapter_text = '\n\n'.join(f'## Kompetenz{i}\nText.' for i in range(55))
     _summarize_single_chapter('5.3 Test', chapter_text)
     assert "Maximal 3 Stichpunkte pro Unterabschnitt" in captured_prompt[0]
     assert "Vollständigkeit" in captured_prompt[0]

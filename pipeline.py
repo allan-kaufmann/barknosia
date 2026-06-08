@@ -593,18 +593,19 @@ def _summarize_single_chapter(heading: str, chapter_text: str) -> str:
             f"als eigene Überschrift erscheinen:\n{_rlist}\n"
             "Jeder Abschnitt benötigt mindestens 1 Stichpunkt. Keiner darf fehlen!\n"
         )
-    # Große Kapitel: strenge Längenbeschränkung pro Abschnitt damit alle in den Output passen.
+    # Sehr große Kapitel (>50 Abschnitte, z.B. 263 Kompetenzen): strenge Kompression nötig
+    # damit alle Abschnitte in den Output passen.
     # 263 Abschnitte × 3 Bullets × 15 Wörter ≈ 12.000 Wörter → passt in 65.536 Output-Token.
-    if len(_required) > 10:
+    if len(_required) > 50:
         prompt += (
-            f"\n\nWICHTIG FÜR DIESES GROSSE KAPITEL ({len(_required)} Abschnitte):\n"
+            f"\n\nWICHTIG FÜR DIESES SEHR GROSSE KAPITEL ({len(_required)} Abschnitte):\n"
             "- Maximal 3 Stichpunkte pro Unterabschnitt (Ausnahme: Definition immer vollständig)\n"
             "- Maximal 20 Wörter pro Stichpunkt\n"
             "- Vollständigkeit (alle Abschnitte vorhanden) hat ABSOLUTEN Vorrang vor Ausführlichkeit\n"
             "- Keinen Abschnitt auslassen, lieber sehr kurz als gar nicht!\n"
         )
-    # Große Kapitel brauchen mehr Output-Token – Default ~8192 reicht nicht für 100+ Abschnitte.
-    _out_tokens = 65536 if len(_required) > 10 else 8192
+    # Sehr große Kapitel brauchen 65536 Output-Token; normale Kapitel 32768 für ausführliche Summaries.
+    _out_tokens = 65536 if len(_required) > 50 else 32768
     try:
         response = call_gemini_with_retry(
             model_name='gemini-2.5-pro',
@@ -1698,6 +1699,15 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
 
         # Platzhalter-Sektionen (OCR-Notizlinien \_\_\_ im Body) komplett überspringen
         if re.search(r'^(?:\\_)+\s*$', orig_body, re.MULTILINE):
+            continue
+
+        # In eingebettetem Modus (parent_chapter gesetzt, keine nummerierten Kapitel):
+        # Level-1-Headings sind OCR-Artefakte (Artikeltitel, Journal-Metadaten).
+        # Originaltext als versteckten Text erhalten, aber KEINE Nav-Überschrift erzeugen,
+        # damit der Counter für level-2+ sauber bei 1 beginnt (5.1.1, 5.1.2 ...).
+        if parent_chapter and not has_numbered_chapters and level == 1:
+            if orig_body.strip():
+                process_markdown_to_docx(doc, orig_body, hide_text=True, base_path=base_path)
             continue
 
         if parent_chapter:
