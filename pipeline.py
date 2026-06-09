@@ -692,7 +692,13 @@ def generate_summary_by_chapter(text: str, out_dir: Path) -> str:
     if not chapters:
         print("   Keine Level-1-Kapitel gefunden, fasse Gesamttext zusammen...")
         fallback_path = out_dir / "zusammenfassung_kap_00.md"
-        fallback_ch = {'heading': 'Volltext', 'full_text': text, 'level': 1}
+        # Wenn substanzieller Preamble-Inhalt existiert (Abstract etc.), einen fixen
+        # "## Einleitung"-Abschnitt voranstellen, damit die KI ihn explizit zusammenfasst
+        # und sum_lookup["einleitung"] später im Docx-Builder verwendet werden kann.
+        _pre, _ = _split_at_level(text, 2)
+        _pre_body = re.sub(r'^#{1,6}\s.*$', '', _pre, flags=re.MULTILINE).strip()
+        full_text_for_summary = ('## Einleitung\n\n' + text) if len(_pre_body) > 300 else text
+        fallback_ch = {'heading': 'Volltext', 'full_text': full_text_for_summary, 'level': 1}
         result = load_or_run(
             fallback_path,
             lambda: _summarize_chapter_smart(fallback_ch, 0),
@@ -1706,6 +1712,11 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         # Originaltext als versteckten Text erhalten, aber KEINE Nav-Überschrift erzeugen,
         # damit der Counter für level-2+ sauber bei 1 beginnt (5.1.1, 5.1.2 ...).
         if parent_chapter and not has_numbered_chapters and level == 1:
+            if len(orig_body.strip()) > 800:
+                # Substanzieller Einleitungstext (Abstract/Intro): Summary anzeigen wenn vorhanden.
+                _skipped_sum = sum_lookup.get(lookup_key, '') or sum_lookup.get('einleitung', '')
+                if _skipped_sum.strip():
+                    process_markdown_to_docx(doc, _skipped_sum, hide_text=False, base_path=base_path)
             if orig_body.strip():
                 process_markdown_to_docx(doc, orig_body, hide_text=True, base_path=base_path)
             continue
@@ -1838,7 +1849,13 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     # --- QA-Unterkapitel am Dokumentende ---
     if has_qa and qa_items:
         if parent_chapter:
-            qa_top_num = counters[0] + 1
+            # Nach Fix 4 werden Level-1-Headings in nicht-nummerierten Dokumenten übersprungen
+            # (OCR-Artefakte), sodass counters[0] = 0 bleibt. Die Top-Level-Inhalte liegen
+            # bei Level 2 (counters[1]). Für nummerierte Dokumente zählt weiterhin counters[0].
+            if not has_numbered_chapters:
+                qa_top_num = counters[1] + 1
+            else:
+                qa_top_num = counters[0] + 1
             qa_hdg_text = f"{parent_chapter}.{qa_top_num} Lernfragen"
             qa_level    = min(lvl_shift + 1, 9)
             q_sub_level = min(lvl_shift + 2, 9)
@@ -1850,9 +1867,9 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         h = doc.add_heading(qa_hdg_text, level=qa_level)
         _set_heading_color(h, MM_HEADING_COLORS.get(qa_level, MM_HEADING_COLORS[9]))
 
-        for item in qa_items:
+        for q_idx, item in enumerate(qa_items, start=1):
             if parent_chapter:
-                fq_hdg = f"{parent_chapter}.{qa_top_num}.{item['num']} Frage {item['num']}"
+                fq_hdg = f"{parent_chapter}.{qa_top_num}.{q_idx} Frage {item['num']}"
             else:
                 fq_hdg = f"Frage {item['num']}"
             h_f = doc.add_heading(fq_hdg, level=q_sub_level)
