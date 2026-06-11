@@ -161,10 +161,13 @@ def extract_chapter(text: str, chapter_id: str) -> str:
             continue
         if i > start_idx:
             m2 = re.match(r'^(#{1,6})\s', line)
-            if m2 and len(m2.group(1)) <= heading_level:
+            if m2:
                 clean2 = _clean_heading_text(line)
-                # Ende wenn kein Unterkapitel (d.h. beginnt nicht mit chapter_id.)
-                if not re.match(rf'^{escaped}\.', clean2):
+                # Ende erst beim nächsten nummerierten Kapitel, das weder das Kapitel
+                # selbst noch ein Unterkapitel (chapter_id.x) ist. Unnummerierte
+                # Zwischenüberschriften (OCR setzt sie oft fälschlich auf '#') gehören
+                # zum Kapitelinhalt und beenden die Extraktion NICHT.
+                if re.match(r'^\d', clean2) and not re.match(rf'^{escaped}(\.|\s|$)', clean2):
                     break
         result.append(line)
 
@@ -1478,6 +1481,26 @@ def _prefix_chapter_number(heading_text: str, prefix: str) -> str:
     return heading_text
 
 
+def _rebase_chapter_number(heading_text: str, chapter_root: str, parent_chapter: str) -> str:
+    """
+    Ersetzt die Nummer eines extrahierten Kapitels durch das Elternkapitel.
+    chapter_root='1.3', parent='2.4.1.1':
+      '1.3 Titel'   → '2.4.1.1 Titel'
+      '1.3.2 Titel' → '2.4.1.1.2 Titel'
+      '1.3'         → '2.4.1.1'        (auch reine Nummer ohne Titel)
+    Nicht-Nachfahren werden regulär präfixiert (Fallback).
+    """
+    m = re.match(r'^(\d[\d.]*?)(\s.*|$)', heading_text.strip())
+    if not m:
+        return heading_text
+    num, rest = m.group(1).rstrip('.'), m.group(2)
+    if num == chapter_root:
+        return f"{parent_chapter}{rest}"
+    if num.startswith(chapter_root + '.'):
+        return f"{parent_chapter}.{num[len(chapter_root) + 1:]}{rest}"
+    return f"{parent_chapter}.{num}{rest}"   # Fallback
+
+
 def build_translation_word_document(translated_text: str, output_path: str, base_path: str = None):
     """Erstellt ein Word-Dokument aus dem übersetzten Text.
     Preamble (Abstract) eingerückt; Skip-Headings (Referenzen, Historie, Autor) gefiltert.
@@ -1528,7 +1551,8 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                                     parent_chapter: str = None, parent_level: int = None,
                                     skip_references: bool = True,
                                     questions_path: str = None,
-                                    doc_title: str = "Lernskript"):
+                                    doc_title: str = "Lernskript",
+                                    extracted_chapter: str = None):
     """
     Erstellt ein Word-Dokument, bei dem Zusammenfassung und Originaltext
     kapitelweise verschränkt sind.
@@ -1723,8 +1747,14 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
 
         if parent_chapter:
             if re.match(r'^\d', clean_heading):
-                clean_heading = _prefix_chapter_number(clean_heading, parent_chapter)
-            else:
+                if extracted_chapter:
+                    clean_heading = _rebase_chapter_number(clean_heading, extracted_chapter, parent_chapter)
+                else:
+                    clean_heading = _prefix_chapter_number(clean_heading, parent_chapter)
+            elif not has_numbered_chapters:
+                # Unnummeriert ohne nummerierte Kapitel: hier auto-nummerieren.
+                # Bei has_numbered_chapters übernimmt der Auto-Block unten
+                # (verhindert Doppel-Nummerierung).
                 local_num = _advance_counter(counters, level)
                 clean_heading = f"{parent_chapter}.{local_num} {clean_heading}"
 
@@ -1745,6 +1775,8 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             if originally_numbered:
                 _m = re.match(r'^([\d.]+)', lookup_key)
                 _auto_parent = _m.group(1) if _m else None
+                if _auto_parent and extracted_chapter and parent_chapter:
+                    _auto_parent = _rebase_chapter_number(_auto_parent, extracted_chapter, parent_chapter)
                 _auto_counter = 0
                 _current_competency_key = None
             elif _auto_parent is not None and _unnumbered_freq.get(lookup_key, 0) == 1:
@@ -1852,7 +1884,11 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             # Nach Fix 4 werden Level-1-Headings in nicht-nummerierten Dokumenten übersprungen
             # (OCR-Artefakte), sodass counters[0] = 0 bleibt. Die Top-Level-Inhalte liegen
             # bei Level 2 (counters[1]). Für nummerierte Dokumente zählt weiterhin counters[0].
-            if not has_numbered_chapters:
+            if extracted_chapter and has_numbered_chapters:
+                # Rebase-Modus: Unterkapitel werden über _auto_counter gezählt;
+                # Lernfragen ist das nächste Geschwister.
+                qa_top_num = _auto_counter + 1
+            elif not has_numbered_chapters:
                 qa_top_num = counters[1] + 1
             else:
                 qa_top_num = counters[0] + 1
@@ -2029,6 +2065,7 @@ if __name__ == "__main__":
             skip_references=not args.include_references,
             questions_path=args.questions,
             doc_title=doc_title,
+            extracted_chapter=args.chapter,
         )
 
         print(f"\n=== PIPELINE ERFOLGREICH BEENDET ===")
