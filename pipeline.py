@@ -279,12 +279,23 @@ def _inject_comments_part(doc, comments_list: list):
 
 
 def check_if_english(text: str) -> bool:
-    """Schritt 2a: Prüfe, ob der Text englisch ist."""
+    """Schritt 2a: Prüfe, ob der Text englisch ist.
+
+    Nimmt drei Stichproben (Anfang, Mitte, Ende) um Dokumente mit deutschem Titel
+    aber englischem Haupttext korrekt zu erkennen.
+    """
     print("--- Schritt 2a: Prüfe Sprache des Dokuments ---")
-    leseprobe = text[:2000]
+    n = len(text)
+    samples = [
+        text[:1500],
+        text[max(0, n // 2 - 750): n // 2 + 750],
+        text[max(0, n - 1500):],
+    ]
+    leseprobe = "\n\n---\n\n".join(s for s in samples if s.strip())
     prompt = (
         "Antworte mit exakt einem Wort, entweder 'YES' oder 'NO'. "
-        "Ist der folgende Text hauptsächlich in englischer Sprache verfasst?\n\n"
+        "Ist der folgende Text hauptsächlich in englischer Sprache verfasst? "
+        "Ignoriere vereinzelte deutsche Wörter (z.B. Eigennamen, Zitate) – frage nur nach der Hauptsprache.\n\n"
         f"Text:\n{leseprobe}"
     )
     try:
@@ -2127,35 +2138,44 @@ if __name__ == "__main__":
         if args.chapter:
             raw_md = extract_chapter(raw_md, args.chapter)
 
-        # --- Schritt 2: Sprache prüfen & Übersetzen ---
+        # --- Schritt 2: Sprache prüfen & ggf. übersetzen (nur englische Quellen) ---
         transl_path = cache_dir / "de_uebersetzung.md"
         if args.force and transl_path.exists():
             transl_path.unlink()
 
-        if not transl_path.exists():
-            if check_if_english(raw_md):
-                print("Text ist Englisch. Starte Übersetzung...")
-                working_text = load_or_run(transl_path, lambda: translate_text(raw_md), "Übersetzung")
-            else:
-                print("Text ist bereits Deutsch. Keine Übersetzung notwendig.")
-                working_text = raw_md
-                transl_path.write_text(working_text, encoding="utf-8")
-        else:
+        is_translated = False
+        if transl_path.exists():
+            # Gecachte Übersetzung aus vorherigem Lauf
             print(f"[SKIP] Übersetzung – bereits vorhanden: {transl_path}")
             working_text = transl_path.read_text(encoding="utf-8")
-
-        # --- Zwischenschritt: Übersetzung als eigenes Word-Dokument ---
-        kap_infix = f"_kap{chapter_safe}" if chapter_safe else ""
-        transl_docx_path = Path(OUTPUT_BASE) / f"{pdf_stem}{kap_infix}_Uebersetzung.docx"
-        if args.force or not transl_docx_path.exists():
-            build_translation_word_document(working_text, str(transl_docx_path), base_path=str(out_dir))
+            is_translated = True
+        elif check_if_english(raw_md):
+            print("Text ist Englisch. Starte Übersetzung...")
+            working_text = translate_text(raw_md)
+            transl_path.write_text(working_text, encoding="utf-8")
+            print(f"       Übersetzung gespeichert: {transl_path}")
+            is_translated = True
         else:
-            print(f"[SKIP] Übersetzungs-Docx – bereits vorhanden: {transl_docx_path}")
+            print("Text ist bereits Deutsch. Keine Übersetzung notwendig.")
+            working_text = raw_md
 
-        if args.no_summary:
-            print(f"\n=== PIPELINE ERFOLGREICH BEENDET (nur Übersetzung) ===")
+        # --- Zwischenschritt: Übersetzungs-Docx (nur bei englischer Quelle) ---
+        kap_infix = f"_kap{chapter_safe}" if chapter_safe else ""
+        if is_translated:
+            transl_docx_path = Path(OUTPUT_BASE) / f"{pdf_stem}{kap_infix}_Uebersetzung.docx"
+            if args.force or not transl_docx_path.exists():
+                build_translation_word_document(working_text, str(transl_docx_path), base_path=str(out_dir))
+            else:
+                print(f"[SKIP] Übersetzungs-Docx – bereits vorhanden: {transl_docx_path}")
+
+            if args.no_summary:
+                print(f"\n=== PIPELINE ERFOLGREICH BEENDET (nur Übersetzung) ===")
+                print(f"Zwischenergebnisse: {cache_dir}")
+                print(f"Fertiges Dokument:  {transl_docx_path}")
+                sys.exit(0)
+        elif args.no_summary:
+            print(f"\n=== PIPELINE ERFOLGREICH BEENDET (Text bereits Deutsch – keine Übersetzung erstellt) ===")
             print(f"Zwischenergebnisse: {cache_dir}")
-            print(f"Fertiges Dokument:  {transl_docx_path}")
             sys.exit(0)
 
         # --- Schritt 3: Box-Strukturreparatur (nur wenn Lehrbuch-Kästen vorhanden) ---
