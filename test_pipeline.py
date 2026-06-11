@@ -39,7 +39,14 @@ from pipeline import (
     _summarize_chapter_by_sections,
     _summarize_single_chapter,
     generate_summary_by_chapter,
+    _is_box_heading,
+    _split_paragraphs,
+    repair_box_structure,
+    _classify_box_boundaries,
+    _rebase_chapter_number,
+    extract_chapter,
 )
+import pipeline
 
 
 # ---------------------------------------------------------------------------
@@ -1712,4 +1719,130 @@ def test_generate_chunks_all_sections_covered(tmp_path, monkeypatch):
 
     for i in range(1, 7):
         assert f"Section {i}" in result, f"Section {i} fehlt im kombinierten Output"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 30: Kapitel-Extraktion & Nummern-Rebase (--chapter + --parent-chapter)
+# ---------------------------------------------------------------------------
+
+def test_extract_chapter_keeps_unnumbered_subsections():
+    """extract_chapter bricht NICHT bei unnummerierten '#'-Zwischenüberschriften ab."""
+    md = (
+        "# 1.3 Lernen als Wissenserwerb\n\nIntro.\n\n"
+        "#### Wie wird Wissen erworben?\n\nAbsatz A.\n\n"
+        "# Wie ist Wissen repräsentiert?\n\nAbsatz B.\n\n"
+        "# 1.4 Konstruktion\n\nNächstes Kapitel.\n"
+    )
+    out = extract_chapter(md, "1.3")
+    assert "Wie ist Wissen repräsentiert?" in out
+    assert "Absatz B." in out
+    assert "1.4 Konstruktion" not in out
+    assert "Nächstes Kapitel." not in out
+
+
+def test_rebase_chapter_number_root_and_descendants():
+    assert _rebase_chapter_number("1.3 Titel", "1.3", "2.4.1.1") == "2.4.1.1 Titel"
+    assert _rebase_chapter_number("1.3.2 Unterkapitel", "1.3", "2.4.1.1") == "2.4.1.1.2 Unterkapitel"
+    assert _rebase_chapter_number("1.3", "1.3", "2.4.1.1") == "2.4.1.1"
+
+
+def test_rebase_chapter_number_non_descendant_fallback():
+    """Nicht-Nachfahren werden präfixiert (Fallback)."""
+    assert _rebase_chapter_number("2 Anderes", "1.3", "2.4.1.1") == "2.4.1.1.2 Anderes"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 31: Box-Strukturreparatur (Fokus/Studie/Definition/Beispiel)
+# ---------------------------------------------------------------------------
+
+def test_is_box_heading_detects_labels():
+    assert _is_box_heading("Fokus: Bedeutung des Hippocampus")
+    assert _is_box_heading("**Studie: Bildrätsel**")
+    assert _is_box_heading("Definition: Proposition")
+    assert _is_box_heading("Beispiel: Advance Organizer")
+    assert not _is_box_heading("Wie ist Wissen repräsentiert?")
+    assert not _is_box_heading("1.3 Lernen als Wissenserwerb")
+
+
+def test_split_paragraphs_basic():
+    assert _split_paragraphs("A\n\nB\n\n\nC") == ["A", "B", "C"]
+    assert _split_paragraphs("") == []
+
+
+def test_repair_box_structure_no_box_unchanged(monkeypatch):
+    """Ohne Kasten: Text unverändert, kein Klassifikator-Aufruf."""
+    called = []
+    monkeypatch.setattr('pipeline._classify_box_boundaries', lambda b: called.append(b) or [])
+    md = "# Kapitel\n\nText.\n\n## Unterkapitel\n\nMehr Text.\n"
+    assert repair_box_structure(md) == md
+    assert called == []
+
+
+def test_repair_box_structure_reattaches_running_text(monkeypatch):
+    """Fließtext-Suffix wandert zum Eltern, Kasten behält nur Kasteninhalt."""
+    monkeypatch.setattr('pipeline._classify_box_boundaries', lambda boxes: [2])
+    md = (
+        "# Wie ist Wissen repräsentiert?\n\nIntro-Absatz.\n\n"
+        "#### Fokus: Hippocampus\n\n"
+        "Kasten Absatz 1.\n\nKasten Absatz 2.\n\n"
+        "Fließtext Absatz 1.\n\nFließtext Absatz 2.\n\n"
+        "# Nächster Abschnitt\n\nEgal.\n"
+    )
+    out = repair_box_structure(md)
+    # Parent enthält jetzt den Fließtext
+    parent_part = out.split("#### Fokus")[0]
+    assert "Intro-Absatz." in parent_part
+    assert "Fließtext Absatz 1." in parent_part
+    assert "Fließtext Absatz 2." in parent_part
+    # Kasten enthält NUR den Kasteninhalt
+    box_part = out.split("#### Fokus: Hippocampus")[1].split("# Nächster Abschnitt")[0]
+    assert "Kasten Absatz 1." in box_part
+    assert "Kasten Absatz 2." in box_part
+    assert "Fließtext Absatz 1." not in box_part
+
+
+def test_repair_box_structure_woven_two_boxes(monkeypatch):
+    """Zwei Kästen, beide Suffixe landen in Reihenfolge im selben Parent."""
+    monkeypatch.setattr('pipeline._classify_box_boundaries', lambda boxes: [1, 1])
+    md = (
+        "# Eltern\n\nIntro.\n\n"
+        "#### Studie: Eins\n\nStudieinhalt.\n\nSuffix Eins.\n\n"
+        "#### Definition: Zwei\n\nDefinhalt.\n\nSuffix Zwei.\n\n"
+        "# Ende\n\nfertig.\n"
+    )
+    out = repair_box_structure(md)
+    parent_part = out.split("#### Studie")[0]
+    assert "Suffix Eins." in parent_part
+    assert "Suffix Zwei." in parent_part
+    # Reihenfolge: Suffix Eins vor Suffix Zwei
+    assert parent_part.index("Suffix Eins.") < parent_part.index("Suffix Zwei.")
+    # Beide Kästen erscheinen sauber nach dem Elterntext
+    assert "#### Studie: Eins" in out
+    assert "#### Definition: Zwei" in out
+
+
+def test_repair_box_structure_fallback_on_error(monkeypatch):
+    """Klassifikator-Fehler → Originaltext unverändert (kein Crash)."""
+    def boom(boxes):
+        raise RuntimeError("API down")
+    monkeypatch.setattr('pipeline._classify_box_boundaries', boom)
+    md = (
+        "# Eltern\n\nIntro.\n\n"
+        "#### Fokus: X\n\nKasten.\n\nFließtext.\n\n"
+    )
+    assert repair_box_structure(md) == md
+
+
+def test_classify_box_boundaries_clamps(monkeypatch):
+    """Klassifikator clampt n auf [1, len(paragraphs)]."""
+    class FakeResp:
+        text = '{"0": 0, "1": 99}'
+
+    monkeypatch.setattr('pipeline.call_gemini_with_retry',
+                        lambda **kwargs: FakeResp())
+    boxes = [
+        {'title': 'Fokus: A', 'paragraphs': ['p1', 'p2', 'p3']},
+        {'title': 'Studie: B', 'paragraphs': ['q1', 'q2']},
+    ]
+    assert _classify_box_boundaries(boxes) == [1, 2]
 

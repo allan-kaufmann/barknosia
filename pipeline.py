@@ -4,6 +4,7 @@ import subprocess
 import sys
 import time
 import re
+import json
 from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
@@ -579,7 +580,9 @@ def _summarize_single_chapter(heading: str, chapter_text: str) -> str:
         "5. Keine neuen Informationen ergänzen.\n"
         "6. Abbildungen und Tabellen kurz erwähnen und ihren Inhalt beschreiben.\n"
         "7. Stichpunkte statt Fließtext (Ausnahme: Definitionen).\n"
-        "8. Länge: maximal 40–50 % des Originals – ABER vollständige Unterkapitelabdeckung hat Vorrang vor Kürze.\n\n"
+        "8. Länge: maximal 40–50 % des Originals – ABER vollständige Unterkapitelabdeckung hat Vorrang vor Kürze.\n"
+        "9. Kästen (Fokus/Studie/Definition/Beispiel) sind eigenständige Lernobjekte – "
+        "fasse jeden als abgeschlossene Einheit unter seiner eigenen Überschrift zusammen.\n\n"
         "Selbstprüfung (am Ende anhängen):\n"
         "- Liste alle Unterkapitel des Originals auf\n"
         "- Markiere fehlende Unterkapitel oder fehlende Studienergebnisse\n\n"
@@ -815,6 +818,135 @@ def parse_sections(text: str) -> list:
         })
 
     return sections
+
+
+# Kasten-Labels für eingeschobene Lehrbuch-Boxen (Fokus/Studie/Definition/Beispiel/Exkurs).
+_BOX_LABEL_RE = re.compile(r'^(fokus|studie|beispiel|definition|exkurs)\b', re.IGNORECASE)
+
+
+def _is_box_heading(heading: str) -> bool:
+    """True wenn die Überschrift ein eingeschobener Lehrbuch-Kasten ist (Fokus:/Studie: …)."""
+    return bool(_BOX_LABEL_RE.match(_clean_heading_text(heading)))
+
+
+def _split_paragraphs(body: str) -> list:
+    """Body in Absätze splitten (Trenner: Leerzeile). Leere Absätze werden entfernt."""
+    return [p.strip() for p in re.split(r'\n\s*\n', body) if p.strip()]
+
+
+def _classify_box_boundaries(boxes: list) -> list:
+    """
+    LLM-Klassifikation: Für jeden Kasten die Anzahl der FÜHRENDEN Absätze, die wirklich
+    zum Kasten gehören (Rest = irrtümlich von der OCR angehängter Fließtext des
+    Elternabschnitts). boxes: [{'title': str, 'paragraphs': [str, ...]}, ...].
+    Rückgabe: list[int] gleicher Länge, jeweils geclampt auf [1, len(paragraphs)].
+    """
+    lines = [
+        "Du erhältst Textkästen aus einem Lehrbuch. Durch die OCR wurde an jeden Kasten "
+        "fälschlich nachfolgender Fließtext angehängt, der zum umgebenden Kapitel gehört.\n",
+        "Aufgabe: Bestimme für jeden Kasten, wie viele der ERSTEN Absätze tatsächlich zum "
+        "Kasten gehören (thematisch zum Kastentitel passen). Die restlichen Absätze sind "
+        "irrtümlich angehängter Fließtext.\n",
+        "Regeln:\n- Ändere keinen Text.\n- Mindestens 1 Absatz gehört zum Kasten.\n"
+        '- Gib NUR JSON zurück, Format {"0": n0, "1": n1, ...} (Kastenindex → Anzahl).\n',
+        "Kästen:",
+    ]
+    for bi, box in enumerate(boxes):
+        lines.append(f'\n=== Kasten {bi}: "{box["title"]}" ===')
+        for pi, para in enumerate(box['paragraphs'], 1):
+            lines.append(f'[Absatz {pi}] {para.replace(chr(10), " ")}')
+    prompt = '\n'.join(lines)
+
+    response = call_gemini_with_retry(
+        model_name='gemini-2.5-pro',
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0, response_mime_type='application/json'),
+    )
+    raw = response.text.strip()
+    raw = re.sub(r'^```(?:json)?|```$', '', raw, flags=re.MULTILINE).strip()
+    data = json.loads(raw)
+
+    result = []
+    for bi, box in enumerate(boxes):
+        n = int(data.get(str(bi), 1))
+        result.append(max(1, min(n, len(box['paragraphs']))))
+    return result
+
+
+def repair_box_structure(text: str) -> str:
+    """
+    Trennt eingeschobene Lehrbuch-Kästen (Fokus/Studie/Definition/Beispiel) von dem
+    Fließtext, den die OCR fälschlich in den Kasten-Body gezogen hat, und führt diesen
+    Fließtext zum Elternabschnitt zurück. Jeder Kasten wird dadurch ein eigenständiges,
+    vollständiges Lernobjekt; der Elterntext bleibt zusammenhängend.
+
+    Ohne Kästen → Originaltext (kein API-Call). Bei API-/Parse-Fehler → Originaltext
+    unverändert (kein Crash, kein Datenverlust).
+    """
+    sections = parse_sections(text)
+    box_indices = [
+        i for i, s in enumerate(sections)
+        if s['heading'] != '__preamble__' and _is_box_heading(s['heading'])
+    ]
+    if not box_indices:
+        return text
+
+    boxes = [
+        {'title': _clean_heading_text(sections[i]['heading']),
+         'paragraphs': _split_paragraphs(sections[i]['body'])}
+        for i in box_indices
+    ]
+    try:
+        counts = _classify_box_boundaries(boxes)
+    except Exception as e:
+        print(f"   [Box-Reparatur übersprungen] Klassifikation fehlgeschlagen: {e}")
+        return text
+
+    count_map = dict(zip(box_indices, counts))
+
+    out_blocks: list[str] = []
+    parent: dict | None = None  # {'head': str|None, 'paras': list[str], 'boxes': list[str]}
+
+    def _flush(p):
+        if p is None:
+            return
+        parts = []
+        if p['head'] is not None:
+            parts.append(p['head'])
+        if p['paras']:
+            parts.append('\n\n'.join(p['paras']))
+        block = '\n\n'.join(parts).strip()
+        if block:
+            out_blocks.append(block)
+        out_blocks.extend(p['boxes'])
+
+    for i, s in enumerate(sections):
+        head_line = None if s['heading'] == '__preamble__' else '#' * s['level'] + ' ' + s['heading']
+
+        if i in count_map:
+            paras = _split_paragraphs(s['body'])
+            n = count_map[i]
+            box_content, running = paras[:n], paras[n:]
+            box_parts = [head_line] if head_line else []
+            if box_content:
+                box_parts.append('\n\n'.join(box_content))
+            box_block = '\n\n'.join(box_parts).strip()
+            if parent is not None:
+                parent['paras'].extend(running)
+                if box_block:
+                    parent['boxes'].append(box_block)
+            else:
+                # Kasten ohne vorangehenden Elternabschnitt: eigenständig belassen.
+                if box_block:
+                    out_blocks.append(box_block)
+                if running:
+                    out_blocks.append('\n\n'.join(running))
+        else:
+            _flush(parent)
+            parent = {'head': head_line, 'paras': _split_paragraphs(s['body']), 'boxes': []}
+
+    _flush(parent)
+    return '\n\n'.join(out_blocks).strip() + '\n'
 
 
 def normalize_heading(h: str) -> str:
@@ -2025,6 +2157,20 @@ if __name__ == "__main__":
             print(f"Zwischenergebnisse: {cache_dir}")
             print(f"Fertiges Dokument:  {transl_docx_path}")
             sys.exit(0)
+
+        # --- Schritt 3: Box-Strukturreparatur (nur wenn Lehrbuch-Kästen vorhanden) ---
+        # Trennt eingeschobene Kästen (Fokus/Studie/Definition/Beispiel) vom Fließtext,
+        # den die OCR fälschlich in den Kasten gezogen hat. Speist Summary + Interleaved.
+        struct_path = cache_dir / "de_strukturiert.md"
+        if args.force and struct_path.exists():
+            struct_path.unlink()
+        if struct_path.exists():
+            print(f"[SKIP] Box-Strukturreparatur – bereits vorhanden: {struct_path}")
+            working_text = struct_path.read_text(encoding="utf-8")
+        else:
+            print("--- Schritt 3: Box-Strukturreparatur (Kästen vom Fließtext trennen) ---")
+            working_text = repair_box_structure(working_text)
+            struct_path.write_text(working_text, encoding="utf-8")
 
         # --- Schritt 4: Zusammenfassung (kapitelweise) ---
         sum_path = cache_dir / "zusammenfassung.md"
