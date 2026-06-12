@@ -1887,6 +1887,13 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         if re.search(r'^(?:\\_)+\s*$', orig_body, re.MULTILINE):
             continue
 
+        # Normalisierung: "Titel 7.2.2" → "7.2.2 Titel" (OCR-Artefakt: Kapitelnummer am Zeilenende)
+        if extracted_chapter:
+            _ec_esc = re.escape(extracted_chapter)
+            _m_tail = re.match(r'^(.+?)\s+(\d[\d.]*)\s*$', clean_heading)
+            if _m_tail and re.match(rf'^{_ec_esc}\.', _m_tail.group(2)):
+                clean_heading = f"{_m_tail.group(2)} {_m_tail.group(1).rstrip()}"
+
         # In eingebettetem Modus (parent_chapter gesetzt, keine nummerierten Kapitel):
         # Level-1-Headings sind OCR-Artefakte (Artikeltitel, Journal-Metadaten).
         # Originaltext als versteckten Text erhalten, aber KEINE Nav-Überschrift erzeugen,
@@ -1918,8 +1925,8 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             num_m = re.match(r'^([\d.]+)\b', clean_heading)
             if num_m:
                 display_level = min(len(num_m.group(1).split('.')) + 1, 9)
-            elif _is_box_heading(clean_heading):
-                # Kästen: 2 Ebenen unter dem Elternkapitel, unabhängig vom OCR-Level (####).
+            elif _is_box_heading(clean_heading) or (extracted_chapter and level > 1 and not re.match(r'^\d', clean_heading)):
+                # Kästen + nicht-nummerierte Level-2+-Headings im Einbette-Modus: 2 Ebenen unter Elternkapitel.
                 display_level = min(lvl_shift + 2, 9)
             else:
                 display_level = min(level + lvl_shift, 9)
@@ -1927,7 +1934,8 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             display_level = level
 
         sum_body = sum_lookup.get(lookup_key, '')
-        originally_numbered = bool(re.match(r'^\d', lookup_key))
+        # clean_heading kann nach Rebase bereits eine Zahl vorne haben (tail-normalisierte Headings).
+        originally_numbered = bool(re.match(r'^\d', lookup_key)) or bool(re.match(r'^\d', clean_heading))
 
         # Auto-Nummerierung: einzigartige unnummerierte Überschriften (freq=1) nach einem
         # nummerierten Kapitel erhalten automatisch eine Unterkapitelnummer (z.B. 5.3.1).
@@ -1942,10 +1950,11 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                 _auto_counter = 0
                 _current_competency_key = None
             elif (_auto_parent is not None and _unnumbered_freq.get(lookup_key, 0) == 1
-                  and not (extracted_chapter and _is_box_heading(clean_heading))):
+                  and not (extracted_chapter and _is_box_heading(clean_heading))
+                  and not (extracted_chapter and level > 1)):
                 # Unique unnummerierte Unterüberschrift: auto-nummerieren.
-                # Kästen (Fokus/Studie/…) im Einbette-Modus ausgenommen – sie bekommen
-                # keine Kapitelnummer und erscheinen als eigenständige Lernobjekte.
+                # Kästen (Fokus/Studie/…) und Level-2+-Headings im Einbette-Modus ausgenommen
+                # – sie erscheinen als eigenständige Lernobjekte ohne Kapitelnummer.
                 originally_numbered = True
                 _current_competency_key = lookup_key
                 if idx in _visible_section_indices:
@@ -1987,9 +1996,10 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         show_heading_visible = bool(sum_body.strip()) or has_children
         if show_heading_visible:
             if has_numbered_chapters:
-                # Kästen im Einbette-Modus sind nicht originally_numbered (auto-block
-                # ausgeschlossen), aber sie sollen trotzdem als Heading erscheinen.
-                nav_worthy = originally_numbered or (extracted_chapter and _is_box_heading(clean_heading))
+                # Kästen + nicht-nummerierte Level-2+-Headings im Einbette-Modus: trotzdem Heading.
+                nav_worthy = (originally_numbered
+                              or (extracted_chapter and _is_box_heading(clean_heading))
+                              or (extracted_chapter and level > 1 and not re.match(r'^\d', clean_heading)))
             elif parent_chapter:
                 nav_worthy = True
             else:

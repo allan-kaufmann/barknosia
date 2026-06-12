@@ -1998,3 +1998,102 @@ def test_extract_chapter_label_not_found_raises():
     import pytest
     with pytest.raises(ValueError, match="Kapitel '7' nicht im Markdown gefunden"):
         extract_chapter(md, "7")
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 34: Tail-Normalisierung + Level-2+-Heading-Behandlung im Einbette-Modus
+# ---------------------------------------------------------------------------
+
+def test_tail_numbered_heading_rebased_correctly():
+    """Heading 'Titel 7.2.2' (Nummer am Ende) wird normalisiert zu '7.2.2 Titel'
+    und erscheint als '2.4.2.1.2.2 Titel' (Heading 7), nicht als '2.4.2.1.2.1.1'."""
+    orig_md = (
+        "# 7.2 Theorien\n\nEinleitungstext.\n\n"
+        "# 7.2.1 Motivation als Abwägen\n\nText.\n\n"
+        "#### Motivation als Zielverfolgung 7.2.2\n\nText zu 7.2.2.\n\n"
+    )
+    sum_md = (
+        "## 7.2 Theorien\n\nZusammenfassung.\n\n"
+        "## 7.2.1 Motivation als Abwägen\n\nSummary.\n\n"
+        "## Motivation als Zielverfolgung 7.2.2\n\nSummary 7.2.2.\n\n"
+    )
+    paras = _run_interleaved_embedded(orig_md, sum_md,
+                                     parent_chapter="2.4.2.1", extracted_chapter="7")
+    texts = [p.text for p in paras]
+    ziel_paras = [p for p in paras if "Zielverfolgung" in p.text]
+    assert ziel_paras, f"'Motivation als Zielverfolgung' nicht gefunden. Texte:\n{texts}"
+    ziel_text = ziel_paras[0].text
+    assert ziel_text.startswith("2.4.2.1.2.2"), (
+        f"Heading soll mit '2.4.2.1.2.2' beginnen, gefunden: {ziel_text!r}"
+    )
+    assert "2.4.2.1.2.1.1" not in ziel_text, f"Fälschliche Tiefnummer gefunden: {ziel_text!r}"
+
+
+def test_tail_normalization_false_positive_year():
+    """'Studie aus dem Jahr 2023' darf bei extracted_chapter='7' NICHT umgeordnet werden,
+    da '2023' nicht mit '7.' beginnt."""
+    orig_md = (
+        "# 7.1 Empirische Befunde\n\nText.\n\n"
+        "#### Studie aus dem Jahr 2023\n\nStudieninhalt.\n\n"
+    )
+    sum_md = (
+        "## 7.1 Empirische Befunde\n\nZusammenfassung.\n\n"
+        "## Studie aus dem Jahr 2023\n\nStudien-Summary.\n\n"
+    )
+    paras = _run_interleaved_embedded(orig_md, sum_md,
+                                     parent_chapter="2.4.2.1", extracted_chapter="7")
+    studie_paras = [p for p in paras if "Studie" in p.text and "2023" in p.text]
+    assert studie_paras, "Studie-Heading nicht gefunden"
+    for sp in studie_paras:
+        assert not sp.text.startswith("2023"), (
+            f"Jahreszahl wurde fälschlich als Kapitelnummer behandelt: {sp.text!r}"
+        )
+
+
+def test_embed_level3_heading_not_auto_numbered_appears_as_heading():
+    """Level-3-Heading (###) ohne Kapitelnummer erhält im Einbette-Modus keine Auto-Nummer,
+    erscheint aber als Heading (nicht Normal+Bold)."""
+    orig_md = (
+        "# 7.2.1 Motivation als Abwägen\n\nText.\n\n"
+        "### Die Skalen zur Erfassung der Lern- und Leistungsmotivation (SELLMO)\n\nSELLMO-Inhalt.\n\n"
+    )
+    sum_md = (
+        "## 7.2.1 Motivation als Abwägen\n\nSummary.\n\n"
+        "## Die Skalen zur Erfassung der Lern- und Leistungsmotivation (SELLMO)\n\nSELLMO-Summary.\n\n"
+    )
+    paras = _run_interleaved_embedded(orig_md, sum_md,
+                                     parent_chapter="2.4.2.1", extracted_chapter="7")
+    texts = [p.text for p in paras]
+    sellmo_paras = [p for p in paras if "SELLMO" in p.text]
+    assert sellmo_paras, f"SELLMO-Heading nicht gefunden. Texte:\n{texts}"
+    for sp in sellmo_paras:
+        assert not sp.text.startswith("2.4.2.1."), (
+            f"SELLMO-Heading darf keine Kapitelnummer erhalten, gefunden: {sp.text!r}"
+        )
+    assert "Heading" in sellmo_paras[0].style.name, (
+        f"SELLMO soll als Heading erscheinen, Style: {sellmo_paras[0].style.name!r}"
+    )
+
+
+def test_embed_level4_nonbox_heading_not_auto_numbered_appears_as_heading():
+    """Level-4-Heading (####) ohne Kapitelnummer und ohne Fokus/Studie-Label
+    erhält im Einbette-Modus keine Auto-Nummer, erscheint aber als Heading."""
+    orig_md = (
+        "# 7.3 Bezugsnormorientierungen\n\nText.\n\n"
+        "#### Drei Arten von Bezugsnormen\n\nDefinitionstext.\n\n"
+    )
+    sum_md = (
+        "## 7.3 Bezugsnormorientierungen\n\nSummary.\n\n"
+        "## Drei Arten von Bezugsnormen\n\nSummary.\n\n"
+    )
+    paras = _run_interleaved_embedded(orig_md, sum_md,
+                                     parent_chapter="2.4.2.1", extracted_chapter="7")
+    drei_paras = [p for p in paras if "Drei Arten" in p.text]
+    assert drei_paras, "Heading 'Drei Arten von Bezugsnormen' nicht gefunden"
+    for dp in drei_paras:
+        assert not dp.text.startswith("2.4.2.1."), (
+            f"Level-4-Heading darf keine Kapitelnummer erhalten, gefunden: {dp.text!r}"
+        )
+    assert "Heading" in drei_paras[0].style.name, (
+        f"Level-4-Heading soll als Heading erscheinen, Style: {drei_paras[0].style.name!r}"
+    )
