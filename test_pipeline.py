@@ -537,6 +537,30 @@ def test_normalize_5level_depth():
     assert result.startswith("##### 1.2.3.4.5 Sehr tief")
 
 
+def test_normalize_tail_number_reordered():
+    """'#### Titel 7.2.2' (Nummer am Ende, 2 Punkte) → '### 7.2.2 Titel'."""
+    result = normalize_heading_levels("#### Motivation als Zielverfolgung 7.2.2\nText")
+    assert result.startswith("### 7.2.2 Motivation als Zielverfolgung"), (
+        f"Tail-Normalisierung fehlgeschlagen: {result!r}"
+    )
+
+
+def test_normalize_tail_number_false_positive_year():
+    """'Studie aus dem Jahr 2023' (kein Punkt in Zahl) bleibt unverändert."""
+    result = normalize_heading_levels("#### Studie aus dem Jahr 2023\nText")
+    assert result.startswith("#### Studie aus dem Jahr 2023"), (
+        f"Jahreszahl darf nicht als Kapitelnummer behandelt werden: {result!r}"
+    )
+
+
+def test_normalize_tail_number_false_positive_one_dot():
+    """'Abbildung 18.4' (nur 1 Punkt) bleibt unverändert — Mindest 2 Punkte erforderlich."""
+    result = normalize_heading_levels("#### Abbildung 18.4\nText")
+    assert result.startswith("#### Abbildung 18.4"), (
+        f"Einfache Abbildungsnummer darf nicht normalisiert werden: {result!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Gruppe 14: _compress_heading_levels – nummerierte Headings unverändert
 # ---------------------------------------------------------------------------

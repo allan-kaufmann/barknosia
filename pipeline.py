@@ -983,10 +983,13 @@ def normalize_heading_levels(text: str) -> str:
     """
     Normalisiert inkonsistente Markdown-Überschriftenebenen.
     Nummerierte Kapitelüberschriften erhalten konsistente Ebenen:
-      "1 Titel"     → ## (H2)
-      "4.1 Titel"   → ### (H3)
-      "4.1.1 Titel" → #### (H4)
+      "1 Titel"     → # (H1)
+      "4.1 Titel"   → ## (H2)
+      "4.1.1 Titel" → ### (H3)
     Nicht-nummerierte Überschriften werden nicht verändert.
+    Tail-nummerierte Überschriften ("Titel 7.2.2") werden umgeordnet und
+    ebenfalls normalisiert – mindestens 2 Punkte erforderlich (schließt
+    einfache Abbildungsnummern wie "18.4" aus).
     """
     result = []
     for line in text.split('\n'):
@@ -1001,7 +1004,17 @@ def normalize_heading_levels(text: str) -> str:
                 new_level = '#' * min(dots + 1, 6)
                 result.append(f'{new_level} {content}')
             else:
-                result.append(line)
+                # OCR-Artefakt: Kapitelnummer am Ende ("Titel 7.2.2" → "7.2.2 Titel").
+                # Mindestens 2 Punkte (N.M.P) erforderlich – schließt Jahre und einfache
+                # Abbildungsnummern aus ("Studie 2023", "Abbildung 18.4" bleiben unverändert).
+                tail_m = re.match(r'^(.+?)\s+(\d+(?:\.\d+){2,})\s*$', clean_nohtml)
+                if tail_m:
+                    dots = tail_m.group(2).count('.')
+                    new_level = '#' * min(dots + 1, 6)
+                    reordered = f"{tail_m.group(2)} {tail_m.group(1).rstrip()}"
+                    result.append(f'{new_level} {reordered}')
+                else:
+                    result.append(line)
         else:
             result.append(line)
     return '\n'.join(result)
