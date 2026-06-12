@@ -1951,3 +1951,50 @@ def test_embed_parent_chapter_heading_level_from_number():
     assert chapter_para is not None, "Rebasiertes Kapitel '2.4.1.2 Lernen' nicht gefunden"
     style = chapter_para.style.name
     assert "5" in style, f"4-stelliges Kapitel soll Heading 5 sein, erhalten: {style!r}"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 33: extract_chapter erkennt "Kapitel N"-Format
+# ---------------------------------------------------------------------------
+
+def test_extract_chapter_label_format_found():
+    """'Kapitel 7'-Heading (ohne führende Zahl) wird als Kapitelstart erkannt."""
+    md = (
+        "# Kapitel 6\n\n# 6.1 Vorheriges\n\nText.\n\n"
+        "# Kapitel 7\n\n# 7.1 Bedeutung\n\nText A.\n\n# 7.2 Theorien\n\nText B.\n\n"
+        "# Kapitel 8\n\n# 8.1 Nächstes\n\nText C.\n\n"
+    )
+    result = extract_chapter(md, "7")
+    assert "Kapitel 7" in result
+    assert "7.1 Bedeutung" in result
+    assert "7.2 Theorien" in result
+    assert "Kapitel 8" not in result
+    assert "8.1 Nächstes" not in result
+
+
+def test_extract_chapter_label_format_with_html_spans():
+    """HTML-Spans im Kapitel-Heading werden korrekt ignoriert."""
+    md = (
+        '# <span id="p1"></span>Kapitel 7\n\n'
+        '# 7.1 Unterkapitel\n\nText.\n\n'
+        '# <span id="p2"></span>Kapitel 8\n\nNot included.\n\n'
+    )
+    result = extract_chapter(md, "7")
+    assert "7.1 Unterkapitel" in result
+    assert "Kapitel 8" not in result
+
+
+def test_extract_chapter_numeric_format_unchanged():
+    """Numerisches Format '7 Titel' funktioniert weiterhin unverändert."""
+    md = "# 7 Lernen\n\nText.\n\n# 8 Next\n\nNot included.\n\n"
+    result = extract_chapter(md, "7")
+    assert "7 Lernen" in result
+    assert "Not included" not in result
+
+
+def test_extract_chapter_label_not_found_raises():
+    """Wenn weder numerisch noch 'Kapitel N' gefunden: ValueError."""
+    md = "# Kapitel 8\n\nText.\n\n"
+    import pytest
+    with pytest.raises(ValueError, match="Kapitel '7' nicht im Markdown gefunden"):
+        extract_chapter(md, "7")

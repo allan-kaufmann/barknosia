@@ -135,21 +135,32 @@ def extract_chapter(text: str, chapter_id: str) -> str:
     """
     Extrahiert ein bestimmtes Kapitel (inkl. aller Unterkapitel) aus einem Markdown-Text.
     chapter_id: z.B. '4.2' oder '1' — robuste Erkennung auch bei HTML-Tags in Überschriften.
+    Unterstützt zwei Heading-Formate:
+      - Numerisch:  "7 Titel…"  /  "7.2 Sub…"
+      - Label:      "Kapitel 7" / "Chapter 7" / "Teil 7" / "Abschnitt 7"
     Extraktion endet bei der nächsten Überschrift gleicher/höherer Ebene die kein Unterkapitel ist.
     """
     escaped = re.escape(chapter_id)
+    _label_pat = r'(?:Kapitel|Chapter|Teil|Abschnitt)'
     lines = text.split('\n')
     start_idx = None
     heading_level = None
+    label_mode = False   # True wenn Kapitel via "Kapitel N"-Format gefunden
 
     for i, line in enumerate(lines):
         m = re.match(r'^(#{1,6})\s', line)
         if m:
             clean = _clean_heading_text(line)
-            # Exakter Match: "1 Titel" oder "1" allein — NICHT "1.1" oder "11"
+            # Primär: "7 Titel" oder "7" allein — NICHT "7.1" oder "71"
             if re.match(rf'^{escaped}(\s|$)', clean):
                 start_idx = i
                 heading_level = len(m.group(1))
+                break
+            # Fallback: "Kapitel 7", "Chapter 7", "Teil 7", "Abschnitt 7"
+            if re.match(rf'^{_label_pat}\s+{escaped}(\s|$)', clean, re.IGNORECASE):
+                start_idx = i
+                heading_level = len(m.group(1))
+                label_mode = True
                 break
 
     if start_idx is None:
@@ -165,11 +176,13 @@ def extract_chapter(text: str, chapter_id: str) -> str:
             if m2:
                 clean2 = _clean_heading_text(line)
                 # Ende erst beim nächsten nummerierten Kapitel, das weder das Kapitel
-                # selbst noch ein Unterkapitel (chapter_id.x) ist. Unnummerierte
-                # Zwischenüberschriften (OCR setzt sie oft fälschlich auf '#') gehören
-                # zum Kapitelinhalt und beenden die Extraktion NICHT.
+                # selbst noch ein Unterkapitel (chapter_id.x) ist.
                 if re.match(r'^\d', clean2) and not re.match(rf'^{escaped}(\.|\s|$)', clean2):
                     break
+                # Im label_mode: auch bei "Kapitel M" (M ≠ chapter_id) stoppen.
+                if label_mode and re.match(rf'^{_label_pat}\s+\d', clean2, re.IGNORECASE):
+                    if not re.match(rf'^{_label_pat}\s+{escaped}(\s|$)', clean2, re.IGNORECASE):
+                        break
         result.append(line)
 
     extracted = '\n'.join(result)
