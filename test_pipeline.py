@@ -2074,9 +2074,9 @@ def test_tail_normalization_false_positive_year():
         )
 
 
-def test_embed_level3_heading_not_auto_numbered_appears_as_heading():
-    """Level-3-Heading (###) ohne Kapitelnummer erhält im Einbette-Modus keine Auto-Nummer,
-    erscheint aber als Heading (nicht Normal+Bold)."""
+def test_embed_level3_heading_not_auto_numbered_not_in_nav():
+    """Level-3-Heading (###) ohne Kapitelnummer erhält im Einbette-Modus keine Auto-Nummer
+    und erscheint als Normal+Bold (nicht als Word-Heading im Navigationsbereich)."""
     orig_md = (
         "# 7.2.1 Motivation als Abwägen\n\nText.\n\n"
         "### Die Skalen zur Erfassung der Lern- und Leistungsmotivation (SELLMO)\n\nSELLMO-Inhalt.\n\n"
@@ -2094,14 +2094,15 @@ def test_embed_level3_heading_not_auto_numbered_appears_as_heading():
         assert not sp.text.startswith("2.4.2.1."), (
             f"SELLMO-Heading darf keine Kapitelnummer erhalten, gefunden: {sp.text!r}"
         )
-    assert "Heading" in sellmo_paras[0].style.name, (
-        f"SELLMO soll als Heading erscheinen, Style: {sellmo_paras[0].style.name!r}"
+    assert "Heading" not in sellmo_paras[0].style.name, (
+        f"SELLMO soll als Normal+Bold erscheinen (nicht im Navigationsbereich), Style: {sellmo_paras[0].style.name!r}"
     )
 
 
-def test_embed_level4_nonbox_heading_not_auto_numbered_appears_as_heading():
+def test_embed_level4_nonbox_heading_not_auto_numbered_not_in_nav():
     """Level-4-Heading (####) ohne Kapitelnummer und ohne Fokus/Studie-Label
-    erhält im Einbette-Modus keine Auto-Nummer, erscheint aber als Heading."""
+    erhält im Einbette-Modus keine Auto-Nummer und erscheint als Normal+Bold
+    (nicht als Word-Heading im Navigationsbereich)."""
     orig_md = (
         "# 7.3 Bezugsnormorientierungen\n\nText.\n\n"
         "#### Drei Arten von Bezugsnormen\n\nDefinitionstext.\n\n"
@@ -2118,6 +2119,6 @@ def test_embed_level4_nonbox_heading_not_auto_numbered_appears_as_heading():
         assert not dp.text.startswith("2.4.2.1."), (
             f"Level-4-Heading darf keine Kapitelnummer erhalten, gefunden: {dp.text!r}"
         )
-    assert "Heading" in drei_paras[0].style.name, (
-        f"Level-4-Heading soll als Heading erscheinen, Style: {drei_paras[0].style.name!r}"
+    assert "Heading" not in drei_paras[0].style.name, (
+        f"Level-4-Heading soll als Normal+Bold erscheinen (nicht im Navigationsbereich), Style: {drei_paras[0].style.name!r}"
     )

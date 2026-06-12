@@ -2009,10 +2009,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         show_heading_visible = bool(sum_body.strip()) or has_children
         if show_heading_visible:
             if has_numbered_chapters:
-                # Kästen + nicht-nummerierte Level-2+-Headings im Einbette-Modus: trotzdem Heading.
-                nav_worthy = (originally_numbered
-                              or (extracted_chapter and _is_box_heading(clean_heading))
-                              or (extracted_chapter and level > 1 and not re.match(r'^\d', clean_heading)))
+                nav_worthy = originally_numbered or (extracted_chapter and _is_box_heading(clean_heading))
             elif parent_chapter:
                 nav_worthy = True
             else:
