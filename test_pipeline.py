@@ -2024,6 +2024,21 @@ def test_extract_chapter_label_not_found_raises():
         extract_chapter(md, "7")
 
 
+def test_extract_chapter_missing_toplevel_uses_first_subchapter():
+    """Wenn Top-Level-Heading fehlt (OCR-Artefakt), startet Extraktion beim ersten Unterkapitel."""
+    md = (
+        "# 7 Vorherige Kapitel\n\nText.\n\n"
+        "### 8.1 Das Lernen lernen\n\nUnterkapitel-Text.\n\n"
+        "## 8.2 Modelle\n\nMehr Text.\n\n"
+        "# 9 Nächstes Kapitel\n\nEnde.\n"
+    )
+    result = extract_chapter(md, "8")
+    assert "8.1 Das Lernen lernen" in result
+    assert "8.2 Modelle" in result
+    assert "7 Vorherige Kapitel" not in result
+    assert "9 Nächstes Kapitel" not in result
+
+
 # ---------------------------------------------------------------------------
 # Gruppe 34: Tail-Normalisierung + Level-2+-Heading-Behandlung im Einbette-Modus
 # ---------------------------------------------------------------------------

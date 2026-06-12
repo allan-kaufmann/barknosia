@@ -163,6 +163,18 @@ def extract_chapter(text: str, chapter_id: str) -> str:
                 label_mode = True
                 break
 
+    # Fallback: Kein Top-Level-Heading vorhanden (OCR hat es übersprungen),
+    # aber Unterkapitel existieren (z.B. "8.1 ..." wenn "8 ..." fehlt).
+    if start_idx is None:
+        for i, line in enumerate(lines):
+            m = re.match(r'^(#{1,6})\s', line)
+            if m:
+                clean = _clean_heading_text(line)
+                if re.match(rf'^{escaped}\.', clean):
+                    start_idx = i
+                    heading_level = len(m.group(1))
+                    break
+
     if start_idx is None:
         raise ValueError(f"Kapitel '{chapter_id}' nicht im Markdown gefunden. "
                          f"Tipp: --chapter mit exakter Nummer angeben (z.B. '1' oder '4.2').")
