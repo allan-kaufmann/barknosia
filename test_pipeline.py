@@ -1846,3 +1846,108 @@ def test_classify_box_boundaries_clamps(monkeypatch):
     ]
     assert _classify_box_boundaries(boxes) == [1, 2]
 
+
+# ---------------------------------------------------------------------------
+# Gruppe 32: Heading-Level im Einbette-Modus (--chapter + --parent-chapter)
+# ---------------------------------------------------------------------------
+
+def _run_interleaved_embedded(orig_md: str, summary_md: str,
+                              parent_chapter: str, extracted_chapter: str,
+                              qa_text: str = "") -> list:
+    """Hilfsfunktion: build_interleaved_word_document im Einbette-Modus."""
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        build_interleaved_word_document(
+            translated_text=orig_md,
+            summary_text=summary_md,
+            qa_text=qa_text,
+            output_path=tmp_path,
+            parent_chapter=parent_chapter,
+            extracted_chapter=extracted_chapter,
+        )
+        from docx import Document as _Doc
+        doc = _Doc(tmp_path)
+        return [p for p in doc.paragraphs if p.text.strip()]
+    finally:
+        os.unlink(tmp_path)
+
+
+def test_embed_unnumbered_sections_get_counter_numbers():
+    """Extrahiertes Kapitel (has_numbered_chapters=True) mit unnummerierten Unterabschnitten:
+    Counter-Nummern werden vergeben (2.4.1.2.1, 2.4.1.2.2, …)."""
+    orig_md = (
+        "# 1.3 Lernen\n\nIntrotext.\n\n"
+        "# Wie wird Wissen erworben?\n\nText A.\n\n"
+        "# Wie ist Wissen repräsentiert?\n\nText B.\n\n"
+    )
+    sum_md = (
+        "## 1.3 Lernen\n\nZusammenfassung.\n\n"
+        "## Wie wird Wissen erworben?\n\nSummary A.\n\n"
+        "## Wie ist Wissen repräsentiert?\n\nSummary B.\n\n"
+    )
+    paras = _run_interleaved_embedded(orig_md, sum_md,
+                                     parent_chapter="2.4.1.2", extracted_chapter="1.3")
+    texts = [p.text for p in paras]
+    assert any("2.4.1.2.1" in t and "Wie wird Wissen erworben" in t for t in texts), \
+        f"Erster Unterabschnitt soll '2.4.1.2.1' bekommen. Gefunden:\n{texts}"
+    assert any("2.4.1.2.2" in t and "Wie ist Wissen repräsentiert" in t for t in texts), \
+        f"Zweiter Unterabschnitt soll '2.4.1.2.2' bekommen. Gefunden:\n{texts}"
+
+
+def test_embed_box_headings_not_numbered():
+    """Kästen (Fokus/Studie) erhalten keine Counter-Nummer im Einbette-Modus."""
+    orig_md = (
+        "# 1.3 Lernen\n\nIntrotext.\n\n"
+        "# Erster Abschnitt\n\nText.\n\n"
+        "#### Fokus: Hippocampus\n\nKasteninhalt.\n\n"
+    )
+    sum_md = (
+        "## 1.3 Lernen\n\nZusammenfassung.\n\n"
+        "## Erster Abschnitt\n\nSummary.\n\n"
+        "## Fokus: Hippocampus\n\nFokus-Summary.\n\n"
+    )
+    paras = _run_interleaved_embedded(orig_md, sum_md,
+                                     parent_chapter="2.4.1.2", extracted_chapter="1.3")
+    texts = [p.text for p in paras]
+    fokus_texts = [t for t in texts if "Fokus" in t and "Hippocampus" in t]
+    assert fokus_texts, f"Fokus-Kasten-Überschrift soll im Dokument erscheinen. Texte:\n{texts}"
+    # Kasten darf KEINE Nummer der Form "2.4.1.2.N" tragen
+    for ft in fokus_texts:
+        assert "2.4.1.2." not in ft, \
+            f"Fokus-Kasten soll keine Kapitelnummer erhalten, aber: {ft!r}"
+
+
+def test_embed_box_heading_level_is_lvlshift_plus_2():
+    """Kasten-Überschrift im Einbette-Modus: Word-Heading = lvl_shift+2 statt level+lvl_shift.
+    parent_chapter='2.4.1.2' → lvl_shift=5 → box display_level=7 (nicht 9)."""
+    orig_md = (
+        "# 1.3 Lernen\n\nIntrotext.\n\n"
+        "#### Fokus: Hippocampus\n\nKasteninhalt.\n\n"
+    )
+    sum_md = (
+        "## 1.3 Lernen\n\nZusammenfassung.\n\n"
+        "## Fokus: Hippocampus\n\nFokus-Summary.\n\n"
+    )
+    paras = _run_interleaved_embedded(orig_md, sum_md,
+                                     parent_chapter="2.4.1.2", extracted_chapter="1.3")
+    box_para = next((p for p in paras if "Fokus" in p.text and "Hippocampus" in p.text), None)
+    assert box_para is not None, "Fokus-Kasten-Überschrift nicht gefunden"
+    style = box_para.style.name
+    assert "7" in style, (
+        f"Fokus-Kasten soll Heading 7 sein (lvl_shift=5 + 2), erhalten: {style!r}. "
+        f"Früher wäre es level(4)+lvl_shift(5)=9 gewesen."
+    )
+
+
+def test_embed_parent_chapter_heading_level_from_number():
+    """Rebasiertes Kapitel 'X.Y.Z.W' (4 Teile) → display_level=5 (Überschrift 5)."""
+    orig_md = "# 1.3 Lernen\n\nIntrotext.\n\n"
+    sum_md = "## 1.3 Lernen\n\nZusammenfassung.\n\n"
+    paras = _run_interleaved_embedded(orig_md, sum_md,
+                                     parent_chapter="2.4.1.2", extracted_chapter="1.3")
+    chapter_para = next((p for p in paras if "2.4.1.2" in p.text and "Lernen" in p.text), None)
+    assert chapter_para is not None, "Rebasiertes Kapitel '2.4.1.2 Lernen' nicht gefunden"
+    style = chapter_para.style.name
+    assert "5" in style, f"4-stelliges Kapitel soll Heading 5 sein, erhalten: {style!r}"

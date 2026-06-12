@@ -1903,7 +1903,13 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
 
         if parent_chapter:
             num_m = re.match(r'^([\d.]+)\b', clean_heading)
-            display_level = min(len(num_m.group(1).split('.')) + 1, 9) if num_m else min(level + lvl_shift, 9)
+            if num_m:
+                display_level = min(len(num_m.group(1).split('.')) + 1, 9)
+            elif _is_box_heading(clean_heading):
+                # Kästen: 2 Ebenen unter dem Elternkapitel, unabhängig vom OCR-Level (####).
+                display_level = min(lvl_shift + 2, 9)
+            else:
+                display_level = min(level + lvl_shift, 9)
         else:
             display_level = level
 
@@ -1922,14 +1928,18 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                     _auto_parent = _rebase_chapter_number(_auto_parent, extracted_chapter, parent_chapter)
                 _auto_counter = 0
                 _current_competency_key = None
-            elif _auto_parent is not None and _unnumbered_freq.get(lookup_key, 0) == 1:
+            elif (_auto_parent is not None and _unnumbered_freq.get(lookup_key, 0) == 1
+                  and not (extracted_chapter and _is_box_heading(clean_heading))):
+                # Unique unnummerierte Unterüberschrift: auto-nummerieren.
+                # Kästen (Fokus/Studie/…) im Einbette-Modus ausgenommen – sie bekommen
+                # keine Kapitelnummer und erscheinen als eigenständige Lernobjekte.
                 originally_numbered = True
                 _current_competency_key = lookup_key
                 if idx in _visible_section_indices:
                     _auto_counter += 1
                     clean_heading = f"{_auto_parent}.{_auto_counter} {clean_heading}"
                 _dots = clean_heading.split()[0].count('.')
-                display_level = min(_dots + 1, 9)
+                display_level = min(_dots + 2, 9)
 
         # Scoped lookup: Sub-Sections (freq>1, wiederkehrend) unter der aktuellen Kompetenz.
         # Verhindert dass sum_lookup["off the job"] immer den letzten Summary-Eintrag liefert.
@@ -1964,7 +1974,9 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         show_heading_visible = bool(sum_body.strip()) or has_children
         if show_heading_visible:
             if has_numbered_chapters:
-                nav_worthy = originally_numbered
+                # Kästen im Einbette-Modus sind nicht originally_numbered (auto-block
+                # ausgeschlossen), aber sie sollen trotzdem als Heading erscheinen.
+                nav_worthy = originally_numbered or (extracted_chapter and _is_box_heading(clean_heading))
             elif parent_chapter:
                 nav_worthy = True
             else:
@@ -2236,7 +2248,8 @@ if __name__ == "__main__":
 
         print(f"\n=== PIPELINE ERFOLGREICH BEENDET ===")
         print(f"Zwischenergebnisse:   {cache_dir}")
-        print(f"Übersetzung (Word):   {transl_docx_path}")
+        if is_translated:
+            print(f"Übersetzung (Word):   {transl_docx_path}")
         print(f"Fertiges Dokument:    {final_docx_path}")
         if args.parent_chapter:
             print(f"  → Einfügemodus: Kapitelpräfix '{args.parent_chapter}', "
