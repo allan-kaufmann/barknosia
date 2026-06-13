@@ -216,6 +216,7 @@ def parse_qa_response(qa_text: str) -> list:
     while i < len(blocks) - 1:
         num_str = blocks[i].strip()
         block = blocks[i + 1]
+        block = re.sub(r'^\*\*([^*:]+:)\*\*', r'\1', block, flags=re.MULTILINE)
         i += 2
         try:
             num = int(num_str)
