@@ -229,9 +229,10 @@ def parse_qa_response(qa_text: str) -> list:
                 return m.group(1).strip().split('\n')[0].strip()
             return default
 
-        antwort     = _extract(r'^Antwort:\s*(.+?)(?=\n(?:Textgrundlage|Schlüsselbegriffe|Abdeckung|$))', block)
+        antwort     = _extract(r'^Antwort:\s*(.+?)(?=\n(?:Textgrundlage|Schlüsselbegriffe|Beleg|Abdeckung|$))', block)
         textgr      = _extract(r'^Textgrundlage:\s*(.+)', block)
         schluessel  = _extract(r'^Schlüsselbegriffe:\s*(.+)', block)
+        beleg       = _extract(r'^Beleg:\s*(.+)', block, default='')
         abdeckung   = _extract(r'^Abdeckung:\s*(.+)', block)
 
         items.append({
@@ -239,9 +240,31 @@ def parse_qa_response(qa_text: str) -> list:
             'antwort': antwort,
             'textgrundlage': textgr,
             'schluessel': schluessel,
+            'beleg': beleg,
             'abdeckung': abdeckung,
         })
     return items
+
+
+def serialize_qa_items(items: list) -> str:
+    """
+    Serialisiert geparste QA-Items zurück ins Markdown-Format von verify_with_questions().
+    Inverse zu parse_qa_response() – wird nach der Nachbearbeitung (Schritt 5b) genutzt,
+    damit der Downstream-Pfad (Doc-Builder ruft parse_qa_response erneut auf) unverändert läuft.
+    """
+    blocks = []
+    for it in items:
+        lines = [
+            f"**Frage {it['num']}**",
+            f"**Antwort:** {it.get('antwort', '–')}",
+            f"**Textgrundlage:** {it.get('textgrundlage', '–')}",
+            f"**Schlüsselbegriffe:** {it.get('schluessel', '–')}",
+        ]
+        if it.get('beleg'):
+            lines.append(f"**Beleg:** {it['beleg']}")
+        lines.append(f"**Abdeckung:** {it.get('abdeckung', '–')}")
+        blocks.append('\n'.join(lines))
+    return '\n\n'.join(blocks)
 
 
 def _add_comment_range_start(paragraph, comment_id: int):
@@ -267,6 +290,31 @@ def _add_comment_range_end(paragraph, comment_id: int):
     ref.set(qn('w:id'), str(comment_id))
     run.append(ref)
     p_elem.append(run)
+
+
+def _normalize_quote(text: str) -> str:
+    """Normalisiert Text für Beleg-Matching: Markdown weg, Whitespace kollabiert, lowercase."""
+    text = re.sub(r'[*_`"„“”»«\']', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip().lower()
+
+
+def _find_para_by_quote(paras: list, quote: str):
+    """
+    Findet den Absatz in `paras`, dessen Text das (normalisierte) Beleg-Zitat enthält.
+    Nutzt einen Präfix des Zitats (robust gegen leichte Abweichungen am Satzende).
+    Gibt den Absatz zurück oder None.
+    """
+    nq = _normalize_quote(quote)
+    if len(nq) < 8:
+        return None
+    needle = nq[:60]
+    for p in paras:
+        if not p.text.strip():
+            continue
+        if needle in _normalize_quote(p.text):
+            return p
+    return None
 
 
 def _inject_comments_part(doc, comments_list: list):
@@ -797,12 +845,15 @@ def verify_with_questions(summary_text: str, questions_path: str) -> str:
         "- Nicht nur „Kapitel 6.4“, sondern z. B. „6.4.1.2 Eine umfassende Übersicht“.\n"
         "- Wenn mehrere Unterkapitel nötig sind, maximal 3 nennen.\n"
         "- Zusätzlich 1–3 Schlüsselbegriffe aus die Textstelle nennen.\n"
-        "- Keine groben Kapitelverweise, wenn Unterkapitel vorhanden sind.\n\n"
+        "- Keine groben Kapitelverweise, wenn Unterkapitel vorhanden sind.\n"
+        "- Beleg: Ein wörtliches Zitat (5–15 Wörter), exakt aus der Wissensbasis kopiert "
+        "– die Kernstelle, die die Frage belegt. Keine Paraphrase, keine Auslassungszeichen.\n\n"
         "Ausgabeformat pro Frage:\n"
         "Frage X\n"
         "Antwort: [max. 3 Sätze]\n"
         "Textgrundlage: [genaues Unterkapitel]\n"
         "Schlüsselbegriffe: [1–3 Begriffe]\n"
+        "Beleg: [wörtliches Zitat aus der Zusammenfassung, 5–15 Wörter]\n"
         "Abdeckung: vollständig / teilweise / nicht enthalten\n\n"
         f"Wissensbasis (Zusammenfassung):\n{summary_text}\n\n"
         f"Fragen:\n{questions}"
@@ -817,6 +868,99 @@ def verify_with_questions(summary_text: str, questions_path: str) -> str:
     except Exception as e:
         print(f"Fehler bei der Qualitätssicherung: {e}")
         raise
+
+
+_REWORK_LEVELS = {"teilweise", "nicht enthalten"}
+_NO_SUPPLEMENT_MARKER = "KEINE ERGÄNZUNG MÖGLICH"
+
+
+def rework_partial_answers(qa_text: str, working_text: str, questions_path: str = None):
+    """
+    Schritt 5b: Nacharbeit unvollständiger Antworten.
+
+    Für jede Frage mit Abdeckung 'teilweise' oder 'nicht enthalten' wird der
+    übersetzte Originaltext (working_text) der zugehörigen Textgrundlage geprüft
+    und – falls dort vorhanden – die fehlende prüfungsrelevante Information ergänzt.
+    Erfolgreiche Ergänzungen erhalten die Abdeckung 'vollständig durch Nachbearbeitung'.
+
+    Rückgabe: (augmented_qa_text, supplement_map)
+      augmented_qa_text: serialisierte QA (Markdown) mit aktualisierten Items
+      supplement_map: {normalize_heading(textgrundlage): [ergaenzungstext, ...]}
+    """
+    items = parse_qa_response(qa_text)
+    todo = [it for it in items if it.get('abdeckung', '').strip().lower() in _REWORK_LEVELS]
+    if not todo:
+        return qa_text, {}
+
+    print(f"--- Schritt 5b: Nacharbeit {len(todo)} unvollständige(r) Antwort(en) ---")
+
+    # Fragetexte laden (optional) – verbessert den Nacharbeitungs-Prompt
+    questions_map: dict = {}
+    if questions_path and os.path.exists(questions_path):
+        with open(questions_path, encoding='utf-8') as qf:
+            for line in qf:
+                qm = re.match(r'^(\d+)\.\s+(.+)', line.strip())
+                if qm:
+                    questions_map[int(qm.group(1))] = qm.group(2)
+
+    # Originaltext nach Sektionen indizieren (für gezieltes Lookup via Textgrundlage)
+    sections = parse_sections(working_text)
+    sec_lookup: dict = {}
+    for s in sections:
+        if s['heading'] == '__preamble__':
+            continue
+        sec_lookup[normalize_heading(s['heading'])] = s['body']
+
+    def _section_context(textgrundlage: str) -> str:
+        key = normalize_heading(textgrundlage)
+        if key in sec_lookup:
+            return sec_lookup[key]
+        last = normalize_heading(textgrundlage.split('.')[-1])
+        if last in sec_lookup:
+            return sec_lookup[last]
+        return working_text  # Fallback: gesamtes Kapitel
+
+    supplement_map: dict = {}
+    for it in todo:
+        context = _section_context(it.get('textgrundlage', ''))
+        q_text = questions_map.get(it['num'], '')
+        prompt = (
+            "Rolle:\nDu bist Lerncoach und Prüfer für Wirtschaftspsychologie.\n\n"
+            "Situation:\nEine leseleitende Frage wurde anhand einer Zusammenfassung nur "
+            f"'{it.get('abdeckung')}' beantwortet. Prüfe den nachstehenden Originaltext und "
+            "ergänze ausschließlich die fehlende, prüfungsrelevante Kerninformation.\n\n"
+            "Regeln:\n"
+            "- Maximal 3 Sätze.\n"
+            "- Nur Inhalte, die der Originaltext belegt – nicht raten, nichts erfinden.\n"
+            "- Keine Wiederholung der bereits vorhandenen Antwort.\n"
+            f"- Wenn der Originaltext die Lücke nicht schließt, antworte exakt: {_NO_SUPPLEMENT_MARKER}\n\n"
+            f"Frage:\n{q_text or '(Fragetext nicht verfügbar – siehe bisherige Antwort)'}\n\n"
+            f"Bisherige Antwort:\n{it.get('antwort', '')}\n\n"
+            f"Originaltext (Textgrundlage '{it.get('textgrundlage', '')}'):\n{context}"
+        )
+        try:
+            response = call_gemini_with_retry(
+                model_name='gemini-2.5-pro',
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.1)
+            )
+            supplement = (response.text or '').strip()
+        except Exception as e:
+            print(f"  Frage {it['num']}: Nacharbeit fehlgeschlagen ({e}) – unverändert.")
+            continue
+
+        if not supplement or _NO_SUPPLEMENT_MARKER in supplement:
+            print(f"  Frage {it['num']}: keine Ergänzung im Originaltext gefunden.")
+            continue
+
+        it['antwort'] = f"{it.get('antwort', '').rstrip()} {supplement}".strip()
+        it['abdeckung'] = "vollständig durch Nachbearbeitung"
+        tg = it.get('textgrundlage', '')
+        for key in {normalize_heading(tg), normalize_heading(tg.split('.')[-1])}:
+            supplement_map.setdefault(key, []).append(supplement)
+        print(f"  Frage {it['num']}: ergänzt → vollständig durch Nachbearbeitung.")
+
+    return serialize_qa_items(items), supplement_map
 
 
 # ---------------------------------------------------------------------------
@@ -1734,7 +1878,8 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                                     skip_references: bool = True,
                                     questions_path: str = None,
                                     doc_title: str = "Lernskript",
-                                    extracted_chapter: str = None):
+                                    extracted_chapter: str = None,
+                                    supplement_map: dict = None):
     """
     Erstellt ein Word-Dokument, bei dem Zusammenfassung und Originaltext
     kapitelweise verschränkt sind.
@@ -1760,6 +1905,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     # --- QA vorbereiten: Textgrundlage-Map für Kommentare ---
     has_qa = qa_text and qa_text.strip() not in ("", "Keine Leitfragen zur Prüfung übergeben.")
     qa_items = parse_qa_response(qa_text) if has_qa else []
+    qa_by_num: dict = {item['num']: item for item in qa_items}  # für Beleg-Verankerung
     textgrundlage_map: dict = {}  # normalize_heading(textgrundlage) → [fragenummern]
     for item in qa_items:
         for key in [normalize_heading(item['textgrundlage']),
@@ -2044,28 +2190,47 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             before = len(doc.paragraphs)
             process_markdown_to_docx(doc, sum_body, hide_text=False, base_path=base_path,
                                      headings_as_bold=True)
+
+            # Schlüssel zur Zuordnung Sektion → QA (vor-Präfix-Heading + Last-Part-Fallback)
+            match_keys = [lookup_key]
+            last_part = re.sub(r'^[\d.]+\s*', '', lookup_key).strip()
+            if last_part:
+                match_keys.append(last_part)
+
+            # --- Ergänzungen aus der Nachbearbeitung (Schritt 5b) anfügen ---
+            if supplement_map:
+                seen_sup: set = set()
+                for k in match_keys:
+                    for sup in supplement_map.get(k, []):
+                        if not sup or sup in seen_sup:
+                            continue
+                        seen_sup.add(sup)
+                        p_sup = doc.add_paragraph()
+                        r_tag = p_sup.add_run("[Ergänzt durch Nachbearbeitung] ")
+                        r_tag.bold = True
+                        r_tag.font.color.rgb = RGBColor(0xC0, 0x00, 0x00)
+                        p_sup.add_run(sup)
+
             new_paras = doc.paragraphs[before:]
             first_para = next((p for p in new_paras if p.text.strip()), None)
             last_para  = next((p for p in reversed(new_paras) if p.text.strip()), first_para)
 
-            # Word-Kommentar über gesamte Sektion wenn diese Textgrundlage einer Lernfrage ist
+            # Word-Kommentar pro Frage – an der Beleg-Stelle verankert (Fallback: ganze Sektion)
             if first_para and textgrundlage_map:
-                # lookup_key = pre-Präfix-Heading, passend zu QA-Textgrundlage-Referenzen
-                match_keys = [lookup_key]
-                last_part = re.sub(r'^[\d.]+\s*', '', lookup_key).strip()
-                if last_part:
-                    match_keys.append(last_part)
                 q_nums = []
                 for k in match_keys:
                     q_nums.extend(textgrundlage_map.get(k, []))
                 q_nums = sorted(set(q_nums))
-                if q_nums:
+                for n in q_nums:
+                    beleg = (qa_by_num.get(n) or {}).get('beleg', '')
+                    target = _find_para_by_quote(new_paras, beleg) if beleg else None
+                    start_p = target or first_para
+                    end_p   = target or last_para
                     cid = comment_id[0]
                     comment_id[0] += 1
-                    ctext = ', '.join(f'Frage {n}' for n in q_nums)
-                    _add_comment_range_start(first_para, cid)
-                    _add_comment_range_end(last_para, cid)
-                    comment_list.append((cid, ctext))
+                    _add_comment_range_start(start_p, cid)
+                    _add_comment_range_end(end_p, cid)
+                    comment_list.append((cid, f'Frage {n}'))
 
         if orig_body.strip():
             process_markdown_to_docx(doc, orig_body, hide_text=True, base_path=base_path)
@@ -2265,6 +2430,7 @@ if __name__ == "__main__":
 
         # --- Schritt 5: Qualitätssicherung (optional) ---
         qa_result = "Keine Leitfragen zur Prüfung übergeben."
+        supplement_map: dict = {}
         if args.questions:
             if os.path.exists(args.questions):
                 qa_path = cache_dir / "qa_ergebnis.md"
@@ -2275,6 +2441,25 @@ if __name__ == "__main__":
                     lambda: verify_with_questions(summary_result, args.questions),
                     "QA / Leitfragen"
                 )
+
+                # --- Schritt 5b: Nacharbeit unvollständiger Antworten ---
+                rework_path = cache_dir / "qa_nachbearbeitung.md"
+                sup_path    = cache_dir / "qa_ergaenzungen.json"
+                if args.force:
+                    for p in (rework_path, sup_path):
+                        if p.exists():
+                            p.unlink()
+                if rework_path.exists() and sup_path.exists():
+                    print(f"[SKIP] Nacharbeit – bereits vorhanden: {rework_path}")
+                    qa_result = rework_path.read_text(encoding="utf-8")
+                    supplement_map = json.loads(sup_path.read_text(encoding="utf-8"))
+                else:
+                    qa_result, supplement_map = rework_partial_answers(
+                        qa_result, working_text, args.questions
+                    )
+                    rework_path.write_text(qa_result, encoding="utf-8")
+                    sup_path.write_text(json.dumps(supplement_map, ensure_ascii=False, indent=2),
+                                        encoding="utf-8")
             else:
                 print(f"Warnung: Fragen-Datei '{args.questions}' nicht gefunden. Überspringe QS.")
 
@@ -2290,6 +2475,7 @@ if __name__ == "__main__":
             questions_path=args.questions,
             doc_title=doc_title,
             extracted_chapter=args.chapter,
+            supplement_map=supplement_map,
         )
 
         print(f"\n=== PIPELINE ERFOLGREICH BEENDET ===")

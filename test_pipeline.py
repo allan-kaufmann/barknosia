@@ -16,6 +16,10 @@ from pipeline import (
     normalize_heading_levels,
     parse_sections,
     parse_qa_response,
+    serialize_qa_items,
+    rework_partial_answers,
+    _find_para_by_quote,
+    _normalize_quote,
     _advance_counter,
     _prefix_chapter_number,
     _is_skip_heading,
@@ -355,6 +359,113 @@ def test_parse_qa_response_basic():
     assert items[0]['textgrundlage'] == "1.1 Abschnitt"
     assert items[1]['num'] == 2
     assert items[1]['abdeckung'] == "teilweise"
+
+
+def test_parse_qa_response_parses_beleg_and_bold_labels():
+    qa = (
+        "**Frage 9**\n"
+        "**Antwort:** Kompetenzen umfassen Wissen und Fertigkeiten.\n"
+        "**Textgrundlage:** 2.1 Wozu wird gelernt?\n"
+        "**Schlüsselbegriffe:** Wissen, Fertigkeiten\n"
+        "**Beleg:** Kompetenzen umfassen alle Wissensbestände\n"
+        "**Abdeckung:** vollständig\n"
+    )
+    items = parse_qa_response(qa)
+    assert len(items) == 1
+    assert items[0]['beleg'] == "Kompetenzen umfassen alle Wissensbestände"
+    assert items[0]['textgrundlage'] == "2.1 Wozu wird gelernt?"
+    assert items[0]['antwort'].startswith("Kompetenzen umfassen Wissen")
+
+
+def test_serialize_qa_items_roundtrip():
+    qa = (
+        "Frage 1\n"
+        "Antwort: Antwort eins.\n"
+        "Textgrundlage: 1.1 Abschnitt\n"
+        "Schlüsselbegriffe: A, B\n"
+        "Beleg: ein wörtliches Zitat hier\n"
+        "Abdeckung: vollständig\n"
+    )
+    items = parse_qa_response(qa)
+    reparsed = parse_qa_response(serialize_qa_items(items))
+    assert reparsed[0]['num'] == 1
+    assert reparsed[0]['beleg'] == "ein wörtliches Zitat hier"
+    assert reparsed[0]['abdeckung'] == "vollständig"
+    assert reparsed[0]['textgrundlage'] == "1.1 Abschnitt"
+
+
+def test_normalize_quote_strips_markdown_and_case():
+    assert _normalize_quote("**Hallo**  Welt") == "hallo welt"
+    assert _normalize_quote('„Zitat"') == "zitat"
+
+
+def test_find_para_by_quote_matches_prefix():
+    class FakePara:
+        def __init__(self, text):
+            self.text = text
+    paras = [FakePara("Ein einleitender Satz ohne Bezug."),
+             FakePara("Kompetenzen umfassen alle Wissensbestände und Fertigkeiten.")]
+    hit = _find_para_by_quote(paras, "Kompetenzen umfassen alle Wissensbestände")
+    assert hit is paras[1]
+    assert _find_para_by_quote(paras, "etwas völlig anderes das nicht vorkommt") is None
+    assert _find_para_by_quote(paras, "kurz") is None  # zu kurz
+
+
+def test_rework_partial_answers_supplements_partial(monkeypatch):
+    qa = (
+        "Frage 1\n"
+        "Antwort: Der Zyklus hat acht Schritte.\n"
+        "Textgrundlage: 2.2 Modelle\n"
+        "Schlüsselbegriffe: Zyklus\n"
+        "Beleg: Der Zyklus hat acht Schritte\n"
+        "Abdeckung: teilweise\n\n"
+        "Frage 2\n"
+        "Antwort: Vollständige Antwort.\n"
+        "Textgrundlage: 2.1 Grundlagen\n"
+        "Schlüsselbegriffe: X\n"
+        "Beleg: Vollständige Antwort\n"
+        "Abdeckung: vollständig\n"
+    )
+    working = "## 2.2 Modelle\nDie acht Schritte sind A, B, C, D, E, F, G und H.\n"
+
+    class FakeResp:
+        text = "Die acht Schritte sind A bis H."
+
+    calls = []
+    def fake_call(**kwargs):
+        calls.append(kwargs)
+        return FakeResp()
+    monkeypatch.setattr('pipeline.call_gemini_with_retry', fake_call)
+
+    new_qa, supplements = rework_partial_answers(qa, working)
+    items = parse_qa_response(new_qa)
+    by_num = {it['num']: it for it in items}
+    # Nur die teilweise-Frage wurde nachbearbeitet → genau ein Gemini-Call
+    assert len(calls) == 1
+    assert by_num[1]['abdeckung'] == "vollständig durch Nachbearbeitung"
+    assert "A bis H" in by_num[1]['antwort']
+    assert by_num[2]['abdeckung'] == "vollständig"  # unverändert
+    assert any("A bis H" in s for v in supplements.values() for s in v)
+
+
+def test_rework_partial_answers_keeps_item_when_no_supplement(monkeypatch):
+    qa = (
+        "Frage 1\n"
+        "Antwort: Teilantwort.\n"
+        "Textgrundlage: 9.9 Unbekannt\n"
+        "Schlüsselbegriffe: X\n"
+        "Beleg: Teilantwort\n"
+        "Abdeckung: nicht enthalten\n"
+    )
+
+    class FakeResp:
+        text = "KEINE ERGÄNZUNG MÖGLICH"
+    monkeypatch.setattr('pipeline.call_gemini_with_retry', lambda **k: FakeResp())
+
+    new_qa, supplements = rework_partial_answers(qa, "## Anderes\nIrrelevant.\n")
+    items = parse_qa_response(new_qa)
+    assert items[0]['abdeckung'] == "nicht enthalten"
+    assert supplements == {}
 
 
 def test_split_into_level1_chapters():
