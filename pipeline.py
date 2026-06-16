@@ -694,13 +694,16 @@ def _summarize_single_chapter(heading: str, chapter_text: str, output_lang: str 
     lang_name = _language_name(output_lang)
     prompt = (
         f"Erstelle eine lernorientierte Zusammenfassung für das folgende Kapitel: \"{heading}\"\n\n"
-        f"AUSGABESPRACHE: Die gesamte Zusammenfassung MUSS auf {lang_name} verfasst sein – "
-        f"auch Überschriften. Liegt ein Teil des Originals in einer anderen Sprache vor "
-        f"(z.B. ein englisches Abstract), übersetze ihn in der Zusammenfassung nach {lang_name}.\n\n"
+        f"AUSGABESPRACHE: Der gesamte FLIESSTEXT (Stichpunkte, Definitionen, Beschreibungen) MUSS "
+        f"auf {lang_name} verfasst sein. Liegt ein Teil des Originals in einer anderen Sprache vor "
+        f"(z.B. ein englisches Abstract), übersetze dessen INHALT in der Zusammenfassung nach {lang_name}.\n"
+        f"WICHTIG: Die ÜBERSCHRIFTEN dagegen EXAKT und unverändert aus dem Original übernehmen "
+        f"(gleicher Wortlaut, gleiche Sprache, gleiche Nummerierung) – NICHT übersetzen und NICHT "
+        f"umformulieren. Sie dienen als Zuordnungsschlüssel und müssen 1:1 mit dem Original übereinstimmen.\n\n"
         "Pflichtanforderungen:\n"
         f"1. ALLE Unterkapitel müssen vorhanden sein – kein einziges Unterkapitel darf fehlen!\n"
-        f"   Behalte die Nummerierung der Überschriften bei (z.B. '4.1.1 Hedonisches Wohlbefinden'); "
-        f"übersetze fremdsprachige Überschriftentexte nach {lang_name}.\n"
+        f"   Übernimm jede Überschrift exakt wie im Original (Wortlaut inkl. evtl. Nummerierung, "
+        f"z.B. '4.1.1 Hedonisches Wohlbefinden').\n"
         "2. Pro Unterkapitel: mindestens 3–5 Stichpunkte mit den wichtigsten Inhalten.\n"
         "3. Studienergebnisse IMMER erhalten: Metaanalysen, Effektstärken, Befundrichtung, Autoren & Jahr.\n"
         "4. Definitionen: wörtlich oder sehr nah am Original übernehmen.\n"
@@ -2119,6 +2122,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             depth_map[_di] = _actual
 
     _current_competency_key: str | None = None  # aktuell verarbeitete Kompetenz für Scoped Lookup
+    _struct_intro_attached = False  # Einleitungs-Summary im structural_renumber-Modus nur einmal anhängen
 
     # --- Interleaved Aufbau ---
     for idx, section in enumerate(orig_sections):
@@ -2209,6 +2213,13 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             display_level = level
 
         sum_body = sum_lookup.get(lookup_key, '')
+        # Structural-Renumber: Die Intro-Zusammenfassung (synthetische "Einleitung"-Sektion) matcht
+        # keinen Original-Heading. Sie an die erste Tiefe-1-Sektion (Artikeltitel, z.B. 6.2.4.1.1)
+        # anhängen, wenn diese selbst keine eigene Zusammenfassung hat.
+        if (structural_renumber and not _struct_intro_attached
+                and depth_map.get(idx) == 1 and not sum_body.strip()):
+            sum_body = sum_lookup.get('einleitung', '')
+            _struct_intro_attached = True
         # clean_heading kann nach Rebase bereits eine Zahl vorne haben (tail-normalisierte Headings).
         originally_numbered = bool(re.match(r'^\d', lookup_key)) or bool(re.match(r'^\d', clean_heading))
 
