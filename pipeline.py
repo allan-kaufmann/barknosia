@@ -1945,7 +1945,8 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                                     questions_path: str = None,
                                     doc_title: str = "Lernskript",
                                     extracted_chapter: str = None,
-                                    supplement_map: dict = None):
+                                    supplement_map: dict = None,
+                                    title_as_parent: bool = False):
     """
     Erstellt ein Word-Dokument, bei dem Zusammenfassung und Originaltext
     kapitelweise verschränkt sind.
@@ -2103,7 +2104,31 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     # _compress_heading_levels, aber über die Sektions-Levels statt über Markdown-Zeilen und
     # ohne Sonderbehandlung nummerierter Headings (deren Eigennummern werden ohnehin verworfen).
     depth_map: dict[int, int] = {}
-    if structural_renumber:
+    if structural_renumber and title_as_parent:
+        # Variante "Titel = Elternkapitel": Die erste Überschrift (Artikeltitel) ist die
+        # permanente Wurzel (Tiefe 0 → trägt direkt das Elternkapitel, z.B. 6.2.4.1). Alle
+        # weiteren Überschriften werden per Outline-Stack relativ verschachtelt, wobei die
+        # Wurzel NIE vom Stack genommen wird → auch gleichrangige OCR-H1 (Studie 1/2/3) werden
+        # zu Kindern des Titels (Tiefe 1), ihre Unterabschnitte zu Tiefe 2 usw.
+        _stack: list[int] = []
+        _first = True
+        for _di, _ds in enumerate(orig_sections):
+            if _ds['heading'] == '__preamble__':
+                continue
+            _lvl = _ds['level']
+            if _first:
+                depth_map[_di] = 0
+                _first = False
+                continue
+            while _stack and _stack[-1] >= _lvl:
+                _stack.pop()
+            depth_map[_di] = len(_stack) + 1
+            _stack.append(_lvl)
+    elif structural_renumber:
+        # Standard-Einbettung: bildet die (inkonsistenten, lückenhaften) OCR-Überschriftenebenen
+        # auf konsistente Tiefen 1,2,3… ab – analog zu _compress_heading_levels, aber über die
+        # Sektions-Levels statt über Markdown-Zeilen und ohne Sonderbehandlung nummerierter
+        # Headings (deren Eigennummern werden ohnehin verworfen).
         _ocr_to_actual: dict[int, int] = {}
         _prev_actual = 0
         for _di, _ds in enumerate(orig_sections):
@@ -2179,10 +2204,15 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         if structural_renumber:
             # OCR-Eigennummer verwerfen und allein aus der Hierarchie-Tiefe neu nummerieren.
             _title = re.sub(r'^\d[\d.]*\s+', '', clean_heading).strip()
+            _depth = depth_map.get(idx, level)
             if idx in _visible_section_indices:
-                local_num = _advance_counter(counters, depth_map.get(idx, level))
-                number = f"{parent_chapter}.{local_num}" if local_num else parent_chapter
-                clean_heading = _join_number_and_rest(number, _title)
+                if _depth <= 0:
+                    # Wurzel/Artikeltitel (nur bei title_as_parent): trägt direkt das Elternkapitel.
+                    clean_heading = _join_number_and_rest(parent_chapter, _title)
+                else:
+                    local_num = _advance_counter(counters, _depth)
+                    number = f"{parent_chapter}.{local_num}" if local_num else parent_chapter
+                    clean_heading = _join_number_and_rest(number, _title)
             else:
                 # Unsichtbare Sektion (wird ausgeblendet): keine Nummer vergeben.
                 clean_heading = _title
@@ -2217,7 +2247,8 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         # keinen Original-Heading. Sie an die erste Tiefe-1-Sektion (Artikeltitel, z.B. 6.2.4.1.1)
         # anhängen, wenn diese selbst keine eigene Zusammenfassung hat.
         if (structural_renumber and not _struct_intro_attached
-                and depth_map.get(idx) == 1 and not sum_body.strip()):
+                and depth_map.get(idx) == (0 if title_as_parent else 1)
+                and not sum_body.strip()):
             sum_body = sum_lookup.get('einleitung', '')
             _struct_intro_attached = True
         # clean_heading kann nach Rebase bereits eine Zahl vorne haben (tail-normalisierte Headings).
@@ -2455,6 +2486,10 @@ if __name__ == "__main__":
                         help="Quellsprache als ISO-Code erzwingen (überspringt die automatische Erkennung).")
     parser.add_argument("--no-translate", action="store_true",
                         help="Keine Übersetzung – Originalsprache beibehalten, unabhängig von der Erkennung.")
+    parser.add_argument("--title-as-parent", action="store_true",
+                        help="Nur mit --parent-chapter (ohne --chapter): Der Artikeltitel trägt direkt "
+                             "die Elternkapitelnummer (z.B. 6.2.4.1) statt 6.2.4.1.1; alle Abschnitte "
+                             "inkl. Studien werden zu dessen Unterpunkten (6.2.4.1.1, 6.2.4.1.2 …).")
 
     args = parser.parse_args()
     OUTPUT_BASE = "workspace/output"
@@ -2635,6 +2670,7 @@ if __name__ == "__main__":
             doc_title=doc_title,
             extracted_chapter=args.chapter,
             supplement_map=supplement_map,
+            title_as_parent=args.title_as_parent,
         )
 
         print(f"\n=== PIPELINE ERFOLGREICH BEENDET ===")
