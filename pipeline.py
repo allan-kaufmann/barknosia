@@ -684,13 +684,23 @@ def _summarize_chapter_by_sections(ch: dict, out_dir: Path) -> str:
     return '\n\n'.join(parts)
 
 
-def _summarize_single_chapter(heading: str, chapter_text: str) -> str:
-    """Erstellt eine lernorientierte Zusammenfassung für ein einzelnes Kapitel."""
+def _summarize_single_chapter(heading: str, chapter_text: str, output_lang: str = "de") -> str:
+    """Erstellt eine lernorientierte Zusammenfassung für ein einzelnes Kapitel.
+
+    output_lang (ISO-Code) erzwingt die Ausgabesprache: Auch fremdsprachige Passagen im
+    Original (z.B. ein englisches Abstract) werden in dieser Sprache zusammengefasst, statt
+    in der Originalsprache zu verbleiben.
+    """
+    lang_name = _language_name(output_lang)
     prompt = (
         f"Erstelle eine lernorientierte Zusammenfassung für das folgende Kapitel: \"{heading}\"\n\n"
+        f"AUSGABESPRACHE: Die gesamte Zusammenfassung MUSS auf {lang_name} verfasst sein – "
+        f"auch Überschriften. Liegt ein Teil des Originals in einer anderen Sprache vor "
+        f"(z.B. ein englisches Abstract), übersetze ihn in der Zusammenfassung nach {lang_name}.\n\n"
         "Pflichtanforderungen:\n"
-        "1. ALLE Unterkapitel müssen vorhanden sein – kein einziges Unterkapitel darf fehlen!\n"
-        "   Behalte die genauen Überschriften inkl. Nummerierung bei (z.B. '4.1.1 Hedonisches Wohlbefinden').\n"
+        f"1. ALLE Unterkapitel müssen vorhanden sein – kein einziges Unterkapitel darf fehlen!\n"
+        f"   Behalte die Nummerierung der Überschriften bei (z.B. '4.1.1 Hedonisches Wohlbefinden'); "
+        f"übersetze fremdsprachige Überschriftentexte nach {lang_name}.\n"
         "2. Pro Unterkapitel: mindestens 3–5 Stichpunkte mit den wichtigsten Inhalten.\n"
         "3. Studienergebnisse IMMER erhalten: Metaanalysen, Effektstärken, Befundrichtung, Autoren & Jahr.\n"
         "4. Definitionen: wörtlich oder sehr nah am Original übernehmen.\n"
@@ -744,11 +754,12 @@ def _summarize_single_chapter(heading: str, chapter_text: str) -> str:
         raise
 
 
-def generate_summary_by_chapter(text: str, out_dir: Path) -> str:
+def generate_summary_by_chapter(text: str, out_dir: Path, output_lang: str = "de") -> str:
     """
     Schritt 4: Erstellt die Zusammenfassung kapitelweise (je Level-1-Kapitel ein API-Call).
     Nutzt Caching pro Kapitel: zusammenfassung_kap_XX.md in out_dir.
     Kombiniert am Ende zu zusammenfassung.md.
+    output_lang erzwingt die Ausgabesprache der Zusammenfassung.
     """
     print("--- Schritt 4: Erstelle kapitelweise Zusammenfassung (via Gemini 2.5 Pro) ---")
 
@@ -774,13 +785,13 @@ def generate_summary_by_chapter(text: str, out_dir: Path) -> str:
         sublevel = _find_sublevel(ch['full_text'], chap_level)
 
         if sublevel is None or len(ch['full_text']) <= _CHUNK_LIMIT:
-            return _summarize_single_chapter(ch['heading'], ch['full_text'])
+            return _summarize_single_chapter(ch['heading'], ch['full_text'], output_lang)
 
         preamble, sections = _split_at_level(ch['full_text'], sublevel)
         chunks = _group_into_chunks(preamble, sections, _CHUNK_LIMIT)
 
         if len(chunks) <= 1:
-            return _summarize_single_chapter(ch['heading'], ch['full_text'])
+            return _summarize_single_chapter(ch['heading'], ch['full_text'], output_lang)
 
         print(f"   Kapitel {ci} ({ch['heading'][:40]}) → {len(chunks)} Chunks à max {_CHUNK_LIMIT} Zeichen")
         parts: list[str] = []
@@ -796,7 +807,7 @@ def generate_summary_by_chapter(text: str, out_dir: Path) -> str:
             )
 
             def _chunk_gen(ct=chunk_text, hd=ch['heading'], hint=continuation_hint):
-                return _summarize_single_chapter(hd, ct + hint)
+                return _summarize_single_chapter(hd, ct + hint, output_lang)
 
             chunk_label = f"Zusammenfassung Kap. {ci} Teil {j}/{len(chunks)}: {ch['heading'][:40]}"
             chunk_summary = load_or_run(chunk_file, _chunk_gen, chunk_label)
@@ -2168,10 +2179,12 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         # Nur sichtbare Sections (_visible_section_indices) erhalten eine Nummer → keine Lücken.
         if has_numbered_chapters:
             if originally_numbered:
-                _m = re.match(r'^([\d.]+)', lookup_key)
-                _auto_parent = _m.group(1) if _m else None
-                if _auto_parent and extracted_chapter and parent_chapter:
-                    _auto_parent = _rebase_chapter_number(_auto_parent, extracted_chapter, parent_chapter)
+                # clean_heading wurde oben bereits präfixiert/rebased (parent_chapter-Pfad),
+                # daher die Elternnummer direkt daraus übernehmen – NICHT aus dem rohen
+                # lookup_key. Sonst fehlt das Elternpräfix und ein Trailing-Punkt der
+                # OCR-Nummer ("3.") erzeugt Doppelpunkte wie "3..1".
+                _m = re.match(r'^(\d[\d.]*)', clean_heading.strip())
+                _auto_parent = _normalize_chapter_num(_m.group(1)) if _m else None
                 _auto_counter = 0
                 _current_competency_key = None
             elif (_auto_parent is not None and _unnumbered_freq.get(lookup_key, 0) == 1
@@ -2440,24 +2453,30 @@ if __name__ == "__main__":
 
         target_lang = (args.target_language or "de").lower()
         is_translated = False
+        # content_lang = Sprache des working_text → steuert die Ausgabesprache der Zusammenfassung.
+        content_lang = "de"
 
         if args.no_translate:
             print("--no-translate: Übersetzung übersprungen, Originalsprache bleibt erhalten.")
             working_text = raw_md
+            content_lang = (args.source_language or "de").lower()
         else:
             source_lang = (args.source_language or detect_language(raw_md)).lower()
             if source_lang == "unknown":
                 print("Sprache unklar – sicherheitshalber keine Übersetzung (Original bleibt erhalten).")
                 working_text = raw_md
+                content_lang = "de"
             elif source_lang == target_lang:
                 print(f"Quelle ist bereits {_language_name(target_lang)}. Keine Übersetzung notwendig.")
                 working_text = raw_md
+                content_lang = target_lang
             elif transl_path.exists():
                 # Gecachte Übersetzung aus einem vorherigen Lauf wiederverwenden – aber nur,
                 # nachdem feststeht, dass tatsächlich übersetzt werden soll.
                 print(f"[SKIP] Übersetzung – bereits vorhanden: {transl_path}")
                 working_text = transl_path.read_text(encoding="utf-8")
                 is_translated = True
+                content_lang = target_lang
             else:
                 print(f"Quelle ist {_language_name(source_lang)}. Starte Übersetzung nach "
                       f"{_language_name(target_lang)}...")
@@ -2465,6 +2484,7 @@ if __name__ == "__main__":
                 transl_path.write_text(working_text, encoding="utf-8")
                 print(f"       Übersetzung gespeichert: {transl_path}")
                 is_translated = True
+                content_lang = target_lang
 
         # --- Zwischenschritt: Übersetzungs-Docx (nur bei englischer Quelle) ---
         kap_infix = f"_kap{chapter_safe}" if chapter_safe else ""
@@ -2510,7 +2530,7 @@ if __name__ == "__main__":
             print(f"[SKIP] Zusammenfassung – bereits vorhanden: {sum_path}")
             summary_result = sum_path.read_text(encoding="utf-8")
         else:
-            summary_result = generate_summary_by_chapter(working_text, cache_dir)
+            summary_result = generate_summary_by_chapter(working_text, cache_dir, output_lang=content_lang)
 
         # --- Schritt 5: Qualitätssicherung (optional) ---
         qa_result = "Keine Leitfragen zur Prüfung übergeben."
