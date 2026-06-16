@@ -1963,6 +1963,12 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     else:
         lvl_shift = 0
 
+    # Strukturelle Neu-Nummerierung: Im reinen Einbettungs-Modus (parent_chapter, KEIN
+    # extrahiertes Einzelkapitel) wird die gesamte Artikel-Gliederung allein aus der
+    # Überschriften-Hierarchie neu nummeriert. Die OCR-Eigennummern (z.B. "1.", "3.") sind
+    # nur teilweise vorhanden und inkonsistent → sie werden verworfen.
+    structural_renumber = bool(parent_chapter and not extracted_chapter)
+
     counters = [0] * 9  # Zähler je Heading-Ebene für Auto-Nummerierung
 
     # --- QA vorbereiten: Textgrundlage-Map für Kommentare ---
@@ -2089,6 +2095,29 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         if sum_lookup.get(_vk, '').strip() or _any_visible_desc[_vi]:
             _visible_section_indices.add(_vi)
 
+    # Tiefen-Prepass für die strukturelle Neu-Nummerierung: bildet die (inkonsistenten,
+    # lückenhaften) OCR-Überschriftenebenen auf konsistente Tiefen 1,2,3… ab – analog zu
+    # _compress_heading_levels, aber über die Sektions-Levels statt über Markdown-Zeilen und
+    # ohne Sonderbehandlung nummerierter Headings (deren Eigennummern werden ohnehin verworfen).
+    depth_map: dict[int, int] = {}
+    if structural_renumber:
+        _ocr_to_actual: dict[int, int] = {}
+        _prev_actual = 0
+        for _di, _ds in enumerate(orig_sections):
+            if _ds['heading'] == '__preamble__':
+                continue
+            _lvl = _ds['level']
+            if _lvl in _ocr_to_actual:
+                _actual = _ocr_to_actual[_lvl]
+            elif _lvl > _prev_actual + 1:
+                _actual = _prev_actual + 1
+                _ocr_to_actual[_lvl] = _actual
+            else:
+                _actual = _lvl
+                _ocr_to_actual[_lvl] = _actual
+            _prev_actual = _actual
+            depth_map[_di] = _actual
+
     _current_competency_key: str | None = None  # aktuell verarbeitete Kompetenz für Scoped Lookup
 
     # --- Interleaved Aufbau ---
@@ -2133,7 +2162,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         # Level-1-Headings sind OCR-Artefakte (Artikeltitel, Journal-Metadaten).
         # Originaltext als versteckten Text erhalten, aber KEINE Nav-Überschrift erzeugen,
         # damit der Counter für level-2+ sauber bei 1 beginnt (5.1.1, 5.1.2 ...).
-        if parent_chapter and not has_numbered_chapters and level == 1:
+        if parent_chapter and not structural_renumber and not has_numbered_chapters and level == 1:
             if len(orig_body.strip()) > 800:
                 # Substanzieller Einleitungstext (Abstract/Intro): Summary anzeigen wenn vorhanden.
                 _skipped_sum = sum_lookup.get(lookup_key, '') or sum_lookup.get('einleitung', '')
@@ -2143,7 +2172,17 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                 process_markdown_to_docx(doc, orig_body, hide_text=True, base_path=base_path)
             continue
 
-        if parent_chapter:
+        if structural_renumber:
+            # OCR-Eigennummer verwerfen und allein aus der Hierarchie-Tiefe neu nummerieren.
+            _title = re.sub(r'^\d[\d.]*\s+', '', clean_heading).strip()
+            if idx in _visible_section_indices:
+                local_num = _advance_counter(counters, depth_map.get(idx, level))
+                number = f"{parent_chapter}.{local_num}" if local_num else parent_chapter
+                clean_heading = _join_number_and_rest(number, _title)
+            else:
+                # Unsichtbare Sektion (wird ausgeblendet): keine Nummer vergeben.
+                clean_heading = _title
+        elif parent_chapter:
             if re.match(r'^\d', clean_heading):
                 if extracted_chapter:
                     clean_heading = _rebase_chapter_number(clean_heading, extracted_chapter, parent_chapter)
@@ -2177,7 +2216,8 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         # nummerierten Kapitel erhalten automatisch eine Unterkapitelnummer (z.B. 5.3.1).
         # Wiederkehrende Überschriften ("Was ist das?" etc.) bleiben unnummeriert.
         # Nur sichtbare Sections (_visible_section_indices) erhalten eine Nummer → keine Lücken.
-        if has_numbered_chapters:
+        # Im strukturellen Neu-Nummerierungs-Modus ist die Nummerierung oben abschließend erfolgt.
+        if has_numbered_chapters and not structural_renumber:
             if originally_numbered:
                 # clean_heading wurde oben bereits präfixiert/rebased (parent_chapter-Pfad),
                 # daher die Elternnummer direkt daraus übernehmen – NICHT aus dem rohen
@@ -2316,7 +2356,11 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             # Nach Fix 4 werden Level-1-Headings in nicht-nummerierten Dokumenten übersprungen
             # (OCR-Artefakte), sodass counters[0] = 0 bleibt. Die Top-Level-Inhalte liegen
             # bei Level 2 (counters[1]). Für nummerierte Dokumente zählt weiterhin counters[0].
-            if extracted_chapter and has_numbered_chapters:
+            if structural_renumber:
+                # Strukturelle Neu-Nummerierung: Top-Level-Sektionen zählen counters[0];
+                # Lernfragen ist das nächste Geschwister auf Tiefe 1.
+                qa_top_num = counters[0] + 1
+            elif extracted_chapter and has_numbered_chapters:
                 # Rebase-Modus: Unterkapitel werden über _auto_counter gezählt;
                 # Lernfragen ist das nächste Geschwister.
                 qa_top_num = _auto_counter + 1
