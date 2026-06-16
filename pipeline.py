@@ -352,13 +352,31 @@ def _inject_comments_part(doc, comments_list: list):
         print(f"   Kommentare konnten nicht eingebettet werden: {e}")
 
 
-def check_if_english(text: str) -> bool:
-    """Schritt 2a: Prüfe, ob der Text englisch ist.
+# Menschlich lesbare Namen für die gängigsten Sprachcodes (für Übersetzungs-Prompts).
+LANGUAGE_NAMES = {
+    "de": "Deutsch",
+    "en": "Englisch",
+    "fr": "Französisch",
+    "es": "Spanisch",
+    "it": "Italienisch",
+}
 
-    Nimmt drei Stichproben (Anfang, Mitte, Ende) um Dokumente mit deutschem Titel
-    aber englischem Haupttext korrekt zu erkennen.
+
+def _language_name(code: str) -> str:
+    """Liefert den deutschen Klarnamen zu einem Sprachcode (Fallback: Code selbst)."""
+    return LANGUAGE_NAMES.get((code or "").lower(), code)
+
+
+def detect_language(text: str) -> str:
+    """Schritt 2a: Erkennt die Hauptsprache des Dokuments und liefert einen ISO-Code
+    (z.B. 'de', 'en').
+
+    Nimmt drei Stichproben (Anfang, Mitte, Ende), um Dokumente mit z.B. deutschem Titel
+    aber englischem Haupttext korrekt zu erkennen. Bei endgültigem Fehler wird 'unknown'
+    zurückgegeben – die aufrufende Logik übersetzt dann NICHT (sichere Annahme:
+    Quellsprache = Zielsprache), statt blind auf Englisch/Übersetzung auszuweichen.
     """
-    print("--- Schritt 2a: Prüfe Sprache des Dokuments ---")
+    print("--- Schritt 2a: Erkenne Sprache des Dokuments ---")
     n = len(text)
     samples = [
         text[:1500],
@@ -367,9 +385,11 @@ def check_if_english(text: str) -> bool:
     ]
     leseprobe = "\n\n---\n\n".join(s for s in samples if s.strip())
     prompt = (
-        "Antworte mit exakt einem Wort, entweder 'YES' oder 'NO'. "
-        "Ist der folgende Text hauptsächlich in englischer Sprache verfasst? "
-        "Ignoriere vereinzelte deutsche Wörter (z.B. Eigennamen, Zitate) – frage nur nach der Hauptsprache.\n\n"
+        "Bestimme die Hauptsprache des folgenden Textes. "
+        "Antworte mit exakt einem ISO-639-1-Sprachcode in Kleinbuchstaben "
+        "(z.B. 'de' für Deutsch, 'en' für Englisch). "
+        "Ignoriere vereinzelte fremdsprachige Wörter (Eigennamen, Zitate) – "
+        "frage nur nach der Hauptsprache. Gib nur den Code aus, sonst nichts.\n\n"
         f"Text:\n{leseprobe}"
     )
     try:
@@ -378,10 +398,15 @@ def check_if_english(text: str) -> bool:
             contents=prompt,
             config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=5)
         )
-        return "YES" in response.text.strip().upper()
+        code = re.sub(r'[^a-z]', '', response.text.strip().lower())[:2]
+        if code:
+            print(f"   Erkannte Sprache: {code}")
+            return code
+        print("   Sprachcode nicht erkennbar – behandle als 'unknown'.")
+        return "unknown"
     except Exception as e:
-        print(f"Sprachprüfung fehlgeschlagen ({e}), weiche auf Übersetzung aus.")
-        return True
+        print(f"Sprachprüfung fehlgeschlagen ({e}); behandle als 'unknown' (keine Übersetzung).")
+        return "unknown"
 
 
 def split_text_by_headings(text: str, max_chars: int = 15000) -> list:
@@ -405,12 +430,19 @@ def split_text_by_headings(text: str, max_chars: int = 15000) -> list:
     return chunks
 
 
-def translate_text(text: str) -> str:
-    """Schritt 2b: Übersetzt den Text abschnittsweise nach den strengen Regeln."""
-    print("--- Schritt 2b: Übersetze englischen Text ins Deutsche (via Gemini 2.5 Pro) ---")
+def translate_text(text: str, source_lang: str = "en", target_lang: str = "de") -> str:
+    """Schritt 2b: Übersetzt den Text abschnittsweise nach den strengen Regeln.
+
+    source_lang/target_lang sind ISO-639-1-Codes; der Prompt wird daraus dynamisch gebaut,
+    damit nie versehentlich in die falsche Richtung (z.B. Deutsch → Englisch) übersetzt wird.
+    """
+    src_name = _language_name(source_lang)
+    tgt_name = _language_name(target_lang)
+    print(f"--- Schritt 2b: Übersetze Text von {src_name} nach {tgt_name} (via Gemini 2.5 Pro) ---")
 
     system_prompt = (
-        "Übersetze den folgenden englischen wissenschaftlichen Text originalgetreu ins Deutsche.\n\n"
+        f"Übersetze den folgenden {src_name.lower()}en wissenschaftlichen Text "
+        f"originalgetreu ins {tgt_name}.\n\n"
         "Ziel:\n"
         "Eine vollständige, sinntreue Übersetzung, keine Zusammenfassung.\n\n"
         "Strenge Regeln:\n"
@@ -1794,16 +1826,36 @@ def _parent_level_from_chapter(parent_chapter: str) -> int:
     return len(parent_chapter.split('.')) + 1
 
 
+def _normalize_chapter_num(num: str) -> str:
+    """Säubert eine (evtl. OCR-verschmutzte) Kapitelnummer.
+    Kollabiert Mehrfachpunkte ('3...1' → '3.1') und entfernt führende/abschließende Punkte
+    ('1.' → '1'). Liefert reine Punkt-getrennte Ziffernfolgen.
+    """
+    num = re.sub(r'\.{2,}', '.', num)   # 3...1 → 3.1
+    return num.strip('.')               # 1.  → 1 ,  .1 → 1
+
+
+def _join_number_and_rest(num: str, rest: str) -> str:
+    """Fügt eine Kapitelnummer und den Resttext sauber zusammen (genau ein Trenn-Whitespace
+    bei vorhandenem Titel, kein Trailing-Whitespace bei reiner Nummer)."""
+    rest = rest or ""
+    if rest and not rest[:1].isspace():
+        rest = f" {rest}"
+    return f"{num}{rest}"
+
+
 def _prefix_chapter_number(heading_text: str, prefix: str) -> str:
     """
     Setzt den Elternpräfix vor die Kapitelnummer einer Überschrift.
     '1 EINLEITUNG'  + '4.2.1.2' → '4.2.1.2.1 EINLEITUNG'
     '4.1 Abschnitt' + '4.2.1.2' → '4.2.1.2.4.1 Abschnitt'
+    '1. EINLEITUNG' + '6.2.4.1' → '6.2.4.1.1 EINLEITUNG'  (kein Trailing-Punkt)
     Überschriften ohne führende Zahl bleiben unverändert.
     """
     m = re.match(r'^(\d[\d\.]*)(.*)', heading_text.strip())
     if m:
-        return f"{prefix}.{m.group(1)}{m.group(2)}"
+        num = _normalize_chapter_num(m.group(1))
+        return _join_number_and_rest(f"{prefix}.{num}", m.group(2))
     return heading_text
 
 
@@ -1819,12 +1871,12 @@ def _rebase_chapter_number(heading_text: str, chapter_root: str, parent_chapter:
     m = re.match(r'^(\d[\d.]*?)(\s.*|$)', heading_text.strip())
     if not m:
         return heading_text
-    num, rest = m.group(1).rstrip('.'), m.group(2)
+    num, rest = _normalize_chapter_num(m.group(1)), m.group(2)
     if num == chapter_root:
-        return f"{parent_chapter}{rest}"
+        return _join_number_and_rest(parent_chapter, rest)
     if num.startswith(chapter_root + '.'):
-        return f"{parent_chapter}.{num[len(chapter_root) + 1:]}{rest}"
-    return f"{parent_chapter}.{num}{rest}"   # Fallback
+        return _join_number_and_rest(f"{parent_chapter}.{num[len(chapter_root) + 1:]}", rest)
+    return _join_number_and_rest(f"{parent_chapter}.{num}", rest)   # Fallback
 
 
 def build_translation_word_document(translated_text: str, output_path: str, base_path: str = None):
@@ -2091,7 +2143,8 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                 # Bei has_numbered_chapters übernimmt der Auto-Block unten
                 # (verhindert Doppel-Nummerierung).
                 local_num = _advance_counter(counters, level)
-                clean_heading = f"{parent_chapter}.{local_num} {clean_heading}"
+                number = f"{parent_chapter}.{local_num}" if local_num else parent_chapter
+                clean_heading = _join_number_and_rest(number, clean_heading)
 
         if parent_chapter:
             num_m = re.match(r'^([\d.]+)\b', clean_heading)
@@ -2326,6 +2379,14 @@ if __name__ == "__main__":
     parser.add_argument("--no-summary", action="store_true",
                         help="Nur Übersetzung ausgeben – keine Zusammenfassung, kein ausgeblendeter Text, "
                              "kein interleaved-Dokument. Das Übersetzungs-Docx ist das finale Ergebnis.")
+    parser.add_argument("--target-language", type=str, default=None,
+                        help="Zielsprache als ISO-Code, z.B. 'de' oder 'en'. "
+                             "Standard: 'de' (englische Quellen werden automatisch nach Deutsch übersetzt). "
+                             "Ist Quell- = Zielsprache, wird NICHT übersetzt.")
+    parser.add_argument("--source-language", type=str, default=None,
+                        help="Quellsprache als ISO-Code erzwingen (überspringt die automatische Erkennung).")
+    parser.add_argument("--no-translate", action="store_true",
+                        help="Keine Übersetzung – Originalsprache beibehalten, unabhängig von der Erkennung.")
 
     args = parser.parse_args()
     OUTPUT_BASE = "workspace/output"
@@ -2339,55 +2400,78 @@ if __name__ == "__main__":
 
         pdf_stem  = Path(args.pdf_path).stem
         doc_title = pdf_stem.replace('_', ' ')
-        out_dir   = Path(OUTPUT_BASE) / pdf_stem
+        out_dir   = Path(OUTPUT_BASE) / pdf_stem      # Dokument-Ordner: enthält die finalen .docx
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Kapitel-spezifisches Cache-Verzeichnis (OCR-Markdown bleibt in out_dir)
+        # Arbeits-/Zwischendateien (OCR-Markdown + Bilder, Übersetzung, Zusammenfassung, QA)
+        # liegen gebündelt in out_dir/work, getrennt von den finalen Ergebnissen.
+        work_dir = out_dir / "work"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        # Kapitel-spezifisches Cache-Verzeichnis innerhalb des Arbeitsordners
         chapter_safe = args.chapter.replace('.', '_') if args.chapter else None
-        cache_dir = out_dir / f"kap{chapter_safe}" if chapter_safe else out_dir
+        cache_dir = work_dir / f"kap{chapter_safe}" if chapter_safe else work_dir
         cache_dir.mkdir(parents=True, exist_ok=True)
 
         # --- Schritt 1: OCR ---
-        md_path = out_dir / f"{pdf_stem}.md"
+        # Marker schreibt nach work_dir/<pdf_stem>/<pdf_stem>.md (inkl. Bilder).
+        md_path = work_dir / pdf_stem / f"{pdf_stem}.md"
         if args.force or not md_path.exists():
-            raw_md_path = run_marker_ocr(args.pdf_path, OUTPUT_BASE)
+            raw_md_path = run_marker_ocr(args.pdf_path, str(work_dir))
             md_path = Path(raw_md_path)
         else:
             print(f"[SKIP] OCR – Markdown bereits vorhanden: {md_path}")
 
         raw_md = md_path.read_text(encoding="utf-8")
+        # Bilder liegen im selben Ordner wie das OCR-Markdown → base_path für Bildauflösung.
+        image_base = str(md_path.parent)
 
         # --- Schritt 1b: Kapitel-Filter (optional) ---
         if args.chapter:
             raw_md = extract_chapter(raw_md, args.chapter)
 
-        # --- Schritt 2: Sprache prüfen & ggf. übersetzen (nur englische Quellen) ---
+        # --- Schritt 2: Sprache prüfen & ggf. übersetzen ---
+        # Übersetzt wird NUR, wenn Quell- und Zielsprache verschieden sind. Default-Ziel ist
+        # Deutsch: englische Quellen werden automatisch übersetzt, deutsche bleiben deutsch.
+        # Eine explizite --target-language oder --source-language überschreibt die Automatik.
         transl_path = cache_dir / "de_uebersetzung.md"
         if args.force and transl_path.exists():
             transl_path.unlink()
 
+        target_lang = (args.target_language or "de").lower()
         is_translated = False
-        if transl_path.exists():
-            # Gecachte Übersetzung aus vorherigem Lauf
-            print(f"[SKIP] Übersetzung – bereits vorhanden: {transl_path}")
-            working_text = transl_path.read_text(encoding="utf-8")
-            is_translated = True
-        elif check_if_english(raw_md):
-            print("Text ist Englisch. Starte Übersetzung...")
-            working_text = translate_text(raw_md)
-            transl_path.write_text(working_text, encoding="utf-8")
-            print(f"       Übersetzung gespeichert: {transl_path}")
-            is_translated = True
-        else:
-            print("Text ist bereits Deutsch. Keine Übersetzung notwendig.")
+
+        if args.no_translate:
+            print("--no-translate: Übersetzung übersprungen, Originalsprache bleibt erhalten.")
             working_text = raw_md
+        else:
+            source_lang = (args.source_language or detect_language(raw_md)).lower()
+            if source_lang == "unknown":
+                print("Sprache unklar – sicherheitshalber keine Übersetzung (Original bleibt erhalten).")
+                working_text = raw_md
+            elif source_lang == target_lang:
+                print(f"Quelle ist bereits {_language_name(target_lang)}. Keine Übersetzung notwendig.")
+                working_text = raw_md
+            elif transl_path.exists():
+                # Gecachte Übersetzung aus einem vorherigen Lauf wiederverwenden – aber nur,
+                # nachdem feststeht, dass tatsächlich übersetzt werden soll.
+                print(f"[SKIP] Übersetzung – bereits vorhanden: {transl_path}")
+                working_text = transl_path.read_text(encoding="utf-8")
+                is_translated = True
+            else:
+                print(f"Quelle ist {_language_name(source_lang)}. Starte Übersetzung nach "
+                      f"{_language_name(target_lang)}...")
+                working_text = translate_text(raw_md, source_lang=source_lang, target_lang=target_lang)
+                transl_path.write_text(working_text, encoding="utf-8")
+                print(f"       Übersetzung gespeichert: {transl_path}")
+                is_translated = True
 
         # --- Zwischenschritt: Übersetzungs-Docx (nur bei englischer Quelle) ---
         kap_infix = f"_kap{chapter_safe}" if chapter_safe else ""
         if is_translated:
-            transl_docx_path = Path(OUTPUT_BASE) / f"{pdf_stem}{kap_infix}_Uebersetzung.docx"
+            transl_docx_path = out_dir / f"{pdf_stem}{kap_infix}_Uebersetzung.docx"
             if args.force or not transl_docx_path.exists():
-                build_translation_word_document(working_text, str(transl_docx_path), base_path=str(out_dir))
+                build_translation_word_document(working_text, str(transl_docx_path), base_path=image_base)
             else:
                 print(f"[SKIP] Übersetzungs-Docx – bereits vorhanden: {transl_docx_path}")
 
@@ -2465,10 +2549,10 @@ if __name__ == "__main__":
 
         # --- Word-Dokument zusammensetzen ---
         suffix = f"_Einbetten_{args.parent_chapter.replace('.', '-')}" if args.parent_chapter else "_Lernskript"
-        final_docx_path = Path(OUTPUT_BASE) / f"{pdf_stem}{kap_infix}{suffix}.docx"
+        final_docx_path = out_dir / f"{pdf_stem}{kap_infix}{suffix}.docx"
         build_interleaved_word_document(
             working_text, summary_result, qa_result,
-            str(final_docx_path), base_path=str(out_dir),
+            str(final_docx_path), base_path=image_base,
             parent_chapter=args.parent_chapter,
             parent_level=args.parent_level,
             skip_references=not args.include_references,
