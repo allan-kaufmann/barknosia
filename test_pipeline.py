@@ -2341,3 +2341,41 @@ def test_embed_title_as_parent_root_carries_parent_chapter_number():
     texts = [p.text for p in paras]
     assert any(t.startswith("6.2.4.3 ") and "Arbeitsschutz in der Praxis" in t for t in texts), \
         f"Titel soll '6.2.4.3 Arbeitsschutz in der Praxis' lauten. Gefunden:\n{texts}"
+
+
+def test_embed_title_as_parent_root_is_visible_heading():
+    """title_as_parent: Der Titel (Wurzel) ist ein sichtbarer Gliederungspunkt
+    (Heading-Style, nicht ausgeblendet) – nicht als Normal/hidden Text."""
+    orig_md = (
+        "# Arbeitsschutz in der Praxis\n\nUntertitel.\n\n"
+        "# 1 Einleitung\n\nEinleitungstext.\n\n"
+    )
+    sum_md = (
+        "## 1 Einleitung\n\nSummary 1.\n\n"
+    )
+    paras = _run_interleaved_title_as_parent(orig_md, sum_md, parent_chapter="6.2.4.3")
+    root = next((p for p in paras if "Arbeitsschutz in der Praxis" in p.text), None)
+    assert root is not None, "Titel-Absatz nicht gefunden"
+    assert "Heading" in root.style.name, \
+        f"Titel soll Heading-Style haben, ist aber {root.style.name!r}"
+    assert not any(r.font.hidden for r in root.runs), \
+        "Titel-Überschrift darf nicht ausgeblendet sein"
+
+
+def test_embed_summary_heading_with_span_still_matches():
+    """Summary-Überschriften mit kopierten OCR-<span>-Tags müssen trotzdem auf die
+    Original-Section matchen (Key wird via _clean_heading_text bereinigt)."""
+    orig_md = (
+        "# 1.3 Lernen\n\nIntro.\n\n"
+        "# <span id=\"page-3-1\"></span>**Wie wird Wissen erworben?**\n\nOriginaltext A.\n\n"
+    )
+    sum_md = (
+        "## 1.3 Lernen\n\nZusammenfassung.\n\n"
+        "## <span id=\"page-3-1\"></span>**Wie wird Wissen erworben?**\n\n"
+        "Stichpunkt-Erwerb-Inhalt.\n\n"
+    )
+    paras = _run_interleaved_embedded(orig_md, sum_md,
+                                     parent_chapter="2.4.1.2", extracted_chapter="1.3")
+    texts = [p.text for p in paras]
+    assert any("Stichpunkt-Erwerb-Inhalt" in t for t in texts), \
+        f"Summary-Stichpunkt soll trotz <span> im Heading erscheinen. Gefunden:\n{texts}"

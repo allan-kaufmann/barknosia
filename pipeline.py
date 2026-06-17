@@ -2056,7 +2056,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     for s in sum_sections:
         if s['heading'] == '__preamble__':
             continue
-        sum_lookup[normalize_heading(s['heading'])] = s['body']
+        sum_lookup[normalize_heading(_clean_heading_text(s['heading']))] = s['body']
 
     # Scoped lookup: parent_key → {child_key → body}
     # Verhindert Conflation gleichnamiger Sub-Headings (z.B. "Off the job" unter jeder Kompetenz).
@@ -2066,7 +2066,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     for _ss in sum_sections:
         if _ss['heading'] == '__preamble__':
             continue
-        _ssk = normalize_heading(_ss['heading'])
+        _ssk = normalize_heading(_clean_heading_text(_ss['heading']))
         if _ss['level'] <= 2:
             _scp_parent = _ssk
             sum_scoped[_ssk] = {'__self__': _ss['body']}
@@ -2354,14 +2354,19 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             # verhindert goldene Leer-Überschriften ohne sichtbaren Folgeinhalt.
             _any_visible_desc[idx]
         )
+        # Strukturwurzel im title_as_parent-Modus (Artikeltitel, Tiefe 0): trägt das
+        # Elternkapitel und ist der Anker des Dokuments → immer als sichtbare Überschrift,
+        # auch ohne eigene Zusammenfassung und ohne von der flachen OCR-Ebene erkannte Kinder.
+        is_struct_root = structural_renumber and title_as_parent and depth_map.get(idx) == 0
+
         # Nur wirklich leere Sektionen überspringen (kein Original, kein Summary, keine Kinder).
-        if not sum_body.strip() and not orig_body.strip() and not has_children:
+        if not sum_body.strip() and not orig_body.strip() and not has_children and not is_struct_root:
             continue
 
         # Überschrift sichtbar: wenn Zusammenfassung vorhanden ODER Elternkapitel mit Kindern.
         # Sonst ausgeblendet — Originalinhalt bleibt im Dokument, ist im Summary-View aber
         # unsichtbar → kein leerer Gliederungspunkt, kein verlorener Inhalt.
-        show_heading_visible = bool(sum_body.strip()) or has_children
+        show_heading_visible = bool(sum_body.strip()) or has_children or is_struct_root
         if show_heading_visible:
             if has_numbered_chapters:
                 nav_worthy = originally_numbered or (extracted_chapter and _is_box_heading(clean_heading))
