@@ -49,6 +49,7 @@ from pipeline import (
     _classify_box_boundaries,
     _rebase_chapter_number,
     extract_chapter,
+    strip_front_matter,
 )
 import pipeline
 
@@ -2248,3 +2249,95 @@ def test_embed_level4_nonbox_heading_not_auto_numbered_not_in_nav():
     assert "Heading" not in drei_paras[0].style.name, (
         f"Level-4-Heading soll als Normal+Bold erscheinen (nicht im Navigationsbereich), Style: {drei_paras[0].style.name!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 35: Front-Matter-Stripping (Impressum, Inhaltsverzeichnis)
+# ---------------------------------------------------------------------------
+
+def test_strip_front_matter_removes_impressum_and_toc_keeps_title_and_image():
+    """Titel + Titelbild bleiben, Impressum (inkl. Unterabschnitte) und Inhalt verschwinden,
+    der erste echte Inhalt bleibt erhalten."""
+    md = (
+        "# Arbeitsschutz in der Praxis\n\n"
+        "Untertitel-Zeile\n\n"
+        "![](_page_0_Picture_3.jpeg)\n\n"
+        "# **Impressum**\n\n"
+        "## **Berücksichtigung psychischer Belastung**\n\n"
+        "### **Herausgeber:**\n\nFoo Bar\n\n"
+        "#### **Autorinnen und Autoren:**\n\nA, B, C\n\n"
+        "# Inhalt\n\n"
+        "1 Einleitung ........ 3\n\n"
+        "# 1 Einleitung\n\nEchter Inhalt.\n"
+    )
+    out = strip_front_matter(md)
+    assert "# Arbeitsschutz in der Praxis" in out
+    assert "Untertitel-Zeile" in out
+    assert "![](_page_0_Picture_3.jpeg)" in out
+    assert "# 1 Einleitung" in out and "Echter Inhalt." in out
+    # Front-Matter und alle seine Unterabschnitte sind weg.
+    assert "Impressum" not in out
+    assert "Herausgeber" not in out
+    assert "Autorinnen und Autoren" not in out
+    assert "# Inhalt" not in out
+    assert "Einleitung ........ 3" not in out
+
+
+def test_strip_front_matter_noop_without_front_matter():
+    """Ohne Front-Matter bleibt der Text unverändert."""
+    md = "# 1 Einleitung\n\nText.\n\n# 2 Methoden\n\nMehr Text.\n"
+    assert strip_front_matter(md) == md
+
+
+def test_strip_front_matter_english_labels():
+    """Englische Front-Matter-Labels (Contents/Table of Contents) werden ebenfalls entfernt."""
+    md = (
+        "# The Title\n\nIntro line.\n\n"
+        "# Table of Contents\n\n1 Foo .... 2\n\n"
+        "# 1 Introduction\n\nReal content.\n"
+    )
+    out = strip_front_matter(md)
+    assert "# The Title" in out
+    assert "# 1 Introduction" in out and "Real content." in out
+    assert "Table of Contents" not in out
+
+
+def _run_interleaved_title_as_parent(orig_md: str, summary_md: str,
+                                     parent_chapter: str, qa_text: str = "") -> list:
+    """Hilfsfunktion: build_interleaved_word_document im strukturellen Einbette-Modus
+    mit title_as_parent (kein extracted_chapter)."""
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        build_interleaved_word_document(
+            translated_text=orig_md,
+            summary_text=summary_md,
+            qa_text=qa_text,
+            output_path=tmp_path,
+            parent_chapter=parent_chapter,
+            title_as_parent=True,
+        )
+        doc = Document(tmp_path)
+        return [p for p in doc.paragraphs if p.text.strip()]
+    finally:
+        os.unlink(tmp_path)
+
+
+def test_embed_title_as_parent_root_carries_parent_chapter_number():
+    """title_as_parent: Der Artikeltitel (Wurzel) trägt direkt die Elternkapitelnummer
+    (z.B. '6.2.4.3 Arbeitsschutz in der Praxis')."""
+    orig_md = (
+        "# Arbeitsschutz in der Praxis\n\nUntertitel.\n\n"
+        "# 1 Einleitung\n\nEinleitungstext.\n\n"
+        "# 2 Gestaltungsbereiche\n\nText.\n\n"
+    )
+    sum_md = (
+        "## Einleitung\n\nIntro-Zusammenfassung.\n\n"
+        "## 1 Einleitung\n\nSummary 1.\n\n"
+        "## 2 Gestaltungsbereiche\n\nSummary 2.\n\n"
+    )
+    paras = _run_interleaved_title_as_parent(orig_md, sum_md, parent_chapter="6.2.4.3")
+    texts = [p.text for p in paras]
+    assert any(t.startswith("6.2.4.3 ") and "Arbeitsschutz in der Praxis" in t for t in texts), \
+        f"Titel soll '6.2.4.3 Arbeitsschutz in der Praxis' lauten. Gefunden:\n{texts}"

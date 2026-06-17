@@ -1818,6 +1818,45 @@ def _is_skip_heading(heading: str) -> bool:
     return any(pat in key for pat in _SKIP_HEADING_PATTERNS)
 
 
+# Front-Matter-Überschriften am Dokumentanfang (Impressum, Inhaltsverzeichnis),
+# die standardmäßig übersprungen werden. Titel + Titelbild davor bleiben erhalten.
+_FRONT_MATTER_HEADINGS = frozenset([
+    'impressum', 'imprint',
+    'inhalt', 'inhaltsverzeichnis', 'table of contents', 'contents',
+])
+
+
+def strip_front_matter(text: str) -> str:
+    """Entfernt Front-Matter-Blöcke (Impressum, Inhaltsverzeichnis) am Dokumentanfang.
+
+    Titel (erste Überschrift) und ggf. Titelbild davor bleiben erhalten. Ein Block läuft
+    von seiner Überschrift bis zur nächsten gleich-/höherrangigen Überschrift, die selbst
+    kein Front-Matter ist; tiefere Unterabschnitte des Blocks werden mit entfernt.
+    Arbeitet zeilenbasiert, um HTML-Spans und Bild-Referenzen unverändert zu lassen.
+    """
+    out: list[str] = []
+    skipping = False
+    skip_level = 0
+    for line in text.split('\n'):
+        m = re.match(r'^(#{1,6})\s+(.*)$', line)
+        if m:
+            level = len(m.group(1))
+            key = normalize_heading(_clean_heading_text(line))
+            if skipping and level <= skip_level:
+                # Block endet bei gleich-/höherrangiger Überschrift.
+                skipping = False
+            if key in _FRONT_MATTER_HEADINGS:
+                skipping = True
+                skip_level = level
+                continue
+            if skipping and level > skip_level:
+                continue  # tieferes Front-Matter-Unterkapitel
+        if skipping:
+            continue
+        out.append(line)
+    return '\n'.join(out)
+
+
 def _advance_counter(counters: list, level: int) -> str:
     """
     Erhöht den Zähler für `level` (1-basiert) und setzt tiefere Ebenen zurück.
@@ -2098,6 +2137,15 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         _vk = normalize_heading(_clean_heading_text(_vs['heading']))
         if sum_lookup.get(_vk, '').strip() or _any_visible_desc[_vi]:
             _visible_section_indices.add(_vi)
+
+    # title_as_parent: Die Wurzel-Sektion (Artikeltitel, Tiefe 0) ist der Anker des
+    # Dokuments und trägt direkt das Elternkapitel (z.B. 6.2.4.3). Sie immer als sichtbar
+    # markieren, auch ohne eigene Zusammenfassung – sonst bekäme der Titel keine Nummer.
+    if structural_renumber and title_as_parent:
+        for _ti, _ts in enumerate(orig_sections):
+            if _ts['heading'] != '__preamble__':
+                _visible_section_indices.add(_ti)
+                break
 
     # Tiefen-Prepass für die strukturelle Neu-Nummerierung: bildet die (inkonsistenten,
     # lückenhaften) OCR-Überschriftenebenen auf konsistente Tiefen 1,2,3… ab – analog zu
@@ -2460,7 +2508,18 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="End-to-End PDF Translation & Learning Pipeline")
+    parser = argparse.ArgumentParser(
+        description="End-to-End PDF Translation & Learning Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Beispiele:\n"
+            "  python pipeline.py dok.pdf\n"
+            "  python pipeline.py dok.pdf --parent-chapter 6.2.4.3 --title-as-parent --questions fragen.txt\n"
+            "  python pipeline.py dok.pdf --chapter 4.2 --parent-chapter 2.4.1.2\n"
+            "  python pipeline.py dok.pdf --no-translate --no-summary\n"
+            "  python pipeline.py dok.pdf --force   # alle Zwischenergebnisse neu berechnen\n"
+        ),
+    )
     parser.add_argument("pdf_path", type=str, help="Pfad zur Quell-PDF-Datei")
     parser.add_argument("--questions", type=str, default=None, help="Pfad zu den leseleitenden Fragen (optional)")
     parser.add_argument("--force", action="store_true", help="Alle Schritte neu berechnen (kein Resume)")
@@ -2471,6 +2530,9 @@ if __name__ == "__main__":
                         help="Heading-Level des Elternkapitels (Standard: automatisch aus --parent-chapter).")
     parser.add_argument("--include-references", action="store_true",
                         help="Referenzen, Literaturverzeichnis etc. einbeziehen (Standard: werden übersprungen).")
+    parser.add_argument("--include-front-matter", action="store_true",
+                        help="Front-Matter (Impressum, Inhaltsverzeichnis) NICHT überspringen "
+                             "(Standard: wird übersprungen; Titel + Titelbild bleiben immer erhalten).")
     parser.add_argument("--chapter", type=str, default=None,
                         help="Nur dieses Kapitel extrahieren, z.B. '4.2' oder '3'. "
                              "Sucht im OCR-Markdown nach der Überschrift und extrahiert das Kapitel "
@@ -2528,6 +2590,16 @@ if __name__ == "__main__":
         raw_md = md_path.read_text(encoding="utf-8")
         # Bilder liegen im selben Ordner wie das OCR-Markdown → base_path für Bildauflösung.
         image_base = str(md_path.parent)
+
+        # --- Schritt 1a: Front-Matter überspringen (Impressum, Inhaltsverzeichnis) ---
+        # Standardmäßig aktiv; Titel + Titelbild bleiben erhalten. Spart außerdem
+        # Übersetzungs-/Zusammenfassungs-Kosten für irrelevante Vorseiten.
+        if not args.include_front_matter:
+            before_len = len(raw_md)
+            raw_md = strip_front_matter(raw_md)
+            if len(raw_md) < before_len:
+                print(f"[FRONT-MATTER] Impressum/Inhaltsverzeichnis übersprungen "
+                      f"({before_len - len(raw_md)} Zeichen entfernt).")
 
         # --- Schritt 1b: Kapitel-Filter (optional) ---
         if args.chapter:
