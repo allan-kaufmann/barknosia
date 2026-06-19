@@ -2187,6 +2187,58 @@ def test_extract_chapter_missing_toplevel_uses_first_subchapter():
 
 
 # ---------------------------------------------------------------------------
+# Gruppe 33b: extract_chapter --from (Teilkapitel ab Unterkapitel)
+# ---------------------------------------------------------------------------
+
+def _chap4_md():
+    return (
+        "# 4 Vorgehen und Methoden\n\nEinleitungstext zu Kapitel 4.\n\n"
+        "## 4.1 Vorstudie\n\nVorstudientext.\n\n"
+        "## 4.2 Hauptstudie\n\nHauptstudientext.\n\n"
+        "## 4.3 Auswertung\n\nAuswertungstext.\n\n"
+        "# 5 Ergebnisse\n\nErgebnistext.\n"
+    )
+
+
+def test_extract_chapter_from_keeps_title_drops_intro_and_earlier_subsections():
+    """--from 4.2: Kapiteltitel bleibt, Einleitung + 4.1 entfallen, 4.2/4.3 bleiben,
+    Kapitel 5 wird nicht mitgenommen."""
+    result = extract_chapter(_chap4_md(), "4", from_section="4.2")
+    assert "4 Vorgehen und Methoden" in result          # Titel bleibt
+    assert "Einleitungstext zu Kapitel 4" not in result  # Intro weg
+    assert "4.1 Vorstudie" not in result and "Vorstudientext" not in result  # 4.1 weg
+    assert "4.2 Hauptstudie" in result and "Hauptstudientext" in result
+    assert "4.3 Auswertung" in result
+    assert "5 Ergebnisse" not in result and "Ergebnistext" not in result
+
+
+def test_extract_chapter_from_not_found_raises():
+    """--from auf ein nicht vorhandenes/außerhalb liegendes Unterkapitel → ValueError."""
+    with pytest.raises(ValueError):
+        extract_chapter(_chap4_md(), "4", from_section="4.9")
+
+
+def test_extract_chapter_from_missing_root_heading_starts_at_section():
+    """Fehlt der Kapitel-Wurzel-Heading (nur Unterkapitel vorhanden), wird kein Titel
+    vorangestellt; Extraktion startet trotzdem korrekt ab from_section."""
+    md = (
+        "## 4.1 Vorstudie\n\nVorstudientext.\n\n"
+        "## 4.2 Hauptstudie\n\nHauptstudientext.\n\n"
+        "# 5 Ergebnisse\n\nErgebnistext.\n"
+    )
+    result = extract_chapter(md, "4", from_section="4.2")
+    assert "4.2 Hauptstudie" in result and "Hauptstudientext" in result
+    assert "4.1 Vorstudie" not in result
+    assert "5 Ergebnisse" not in result
+
+
+def test_extract_chapter_from_none_unchanged():
+    """from_section=None → identisches Verhalten wie ohne den Parameter (Regressionsschutz)."""
+    md = _chap4_md()
+    assert extract_chapter(md, "4", from_section=None) == extract_chapter(md, "4")
+
+
+# ---------------------------------------------------------------------------
 # Gruppe 34: Tail-Normalisierung + Level-2+-Heading-Behandlung im Einbette-Modus
 # ---------------------------------------------------------------------------
 

@@ -131,7 +131,7 @@ def _clean_heading_text(line: str) -> str:
     return text.strip()
 
 
-def extract_chapter(text: str, chapter_id: str) -> str:
+def extract_chapter(text: str, chapter_id: str, from_section: str = None) -> str:
     """
     Extrahiert ein bestimmtes Kapitel (inkl. aller Unterkapitel) aus einem Markdown-Text.
     chapter_id: z.B. '4.2' oder '1' — robuste Erkennung auch bei HTML-Tags in Überschriften.
@@ -139,6 +139,11 @@ def extract_chapter(text: str, chapter_id: str) -> str:
       - Numerisch:  "7 Titel…"  /  "7.2 Sub…"
       - Label:      "Kapitel 7" / "Chapter 7" / "Teil 7" / "Abschnitt 7"
     Extraktion endet bei der nächsten Überschrift gleicher/höherer Ebene die kein Unterkapitel ist.
+
+    from_section (optional, z.B. '4.2'): Extrahiere das Kapitel erst AB diesem Unterkapitel.
+    Der Kapiteltitel bleibt erhalten, alles davor (Einleitung + frühere Unterkapitel wie 4.1)
+    wird übersprungen – der Rest läuft bis zum Kapitelende. Nur sinnvoll mit chapter_id als
+    Oberkapitel (z.B. chapter_id='4', from_section='4.2').
     """
     escaped = re.escape(chapter_id)
     _label_pat = r'(?:Kapitel|Chapter|Teil|Abschnitt)'
@@ -197,8 +202,26 @@ def extract_chapter(text: str, chapter_id: str) -> str:
                         break
         result.append(line)
 
+    # Optional: erst ab einem bestimmten Unterkapitel beginnen (Titel bleibt erhalten).
+    if from_section:
+        fs_esc = re.escape(from_section)
+        fs_idx = next((j for j, line in enumerate(result)
+                       if re.match(r'^#{1,6}\s', line)
+                       and re.match(rf'^{fs_esc}(\s|$)', _clean_heading_text(line))), None)
+        if fs_idx is None:
+            raise ValueError(f"--from '{from_section}' nicht innerhalb von Kapitel "
+                             f"'{chapter_id}' gefunden (oder liegt außerhalb der Kapitelgrenzen).")
+        head = []
+        # Kapitel-Titel behalten – aber nur, wenn die erste Zeile wirklich die Kapitel-Wurzel ist
+        # (nicht ein Unterkapitel, falls die OCR den Wurzel-Heading übersprungen hat).
+        if result and re.match(r'^#{1,6}\s', result[0]) and \
+                re.match(rf'^{escaped}(\s|$)', _clean_heading_text(result[0])):
+            head = [result[0], '']
+        result = head + result[fs_idx:]
+
     extracted = '\n'.join(result)
-    print(f"[KAPITEL] '{chapter_id}' extrahiert: {len(result)} Zeilen, {len(extracted)} Zeichen")
+    _label = f"'{chapter_id}'" + (f" ab '{from_section}'" if from_section else "")
+    print(f"[KAPITEL] {_label} extrahiert: {len(result)} Zeilen, {len(extracted)} Zeichen")
     return extracted
 
 
@@ -2555,6 +2578,11 @@ if __name__ == "__main__":
                         help="Nur dieses Kapitel extrahieren, z.B. '4.2' oder '3'. "
                              "Sucht im OCR-Markdown nach der Überschrift und extrahiert das Kapitel "
                              "inkl. aller Unterkapitel bis zur nächsten gleichrangigen Überschrift.")
+    parser.add_argument("--from", dest="from_section", type=str, default=None,
+                        help="Nur mit --chapter: Extrahiere das Kapitel erst AB diesem Unterkapitel "
+                             "(z.B. --chapter 4 --from 4.2). Der Kapiteltitel bleibt erhalten; alles "
+                             "davor (Einleitung + frühere Unterkapitel wie 4.1) wird übersprungen, "
+                             "bis zum Kapitelende.")
     parser.add_argument("--no-summary", action="store_true",
                         help="Nur Übersetzung ausgeben – keine Zusammenfassung, kein ausgeblendeter Text, "
                              "kein interleaved-Dokument. Das Übersetzungs-Docx ist das finale Ergebnis.")
@@ -2580,6 +2608,9 @@ if __name__ == "__main__":
 
         if not os.path.exists(args.pdf_path):
             raise FileNotFoundError(f"Die Datei {args.pdf_path} wurde nicht gefunden.")
+
+        if args.from_section and not args.chapter:
+            raise ValueError("--from benötigt --chapter (z.B. --chapter 4 --from 4.2).")
 
         pdf_stem  = Path(args.pdf_path).stem
         doc_title = pdf_stem.replace('_', ' ')
@@ -2621,7 +2652,7 @@ if __name__ == "__main__":
 
         # --- Schritt 1b: Kapitel-Filter (optional) ---
         if args.chapter:
-            raw_md = extract_chapter(raw_md, args.chapter)
+            raw_md = extract_chapter(raw_md, args.chapter, from_section=args.from_section)
 
         # --- Schritt 2: Sprache prüfen & ggf. übersetzen ---
         # Übersetzt wird NUR, wenn Quell- und Zielsprache verschieden sind. Default-Ziel ist
