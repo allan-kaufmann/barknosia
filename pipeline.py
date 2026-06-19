@@ -533,7 +533,20 @@ def split_into_level1_chapters(text: str) -> list:
     if pre_split_lines and chapters:
         preamble_str = '\n'.join(pre_split_lines).strip()
         if preamble_str:
-            chapters[0]['full_text'] = preamble_str + '\n\n' + chapters[0]['full_text']
+            # Erste Überschriftenzeile im Vorspann = Kapitel-Root (z.B. "3 Analyse …").
+            _root_idx = next((k for k, ln in enumerate(pre_split_lines)
+                              if re.match(r'^#{1,6}\s', _html_re.sub('', ln).replace('**', ''))), None)
+            _root_body = '\n'.join(pre_split_lines[_root_idx + 1:]).strip() if _root_idx is not None else ''
+            if _root_idx is not None and len(_root_body) > 300:
+                # Kapitel-Root mit eigenem Einleitungstext → eigenes Kapitel, damit seine
+                # Zusammenfassung dem Root-Heading zugeordnet werden kann (sonst unsichtbar in Kap. 1).
+                _root_heading = re.sub(r'^#{1,6}\s+', '',
+                                       _html_re.sub('', pre_split_lines[_root_idx]).replace('**', '')).strip()
+                chapters.insert(0, {'heading': _root_heading,
+                                    'full_text': preamble_str,
+                                    'level': split_level - 1})
+            else:
+                chapters[0]['full_text'] = preamble_str + '\n\n' + chapters[0]['full_text']
 
     return chapters
 

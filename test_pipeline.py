@@ -1714,6 +1714,41 @@ def test_split_non_adaptive_no_regression():
     assert "Text B" in chapters[1]['full_text']
 
 
+def test_split_adaptive_substantial_intro_becomes_own_chapter():
+    """Kapitel-Root mit substanziellem Intro (>300 Zeichen) vor dem ersten Unterkapitel
+    wird ein eigenes führendes Kapitel (statt in Kap. 1 eingeschmolzen), damit seine
+    Zusammenfassung dem Root-Heading zugeordnet werden kann."""
+    intro = ("Unternehmen gestalten Lernprozesse systematisch. " * 12).strip()  # >300 Zeichen
+    md = (
+        "# 3 Analyse und Handlungsempfehlungen\n\n"
+        f"{intro}\n\n"
+        "## 3.1 Der Personalentwicklungszyklus\n\nText 3.1.\n\n"
+        "## 3.2 Bedarfsanalyse\n\nText 3.2."
+    )
+    chapters = split_into_level1_chapters(md)
+    assert chapters[0]['heading'] == "3 Analyse und Handlungsempfehlungen", \
+        f"Erstes Kapitel soll der Root sein, ist: {chapters[0]['heading']!r}"
+    assert intro[:40] in chapters[0]['full_text'], "Intro-Text muss im Root-Kapitel stecken"
+    # Unterkapitel folgen separat und enthalten den Intro NICHT mehr.
+    sub_headings = [c['heading'] for c in chapters[1:]]
+    assert any("3.1" in h for h in sub_headings) and any("3.2" in h for h in sub_headings)
+    assert intro[:40] not in chapters[1]['full_text'], \
+        "Intro darf nicht mehr doppelt in Kapitel 3.1 stecken"
+
+
+def test_split_adaptive_short_intro_still_folded():
+    """Kurzer Intro (<300 Zeichen) bleibt wie bisher in Kapitel 1 eingeschmolzen –
+    kein leeres/separates Root-Kapitel."""
+    md = (
+        "# 3 Analyse\n\nKurzer Intro.\n\n"
+        "## 3.1 Abschnitt\n\nText 3.1.\n\n"
+        "## 3.2 Abschnitt\n\nText 3.2."
+    )
+    chapters = split_into_level1_chapters(md)
+    assert len(chapters) == 2, f"Kein separates Root-Kapitel erwartet: {[c['heading'] for c in chapters]}"
+    assert "Kurzer Intro" in chapters[0]['full_text']
+
+
 # ---------------------------------------------------------------------------
 # Gruppe 40: _summarize_single_chapter – _required erfasst ### und ####
 # ---------------------------------------------------------------------------
