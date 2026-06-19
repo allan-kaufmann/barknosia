@@ -1317,7 +1317,7 @@ def test_summarize_chapter_by_sections_calls_per_section(tmp_path, monkeypatch):
     """Jede Level-2-Section bekommt einen eigenen _summarize_single_chapter-Call."""
     calls = []
 
-    def fake_summarize(heading, text):
+    def fake_summarize(heading, text, output_lang="de"):
         calls.append(heading)
         return f"## {heading}\n- Zusammenfassung."
 
@@ -1346,7 +1346,7 @@ def test_summarize_chapter_by_sections_preamble_included(tmp_path, monkeypatch):
     """Preamble-Text vor erster Section wird separat zusammengefasst."""
     calls = []
 
-    def fake_summarize(heading, text):
+    def fake_summarize(heading, text, output_lang="de"):
         calls.append(heading)
         return f"## {heading}\n- Summary."
 
@@ -1485,7 +1485,7 @@ def test_generate_summary_includes_preamble_in_first_chapter(tmp_path, monkeypat
     """Preamble-Text vor erstem nummerierten Heading landet im ersten Kapitel-Call."""
     captured_texts = []
 
-    def fake_summarize(heading, text):
+    def fake_summarize(heading, text, output_lang="de"):
         captured_texts.append(text)
         return f"## {heading}\n- Summary."
 
@@ -1510,7 +1510,7 @@ def test_generate_summary_no_preamble_unchanged(tmp_path, monkeypatch):
     """Text ohne Preamble (beginnt direkt mit nummiertem Heading) läuft normal durch."""
     captured_texts = []
 
-    def fake_summarize(heading, text):
+    def fake_summarize(heading, text, output_lang="de"):
         captured_texts.append(text)
         return f"## {heading}\n- Summary."
 
@@ -1825,7 +1825,7 @@ def test_generate_chunks_large_chapter(tmp_path, monkeypatch):
     """Ein Kapitel > 15.000 Zeichen mit ### Sections wird in mehrere Chunks aufgeteilt."""
     call_log = []
 
-    def fake_summarize(heading, text):
+    def fake_summarize(heading, text, output_lang="de"):
         call_log.append({'heading': heading, 'len': len(text)})
         return f"## {heading}\n- Summary."
 
@@ -1853,7 +1853,7 @@ def test_generate_chunks_small_chapter_single_call(tmp_path, monkeypatch):
     """Ein Kapitel < 15.000 Zeichen → genau ein API-Call."""
     call_log = []
 
-    def fake_summarize(heading, text):
+    def fake_summarize(heading, text, output_lang="de"):
         call_log.append(heading)
         return f"## {heading}\n- Summary."
 
@@ -1870,7 +1870,7 @@ def test_generate_chunks_all_sections_covered(tmp_path, monkeypatch):
     """Nach chunk-weiser Verarbeitung sind alle Section-Headings im kombinierten Output."""
     import re as _re
 
-    def fake_summarize(heading, text):
+    def fake_summarize(heading, text, output_lang="de"):
         found = _re.findall(r'^#{2,6}\s+(.+)$', text, _re.MULTILINE)
         lines = [f"### {h}\n- bullet" for h in found] if found else [f"## {heading}\n- bullet"]
         return "\n\n".join(lines)
