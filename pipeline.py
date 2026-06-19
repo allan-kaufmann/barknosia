@@ -246,27 +246,44 @@ def parse_qa_response(qa_text: str) -> list:
         except ValueError:
             continue
 
-        def _extract(pattern, text, default='–'):
-            m = re.search(pattern, text, re.MULTILINE | re.DOTALL)
-            if m:
-                return m.group(1).strip().split('\n')[0].strip()
-            return default
+        item = {'num': num}
+        item.update(_parse_qa_fields(block))
 
-        antwort     = _extract(r'^Antwort:\s*(.+?)(?=\n(?:Textgrundlage|Schlüsselbegriffe|Beleg|Abdeckung|$))', block)
-        textgr      = _extract(r'^Textgrundlage:\s*(.+)', block)
-        schluessel  = _extract(r'^Schlüsselbegriffe:\s*(.+)', block)
-        beleg       = _extract(r'^Beleg:\s*(.+)', block, default='')
-        abdeckung   = _extract(r'^Abdeckung:\s*(.+)', block)
+        # Unterpunkt-Modus: mehrere "**Label**"-Blöcke (fett, ohne Doppelpunkt), die jeweils
+        # eine eigene Antwort tragen (z.B. eine Frage mit aufgelisteten Methoden).
+        subs = []
+        label_matches = list(re.finditer(r'(?m)^\*\*\s*([^*:]+?)\s*\*\*\s*$', block))
+        for li, lm in enumerate(label_matches):
+            seg_start = lm.end()
+            seg_end = label_matches[li + 1].start() if li + 1 < len(label_matches) else len(block)
+            segment = block[seg_start:seg_end]
+            if re.search(r'^Antwort:', segment, re.MULTILINE):
+                sub = {'label': lm.group(1).strip()}
+                sub.update(_parse_qa_fields(segment))
+                subs.append(sub)
+        if len(subs) >= 2:
+            item['subs'] = subs
 
-        items.append({
-            'num': num,
-            'antwort': antwort,
-            'textgrundlage': textgr,
-            'schluessel': schluessel,
-            'beleg': beleg,
-            'abdeckung': abdeckung,
-        })
+        items.append(item)
     return items
+
+
+def _parse_qa_fields(text: str) -> dict:
+    """Extrahiert die QA-Standardfelder (Antwort/Textgrundlage/Schlüsselbegriffe/Beleg/Abdeckung)
+    aus einem Block- oder Unterpunkt-Segment."""
+    def _extract(pattern, default='–'):
+        m = re.search(pattern, text, re.MULTILINE | re.DOTALL)
+        if m:
+            return m.group(1).strip().split('\n')[0].strip()
+        return default
+
+    return {
+        'antwort':       _extract(r'^Antwort:\s*(.+?)(?=\n(?:Textgrundlage|Schlüsselbegriffe|Beleg|Abdeckung|$))'),
+        'textgrundlage': _extract(r'^Textgrundlage:\s*(.+)'),
+        'schluessel':    _extract(r'^Schlüsselbegriffe:\s*(.+)'),
+        'beleg':         _extract(r'^Beleg:\s*(.+)', default=''),
+        'abdeckung':     _extract(r'^Abdeckung:\s*(.+)'),
+    }
 
 
 def serialize_qa_items(items: list) -> str:
@@ -275,17 +292,26 @@ def serialize_qa_items(items: list) -> str:
     Inverse zu parse_qa_response() – wird nach der Nachbearbeitung (Schritt 5b) genutzt,
     damit der Downstream-Pfad (Doc-Builder ruft parse_qa_response erneut auf) unverändert läuft.
     """
+    def _fields(src: dict) -> list:
+        ls = [
+            f"**Antwort:** {src.get('antwort', '–')}",
+            f"**Textgrundlage:** {src.get('textgrundlage', '–')}",
+            f"**Schlüsselbegriffe:** {src.get('schluessel', '–')}",
+        ]
+        if src.get('beleg'):
+            ls.append(f"**Beleg:** {src['beleg']}")
+        ls.append(f"**Abdeckung:** {src.get('abdeckung', '–')}")
+        return ls
+
     blocks = []
     for it in items:
-        lines = [
-            f"**Frage {it['num']}**",
-            f"**Antwort:** {it.get('antwort', '–')}",
-            f"**Textgrundlage:** {it.get('textgrundlage', '–')}",
-            f"**Schlüsselbegriffe:** {it.get('schluessel', '–')}",
-        ]
-        if it.get('beleg'):
-            lines.append(f"**Beleg:** {it['beleg']}")
-        lines.append(f"**Abdeckung:** {it.get('abdeckung', '–')}")
+        lines = [f"**Frage {it['num']}**"]
+        if it.get('subs'):
+            for sub in it['subs']:
+                lines.append(f"**{sub.get('label', '–')}**")
+                lines.extend(_fields(sub))
+        else:
+            lines.extend(_fields(it))
         blocks.append('\n'.join(lines))
     return '\n\n'.join(blocks)
 
@@ -914,8 +940,14 @@ def verify_with_questions(summary_text: str, questions_path: str) -> str:
         "Schritt 2: Liste die Textstellen stichpunktartig auf.\n"
         "Schritt 3: Erst danach beantworte die Frage.\n\n"
         "Wenn keine passende Stelle existiert:\n'Im Dokument nicht enthalten'. Nicht raten.\n\n"
+        "Mehrteilige Fragen:\n"
+        "- Enthält eine Frage eine Aufzählung von Unterpunkten (z.B. mehrere Methoden/Begriffe, "
+        "oft mit 'o' oder '-' aufgelistet), beantworte JEDEN Unterpunkt EINZELN.\n"
+        "- Schreibe pro Unterpunkt zuerst seinen Namen als **fette Überschrift** in einer eigenen "
+        "Zeile, darunter das normale Antwortformat (Antwort/Textgrundlage/Schlüsselbegriffe/Beleg/"
+        "Abdeckung). Kein Unterpunkt darf fehlen.\n\n"
         "Antwortregeln:\n"
-        "- Maximal 3 Sätze pro Frage.\n"
+        "- Maximal 3 Sätze pro Frage bzw. pro Unterpunkt.\n"
         "- Keine Einleitung.\n"
         "- Keine Wiederholung der Frage.\n"
         "- Keine ausführlichen Erklärungen.\n"
@@ -970,7 +1002,16 @@ def rework_partial_answers(qa_text: str, working_text: str, questions_path: str 
       supplement_map: {normalize_heading(textgrundlage): [ergaenzungstext, ...]}
     """
     items = parse_qa_response(qa_text)
-    todo = [it for it in items if it.get('abdeckung', '').strip().lower() in _REWORK_LEVELS]
+    # Nacharbeits-Ziele: pro Unterpunkt eine Antwort-Einheit, sonst die Frage selbst.
+    # Jedes Ziel referenziert das Dict (Item oder Sub) direkt → In-Place-Update.
+    targets = []
+    for it in items:
+        if it.get('subs'):
+            for sub in it['subs']:
+                targets.append({'num': it['num'], 'label': sub.get('label', ''), 'd': sub})
+        else:
+            targets.append({'num': it['num'], 'label': '', 'd': it})
+    todo = [t for t in targets if t['d'].get('abdeckung', '').strip().lower() in _REWORK_LEVELS]
     if not todo:
         return qa_text, {}
 
@@ -1003,13 +1044,18 @@ def rework_partial_answers(qa_text: str, working_text: str, questions_path: str 
         return working_text  # Fallback: gesamtes Kapitel
 
     supplement_map: dict = {}
-    for it in todo:
-        context = _section_context(it.get('textgrundlage', ''))
-        q_text = questions_map.get(it['num'], '')
+    for t in todo:
+        d = t['d']
+        num, label = t['num'], t['label']
+        tag = f"Frage {num}" + (f" – {label}" if label else "")
+        context = _section_context(d.get('textgrundlage', ''))
+        q_text = questions_map.get(num, '')
+        if label:
+            q_text = f"{q_text}\nUnterpunkt: {label}".strip()
         prompt = (
             "Rolle:\nDu bist Lerncoach und Prüfer für Wirtschaftspsychologie.\n\n"
             "Situation:\nEine leseleitende Frage wurde anhand einer Zusammenfassung nur "
-            f"'{it.get('abdeckung')}' beantwortet. Prüfe den nachstehenden Originaltext und "
+            f"'{d.get('abdeckung')}' beantwortet. Prüfe den nachstehenden Originaltext und "
             "ergänze ausschließlich die fehlende, prüfungsrelevante Kerninformation.\n\n"
             "Regeln:\n"
             "- Maximal 3 Sätze.\n"
@@ -1017,8 +1063,8 @@ def rework_partial_answers(qa_text: str, working_text: str, questions_path: str 
             "- Keine Wiederholung der bereits vorhandenen Antwort.\n"
             f"- Wenn der Originaltext die Lücke nicht schließt, antworte exakt: {_NO_SUPPLEMENT_MARKER}\n\n"
             f"Frage:\n{q_text or '(Fragetext nicht verfügbar – siehe bisherige Antwort)'}\n\n"
-            f"Bisherige Antwort:\n{it.get('antwort', '')}\n\n"
-            f"Originaltext (Textgrundlage '{it.get('textgrundlage', '')}'):\n{context}"
+            f"Bisherige Antwort:\n{d.get('antwort', '')}\n\n"
+            f"Originaltext (Textgrundlage '{d.get('textgrundlage', '')}'):\n{context}"
         )
         try:
             response = call_gemini_with_retry(
@@ -1028,19 +1074,19 @@ def rework_partial_answers(qa_text: str, working_text: str, questions_path: str 
             )
             supplement = (response.text or '').strip()
         except Exception as e:
-            print(f"  Frage {it['num']}: Nacharbeit fehlgeschlagen ({e}) – unverändert.")
+            print(f"  {tag}: Nacharbeit fehlgeschlagen ({e}) – unverändert.")
             continue
 
         if not supplement or _NO_SUPPLEMENT_MARKER in supplement:
-            print(f"  Frage {it['num']}: keine Ergänzung im Originaltext gefunden.")
+            print(f"  {tag}: keine Ergänzung im Originaltext gefunden.")
             continue
 
-        it['antwort'] = f"{it.get('antwort', '').rstrip()} {supplement}".strip()
-        it['abdeckung'] = "vollständig durch Nachbearbeitung"
-        tg = it.get('textgrundlage', '')
+        d['antwort'] = f"{d.get('antwort', '').rstrip()} {supplement}".strip()
+        d['abdeckung'] = "vollständig durch Nachbearbeitung"
+        tg = d.get('textgrundlage', '')
         for key in {normalize_heading(tg), normalize_heading(tg.split('.')[-1])}:
             supplement_map.setdefault(key, []).append(supplement)
-        print(f"  Frage {it['num']}: ergänzt → vollständig durch Nachbearbeitung.")
+        print(f"  {tag}: ergänzt → vollständig durch Nachbearbeitung.")
 
     return serialize_qa_items(items), supplement_map
 
@@ -1216,6 +1262,26 @@ def normalize_heading(h: str) -> str:
     """Für Matching: Bold-/Italic-Marker entfernen, lowercase. Nummern bleiben für eindeutige Keys."""
     h = re.sub(r'\*+', '', h)   # strip ** und *
     return h.lower().strip()
+
+
+def _textgrundlage_keys(textgrundlage: str) -> set:
+    """Kandidat-Schlüssel für die Zuordnung einer QA-Textgrundlage zu einer Dokument-Sektion.
+
+    Eine Textgrundlage kann zusätzliche Details tragen (z.B.
+    '4.3.1 Simulationsbasiertes Training, • Wirkungsweise der Methode und Befunde').
+    Neben dem Volltext werden daher auch das erste Komma-/Bullet-Segment (die eigentliche
+    Überschrift) – mit und ohne führende Kapitelnummer – sowie der letzte Punkt-Teil als
+    Schlüssel erzeugt, damit das Matching zur Überschrift gelingt.
+    """
+    # Markdown-Links/HTML entfernen und übrig gebliebene eckige Klammern (OCR-Artefakt
+    # '[Blended Learning]' ohne URL) tilgen, damit der Schlüssel zur bereinigten Überschrift passt.
+    tg = _clean_heading_text(textgrundlage or '').replace('[', '').replace(']', '')
+    keys = {normalize_heading(tg), normalize_heading(tg.split('.')[-1])}
+    first = re.split(r'[,;•]', tg)[0].strip()
+    if first:
+        keys.add(normalize_heading(first))
+        keys.add(normalize_heading(re.sub(r'^[\d.]+\s*', '', first)))
+    return {k for k in keys if k}
 
 
 def normalize_heading_levels(text: str) -> str:
@@ -2053,14 +2119,27 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     # --- QA vorbereiten: Textgrundlage-Map für Kommentare ---
     has_qa = qa_text and qa_text.strip() not in ("", "Keine Leitfragen zur Prüfung übergeben.")
     qa_items = parse_qa_response(qa_text) if has_qa else []
-    qa_by_num: dict = {item['num']: item for item in qa_items}  # für Beleg-Verankerung
-    textgrundlage_map: dict = {}  # normalize_heading(textgrundlage) → [fragenummern]
+
+    # Antwort-Einheiten flach machen: pro Unterpunkt eine Einheit, sonst eine pro Frage.
+    # Jede Einheit trägt eigene Textgrundlage + Beleg → eigene Markierung im Originaltext.
+    qa_units: list = []
     for item in qa_items:
-        for key in [normalize_heading(item['textgrundlage']),
-                    normalize_heading(item['textgrundlage'].split('.')[-1])]:
+        if item.get('subs'):
+            for sub in item['subs']:
+                qa_units.append({'num': item['num'], 'label': sub.get('label', ''),
+                                 'textgrundlage': sub.get('textgrundlage', ''),
+                                 'beleg': sub.get('beleg', '')})
+        else:
+            qa_units.append({'num': item['num'], 'label': '',
+                             'textgrundlage': item.get('textgrundlage', ''),
+                             'beleg': item.get('beleg', '')})
+
+    textgrundlage_map: dict = {}  # normalize_heading(textgrundlage) → [qa_unit, ...]
+    for unit in qa_units:
+        for key in _textgrundlage_keys(unit['textgrundlage']):
             textgrundlage_map.setdefault(key, [])
-            if item['num'] not in textgrundlage_map[key]:
-                textgrundlage_map[key].append(item['num'])
+            if unit not in textgrundlage_map[key]:
+                textgrundlage_map[key].append(unit)
 
     comment_list: list = []   # [(comment_id, comment_text)]
     comment_id: list  = [0]  # mutable int-wrapper
@@ -2452,14 +2531,20 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             first_para = next((p for p in new_paras if p.text.strip()), None)
             last_para  = next((p for p in reversed(new_paras) if p.text.strip()), first_para)
 
-            # Word-Kommentar pro Frage – an der Beleg-Stelle verankert (Fallback: ganze Sektion)
+            # Word-Kommentar pro Antwort-Einheit (Frage bzw. Unterpunkt) – an der Beleg-Stelle
+            # verankert (Fallback: ganze Sektion). Mehrteilige Fragen erhalten so je Unterpunkt
+            # eine eigene Markierung.
             if first_para and textgrundlage_map:
-                q_nums = []
+                units = []
+                seen_u: set = set()
                 for k in match_keys:
-                    q_nums.extend(textgrundlage_map.get(k, []))
-                q_nums = sorted(set(q_nums))
-                for n in q_nums:
-                    beleg = (qa_by_num.get(n) or {}).get('beleg', '')
+                    for unit in textgrundlage_map.get(k, []):
+                        uid = id(unit)
+                        if uid not in seen_u:
+                            seen_u.add(uid)
+                            units.append(unit)
+                for unit in sorted(units, key=lambda u: (u['num'], u['label'])):
+                    beleg = unit.get('beleg', '')
                     target = _find_para_by_quote(new_paras, beleg) if beleg else None
                     start_p = target or first_para
                     end_p   = target or last_para
@@ -2467,19 +2552,30 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                     comment_id[0] += 1
                     _add_comment_range_start(start_p, cid)
                     _add_comment_range_end(end_p, cid)
-                    comment_list.append((cid, f'Frage {n}'))
+                    label = f" – {unit['label']}" if unit.get('label') else ""
+                    comment_list.append((cid, f"Frage {unit['num']}{label}"))
 
         if orig_body.strip():
             process_markdown_to_docx(doc, orig_body, hide_text=True, base_path=base_path)
 
     # --- Fragentext laden (optional) ---
+    # Mehrzeilige Fragen (mit aufgelisteten Unterpunkten) komplett erfassen: Folgezeilen
+    # bis zur nächsten nummerierten Frage bzw. Leerzeile gehören zur aktuellen Frage.
     questions_map: dict = {}
     if questions_path and os.path.exists(questions_path):
+        cur_q = None
         with open(questions_path, encoding='utf-8') as qf:
-            for line in qf:
-                qm = re.match(r'^(\d+)\.\s+(.+)', line.strip())
+            for raw in qf:
+                stripped = raw.strip()
+                qm = re.match(r'^(\d+)\.\s+(.+)', stripped)
                 if qm:
-                    questions_map[int(qm.group(1))] = qm.group(2)
+                    cur_q = int(qm.group(1))
+                    questions_map[cur_q] = qm.group(2).strip()
+                elif cur_q is not None:
+                    if stripped:
+                        questions_map[cur_q] += '\n' + stripped
+                    else:
+                        cur_q = None  # Leerzeile beendet die Frage
 
     # --- QA-Unterkapitel am Dokumentende ---
     if has_qa and qa_items:
@@ -2518,24 +2614,38 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             h_f = doc.add_heading(fq_hdg, level=q_sub_level)
             _set_heading_color(h_f, MM_HEADING_COLORS.get(q_sub_level, MM_HEADING_COLORS[9]))
 
-            # Fragetext anzeigen wenn verfügbar
+            # Fragetext anzeigen wenn verfügbar (mehrzeilig inkl. Unterpunkte)
             q_text = questions_map.get(item['num'])
             if q_text:
+                q_lines = q_text.split('\n')
                 p_q = doc.add_paragraph()
-                r_q = p_q.add_run(q_text)
-                r_q.bold = True
-                r_q.italic = True
+                for li, ql in enumerate(q_lines):
+                    r_q = p_q.add_run(ql)
+                    r_q.bold = True
+                    r_q.italic = True
+                    if li < len(q_lines) - 1:
+                        r_q.add_break()
 
-            doc.add_paragraph(item['antwort'])
+            def _qa_meta(src: dict):
+                meta = doc.add_paragraph()
+                r = meta.add_run(
+                    f"Quelle: {src.get('textgrundlage', '–')}  |  "
+                    f"Schlüsselbegriffe: {src.get('schluessel', '–')}  |  "
+                    f"Abdeckung: {src.get('abdeckung', '–')}"
+                )
+                r.font.size = Pt(9)
+                r.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
 
-            meta = doc.add_paragraph()
-            r = meta.add_run(
-                f"Quelle: {item['textgrundlage']}  |  "
-                f"Schlüsselbegriffe: {item['schluessel']}  |  "
-                f"Abdeckung: {item['abdeckung']}"
-            )
-            r.font.size = Pt(9)
-            r.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+            if item.get('subs'):
+                # Mehrteilige Frage: jeden Unterpunkt mit eigener Überschrift, Antwort und Meta.
+                for sub in item['subs']:
+                    p_lbl = doc.add_paragraph()
+                    p_lbl.add_run(sub.get('label', '')).bold = True
+                    doc.add_paragraph(sub.get('antwort', ''))
+                    _qa_meta(sub)
+            else:
+                doc.add_paragraph(item['antwort'])
+                _qa_meta(item)
 
     # --- Kommentare einbetten und speichern ---
     if comment_list:

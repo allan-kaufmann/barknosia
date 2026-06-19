@@ -395,6 +395,128 @@ def test_serialize_qa_items_roundtrip():
     assert reparsed[0]['textgrundlage'] == "1.1 Abschnitt"
 
 
+def _qa_with_subpoints():
+    return (
+        "Frage 42\n"
+        "**Simulationsbasiertes Training**\n"
+        "Antwort: Übung in realitätsnaher Umgebung.\n"
+        "Textgrundlage: 4.3.1 Simulationsbasiertes Training, • Wirkungsweise\n"
+        "Schlüsselbegriffe: Realitätstreue\n"
+        "Beleg: hohe Übereinstimmung zwischen Trainings- und Arbeitsumgebung\n"
+        "Abdeckung: vollständig\n\n"
+        "**Microlearning**\n"
+        "Antwort: Inhalte in kurzen Sequenzen.\n"
+        "Textgrundlage: 4.3.2 [Microlearning]\n"
+        "Schlüsselbegriffe: Mikroinhalte\n"
+        "Beleg: Inhalte stark verkürzt auf Mikroinhalte heruntergebrochen\n"
+        "Abdeckung: teilweise\n"
+    )
+
+
+def test_parse_qa_response_subpoints():
+    """Frage mit mehreren **Label**-Unterpunkten → item['subs'] mit je eigenen Feldern."""
+    items = parse_qa_response(_qa_with_subpoints())
+    assert len(items) == 1
+    subs = items[0].get('subs')
+    assert subs and len(subs) == 2
+    assert subs[0]['label'] == "Simulationsbasiertes Training"
+    assert subs[1]['label'] == "Microlearning"
+    assert subs[1]['abdeckung'] == "teilweise"
+    assert subs[0]['beleg'].startswith("hohe Übereinstimmung")
+
+
+def test_parse_qa_response_single_has_no_subs():
+    """Einzelantwort-Frage bleibt ohne 'subs' (Rückwärtskompatibilität)."""
+    qa = ("Frage 1\nAntwort: Eine Antwort.\nTextgrundlage: 1.1 X\n"
+          "Schlüsselbegriffe: A\nAbdeckung: vollständig\n")
+    items = parse_qa_response(qa)
+    assert 'subs' not in items[0]
+
+
+def test_serialize_qa_items_subpoints_roundtrip():
+    items = parse_qa_response(_qa_with_subpoints())
+    reparsed = parse_qa_response(serialize_qa_items(items))
+    subs = reparsed[0].get('subs')
+    assert subs and len(subs) == 2
+    assert [s['label'] for s in subs] == ["Simulationsbasiertes Training", "Microlearning"]
+    assert subs[1]['abdeckung'] == "teilweise"
+
+
+def test_rework_partial_answers_subpoint(monkeypatch):
+    """Nur der 'teilweise'-Unterpunkt wird nachgearbeitet, der andere bleibt unverändert."""
+    working = "## 4.3.2 Microlearning\nMicrolearning nutzt didaktische Reduktion stark.\n"
+
+    class FakeResp:
+        text = "Ein zentraler Mechanismus ist die didaktische Reduktion."
+    calls = []
+    monkeypatch.setattr('pipeline.call_gemini_with_retry',
+                        lambda **k: calls.append(k) or FakeResp())
+
+    new_qa, supplements = rework_partial_answers(_qa_with_subpoints(), working)
+    subs = parse_qa_response(new_qa)[0]['subs']
+    assert len(calls) == 1  # nur ein Unterpunkt war 'teilweise'
+    assert subs[0]['abdeckung'] == "vollständig"  # unverändert
+    assert subs[1]['abdeckung'] == "vollständig durch Nachbearbeitung"
+    assert "didaktische Reduktion" in subs[1]['antwort']
+
+
+def test_textgrundlage_keys_strips_brackets_and_detail():
+    """Schlüssel matchen auch bei Klammern und Zusatzdetail in der Textgrundlage."""
+    keys = pipeline._textgrundlage_keys("4.3.5 [Blended Learning], • Wirkungsweise")
+    assert "4.3.5 blended learning" in keys
+    assert "blended learning" in keys
+
+
+def test_build_interleaved_subpoints_answers_and_comments(tmp_path):
+    """Frage mit 2 Unterpunkten: beide Sub-Antworten erscheinen im Dokument und es werden
+    pro Unterpunkt eine Beleg-Markierung (Word-Kommentar) verankert."""
+    import zipfile
+    orig = (
+        "# 4 Methoden\n\nIntro.\n\n"
+        "## 4.1 Simulationsbasiertes Training\n\n"
+        "Eine hohe Übereinstimmung zwischen Trainings- und Arbeitsumgebung hilft.\n\n"
+        "## 4.2 Microlearning\n\n"
+        "Inhalte werden auf Mikroinhalte heruntergebrochen und kurz bereitgestellt.\n"
+    )
+    summ = (
+        "## 4.1 Simulationsbasiertes Training\n\n"
+        "Eine hohe Übereinstimmung zwischen Trainings- und Arbeitsumgebung hilft.\n\n"
+        "## 4.2 Microlearning\n\n"
+        "Inhalte werden auf Mikroinhalte heruntergebrochen und kurz bereitgestellt.\n"
+    )
+    qa = (
+        "Frage 42\n"
+        "**Simulationsbasiertes Training**\n"
+        "Antwort: Übung in realitätsnaher Umgebung.\n"
+        "Textgrundlage: 4.1 Simulationsbasiertes Training\n"
+        "Schlüsselbegriffe: Realitätstreue\n"
+        "Beleg: Eine hohe Übereinstimmung zwischen Trainings- und Arbeitsumgebung\n"
+        "Abdeckung: vollständig\n\n"
+        "**Microlearning**\n"
+        "Antwort: Inhalte in kurzen Sequenzen.\n"
+        "Textgrundlage: 4.2 Microlearning\n"
+        "Schlüsselbegriffe: Mikroinhalte\n"
+        "Beleg: Inhalte werden auf Mikroinhalte heruntergebrochen\n"
+        "Abdeckung: vollständig\n"
+    )
+    out = str(tmp_path / "out.docx")
+    build_interleaved_word_document(orig, summ, qa, out, parent_chapter="2.4.1.2",
+                                    extracted_chapter="4")
+    doc = Document(out)
+    texts = [p.text.strip() for p in doc.paragraphs]
+    # Beide Unterpunkt-Antworten im Lernfragen-Abschnitt sichtbar
+    assert any("Übung in realitätsnaher Umgebung" in t for t in texts)
+    assert any("Inhalte in kurzen Sequenzen" in t for t in texts)
+    # Beide Labels als eigene Absätze
+    assert "Simulationsbasiertes Training" in texts and "Microlearning" in texts
+    # Pro Unterpunkt ein Kommentar "Frage 42 – <Label>"
+    with zipfile.ZipFile(out) as z:
+        cx = z.read("word/comments.xml").decode("utf-8")
+    assert "Simulationsbasiertes Training" in cx
+    assert "Microlearning" in cx
+    assert cx.count("Frage 42") >= 2
+
+
 def test_normalize_quote_strips_markdown_and_case():
     assert _normalize_quote("**Hallo**  Welt") == "hallo welt"
     assert _normalize_quote('„Zitat"') == "zitat"
