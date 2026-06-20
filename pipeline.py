@@ -131,6 +131,26 @@ def _clean_heading_text(line: str) -> str:
     return text.strip()
 
 
+def strip_ocr_page_headers(text: str) -> str:
+    """Entfernt von Marker-OCR fälschlich als Überschrift gesetzte Seiten-Kolumnentitel
+    (laufende Kopf-/Fußzeilen) der Form '#### **316** | 4 Schritt 3: …'.
+
+    Erkennung: Heading-Zeile, deren bereinigter Text mit 'Seitenzahl |' beginnt
+    (^\\d{1,4}\\s*\\|). Eine Zahl direkt gefolgt von '|' ist das typische Kolumnentitel-
+    Muster und nie eine echte Kapitelüberschrift. Das Entfernen verhindert einen
+    vorzeitigen Abbruch der Kapitel-Extraktion (die Artefakt-Zahl wirkt sonst wie der
+    Beginn eines neuen Kapitels) und hält die Störzeilen aus allen Ausgaben heraus
+    (saubere Navigationsleiste). Arbeitet zeilenbasiert; alle übrigen Zeilen bleiben
+    unverändert.
+    """
+    out = []
+    for line in text.split('\n'):
+        if re.match(r'^#{1,6}\s', line) and re.match(r'^\d{1,4}\s*\|', _clean_heading_text(line)):
+            continue
+        out.append(line)
+    return '\n'.join(out)
+
+
 def extract_chapter(text: str, chapter_id: str, from_section: str = None,
                     to_section: str = None) -> str:
     """
@@ -198,9 +218,15 @@ def extract_chapter(text: str, chapter_id: str, from_section: str = None,
             m2 = re.match(r'^(#{1,6})\s', line)
             if m2:
                 clean2 = _clean_heading_text(line)
-                # Ende erst beim nächsten nummerierten Kapitel, das weder das Kapitel
-                # selbst noch ein Unterkapitel (chapter_id.x) ist.
-                if re.match(r'^\d', clean2) and not re.match(rf'^{escaped}(\.|\s|$)', clean2):
+                # Ende erst beim nächsten Heading mit echter Abschnittsnummer (z.B. '5 …'
+                # oder '4.7 …'), das weder das Kapitel selbst noch ein Unterkapitel
+                # (chapter_id.x) ist. KEIN Abbruch bei nummerierten Listen-Headings
+                # ('1. Vorphase' → '1.' ist keine Abschnittsnummer) oder bei OCR-Kolumnentitel-
+                # Resten ('316 | 4 Schritt 3 …') – beide würden sonst mitten im Kapitel
+                # (z.B. vor einer Abbildung) fälschlich beenden.
+                if re.match(r'^\d+(\.\d+)*(\s|$)', clean2) \
+                        and not re.match(r'^\d{1,4}\s*\|', clean2) \
+                        and not re.match(rf'^{escaped}(\.|\s|$)', clean2):
                     break
                 # Im label_mode: auch bei "Kapitel M" (M ≠ chapter_id) stoppen.
                 if label_mode and re.match(rf'^{_label_pat}\s+\d', clean2, re.IGNORECASE):
@@ -2816,6 +2842,15 @@ if __name__ == "__main__":
         raw_md = md_path.read_text(encoding="utf-8")
         # Bilder liegen im selben Ordner wie das OCR-Markdown → base_path für Bildauflösung.
         image_base = str(md_path.parent)
+
+        # OCR-Kolumnentitel ('#### **316** | 4 Schritt 3 …') früh entfernen: solche
+        # Artefakte würden sonst die Kapitel-Extraktion vorzeitig abbrechen (Seitenzahl
+        # wirkt wie neues Kapitel) und als Stör-Überschrift in der Navigationsleiste landen.
+        _lines_before = raw_md.count('\n') + 1
+        raw_md = strip_ocr_page_headers(raw_md)
+        _removed = _lines_before - (raw_md.count('\n') + 1)
+        if _removed > 0:
+            print(f"[OCR-CLEANUP] {_removed} Seiten-Kolumnentitel als Überschrift entfernt.")
 
         # --- Schritt 1a: Front-Matter überspringen (Impressum, Inhaltsverzeichnis) ---
         # Standardmäßig aktiv; Titel + Titelbild bleiben erhalten. Spart außerdem

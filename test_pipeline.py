@@ -50,6 +50,7 @@ from pipeline import (
     _rebase_chapter_number,
     extract_chapter,
     strip_front_matter,
+    strip_ocr_page_headers,
 )
 import pipeline
 
@@ -2440,6 +2441,106 @@ def test_extract_chapter_to_last_section_keeps_all():
     result = extract_chapter(_chap46_md(), "4.6", to_section="4.6.4")
     assert "4.6.4 Sonstiges" in result and "Sonstigestext" in result
     assert "4.7 Nächstes" not in result
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 33d: OCR-Kolumnentitel + robuste Kapitel-Ende-Erkennung
+# (Regression: fehlende Abbildungen durch Seiten-Kopf/Fuß-Artefakte)
+# ---------------------------------------------------------------------------
+
+def test_strip_ocr_page_headers_removes_running_header_keeps_content():
+    """'#### **316** | 4 Schritt 3: …' wird entfernt; echte Headings + Text bleiben."""
+    md = (
+        "## 4.6.3 Zielvereinbarungen\n\nFließtext.\n\n"
+        "#### **316** | 4 Schritt 3: Instrumente der Personalentwicklung\n\n"
+        "Weiterer Text.\n\n"
+        "## 4.6.4 Delegation\n"
+    )
+    out = strip_ocr_page_headers(md)
+    assert "316 | 4 Schritt 3" not in out
+    assert "| 4 Schritt 3" not in out
+    assert "4.6.3 Zielvereinbarungen" in out
+    assert "Fließtext." in out and "Weiterer Text." in out
+    assert "4.6.4 Delegation" in out
+
+
+def test_strip_ocr_page_headers_bare_number_pipe_form():
+    """Auch ohne **fett** (z.B. '#### 210 | …') wird der Kolumnentitel entfernt."""
+    md = "#### 210 | 4 Schritt 3: Instrumente\n\nText.\n"
+    out = strip_ocr_page_headers(md)
+    assert "210 | 4 Schritt 3" not in out
+    assert "Text." in out
+
+
+def test_strip_ocr_page_headers_keeps_real_headings_and_tables():
+    """Echte nummerierte Headings und normale Tabellenzeilen bleiben unangetastet."""
+    md = (
+        "# 4 Schritt 3\n\n## 4.6 Führung\n\n"
+        "| Spalte A | Spalte B |\n| --- | --- |\n| 1 | 2 |\n"
+    )
+    out = strip_ocr_page_headers(md)
+    assert out == md  # nichts entfernt
+
+
+def test_extract_chapter_keeps_image_after_ocr_header_artifact():
+    """Kernregression: ein Kolumnentitel-Artefakt vor einer Abbildung darf die Extraktion
+    nicht beenden – die Abbildung muss erhalten bleiben (nach Normalisierung)."""
+    md = (
+        "## 4.6 Führungsinstrumente\n\nIntro.\n\n"
+        "### 4.6.3 Zielvereinbarungen\n\nVor der Abbildung.\n\n"
+        "#### **316** | 4 Schritt 3: Instrumente der Personalentwicklung\n\n"
+        "![](_page_122_Figure_3.jpeg)\n\n"
+        "Text nach der Abbildung.\n\n"
+        "# 5 Nächstes Kapitel\n\nDanach.\n"
+    )
+    result = extract_chapter(strip_ocr_page_headers(md), "4.6")
+    assert "![](_page_122_Figure_3.jpeg)" in result
+    assert "Text nach der Abbildung." in result
+    assert "5 Nächstes Kapitel" not in result
+
+
+def test_extract_chapter_image_survives_with_to_section():
+    """Abbildung in 4.6.3 bleibt, 4.6.4 wird per --to ausgeschlossen (User-Szenario)."""
+    md = (
+        "## 4.6 Führungsinstrumente\n\nIntro.\n\n"
+        "### 4.6.3 Zielvereinbarungen\n\nVortext.\n\n"
+        "#### **316** | 4 Schritt 3: Instrumente der Personalentwicklung\n\n"
+        "![](_page_122_Figure_3.jpeg)\n\nNachtext.\n\n"
+        "### 4.6.4 Delegation\n\nDelegationstext.\n"
+    )
+    result = extract_chapter(strip_ocr_page_headers(md), "4.6", to_section="4.6.3")
+    assert "![](_page_122_Figure_3.jpeg)" in result
+    assert "4.6.4 Delegation" not in result and "Delegationstext" not in result
+
+
+def test_extract_chapter_numbered_list_heading_does_not_terminate():
+    """Nummeriertes Listen-Heading ('## 1. Vorphase') innerhalb eines Kapitels beendet
+    die Extraktion NICHT (nur echte Abschnittsnummern wie '5 …' tun das)."""
+    md = (
+        "# 4 Vorgehen\n\nIntro.\n\n"
+        "## 4.3 Teamentwicklung\n\nText.\n\n"
+        "## 1. Vorphase\n\nVorphasentext.\n\n"
+        "## 2. Teamentwicklung\n\nMehr Text.\n\n"
+        "# 5 Fallbeispiele\n\nDanach.\n"
+    )
+    result = extract_chapter(md, "4")
+    assert "1. Vorphase" in result and "Vorphasentext" in result
+    assert "2. Teamentwicklung" in result
+    assert "5 Fallbeispiele" not in result and "Danach." not in result
+
+
+def test_extract_chapter_real_next_chapter_still_terminates():
+    """Regression: echte Folgekapitel ('# 5 …' und Geschwister '## 4.7 …') beenden weiter."""
+    md = (
+        "## 4.6 Führung\n\nText.\n\n"
+        "### 4.6.1 Sub\n\nSubtext.\n\n"
+        "## 4.7 Nächstes\n\nNachbar.\n\n"
+        "# 5 Ende\n\nEndtext.\n"
+    )
+    result = extract_chapter(md, "4.6")
+    assert "4.6.1 Sub" in result and "Subtext" in result
+    assert "4.7 Nächstes" not in result and "Nachbar" not in result
+    assert "5 Ende" not in result
 
 
 # ---------------------------------------------------------------------------
