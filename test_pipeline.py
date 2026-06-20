@@ -51,6 +51,9 @@ from pipeline import (
     extract_chapter,
     strip_front_matter,
     strip_ocr_page_headers,
+    _CAPTION_RE,
+    _textfigure_visible_lines,
+    audit_figure_captions,
 )
 import pipeline
 
@@ -2541,6 +2544,110 @@ def test_extract_chapter_real_next_chapter_still_terminates():
     assert "4.6.1 Sub" in result and "Subtext" in result
     assert "4.7 Nächstes" not in result and "Nachbar" not in result
     assert "5 Ende" not in result
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 33e: Caption-Erkennung, Text-Figuren-Sichtbarkeit, Abbildungs-Audit
+# (Regression: 'Abb. N'/'Tab. N' wurden im Embed-Modus ausgeblendet)
+# ---------------------------------------------------------------------------
+
+def test_caption_re_matches_abbreviated_and_full_forms():
+    """Abgekürzte und volle Captions (auch fett/als Bullet) werden erkannt."""
+    for s in ["Abb. 42: Leitfragen", "Tab. 45: Arten", "**Abb. 42:** Titel",
+              "**Tab. 45:** Arten von Zielen", "Abbildung 43: Theorie", "Tabelle 42",
+              "Figure 3", "Fig. 2: x", "- Abb. 7: Skizze"]:
+        assert _CAPTION_RE.match(s), f"sollte Caption sein: {s!r}"
+
+
+def test_caption_re_rejects_false_positives():
+    """Normale Wörter, die zufällig mit Tab/Abb/Table beginnen, sind keine Captions."""
+    for s in ["Tabletten gegen Kopfschmerzen", "Abbau von Stress",
+              "Tabular sheet", "Table of contents", "Figurative Sprache"]:
+        assert not _CAPTION_RE.match(s), f"sollte KEINE Caption sein: {s!r}"
+
+
+def test_textfigure_visible_lines_surfaces_box_up_to_caption():
+    """Text-Figur (Caption ohne Bild) mit passender Intro-Überschrift: gesamter Kasten von
+    der Intro-Überschrift bis zur Caption wird sichtbar markiert."""
+    md = (
+        "### 4.6.2 Mitarbeitergespräche\n"
+        "Prosa vor der Figur.\n"
+        "#### Leitfragen zur Vorbereitung\n"
+        "Intro zur Grafik.\n"
+        "- Welche Ziele verfolgt sie?\n"
+        "#### Gemeinsame Fragen\n"
+        "- Was sind unsere Ziele?\n"
+        "Abb. 42: Leitfragen zur Vorbereitung\n"
+        "### 4.6.3 Zielvereinbarungen\n"
+        "Weiter im Kapitel.\n"
+    )
+    lines = md.split('\n')
+    vis = _textfigure_visible_lines(lines)
+    text = lambda k: lines[k]
+    # Intro-Heading bis Caption sichtbar
+    assert any("Leitfragen zur Vorbereitung" in text(k) and k in vis for k in range(len(lines)))
+    assert any(text(k).startswith("Abb. 42") and k in vis for k in range(len(lines)))
+    assert any("Welche Ziele verfolgt sie" in text(k) and k in vis for k in range(len(lines)))
+    # Kapitel-Prosa NICHT sichtbar
+    prosa = next(k for k, l in enumerate(lines) if l == "Prosa vor der Figur.")
+    weiter = next(k for k, l in enumerate(lines) if l == "Weiter im Kapitel.")
+    assert prosa not in vis and weiter not in vis
+    # nummerierte Kapitelüberschriften nicht eingezogen
+    assert next(k for k, l in enumerate(lines) if l.startswith("### 4.6.2")) not in vis
+
+
+def test_textfigure_visible_lines_caption_only_without_intro():
+    """Ohne passende Intro-Überschrift (z.B. Tabellen-Caption) bleibt nur die Caption-Zeile
+    sichtbar – keine umgebende Kapitel-Prosa wird aufgebläht."""
+    md = (
+        "### 4.6.3 Zielvereinbarungen\n"
+        "Viel Kapitel-Prosa hier.\n"
+        "| A | B |\n| - | - |\n| 1 | 2 |\n"
+        "**Tab. 45:** Arten von Zielen\n"
+        "Weitere Prosa.\n"
+    )
+    lines = md.split('\n')
+    vis = _textfigure_visible_lines(lines)
+    cap = next(k for k, l in enumerate(lines) if l.startswith("**Tab. 45"))
+    prosa = next(k for k, l in enumerate(lines) if l == "Viel Kapitel-Prosa hier.")
+    assert cap in vis
+    assert prosa not in vis
+
+
+def test_audit_figure_captions_flags_text_only(capsys):
+    """Audit meldet Captions ohne Grafik als 'nur Text' und zählt Bild/Tabelle korrekt."""
+    md = (
+        "### 4.6.2 Gespräche\n"
+        "#### Leitfragen zur Vorbereitung\n"
+        "- Frage 1?\n"
+        "Abb. 42: Leitfragen zur Vorbereitung\n"
+        "### 4.6.3 Ziele\n"
+        "| A | B |\n| - | - |\n"
+        "**Tab. 45:** Arten von Zielen\n"
+    )
+    res = audit_figure_captions(md, base_path=None)
+    assert res['counts']['text'] == 1
+    assert res['counts']['table'] == 1
+    assert any("Abb. 42" in c for c in res['text_only'])
+    out = capsys.readouterr().out
+    assert "[ABBILDUNG]" in out
+    assert "nur als Text" in out
+
+
+def test_audit_figure_captions_image_counts_as_covered(tmp_path):
+    """Eine Caption mit vorhandenem, nicht-dekorativem Bild zählt als 'image', nicht 'text'."""
+    # echtes, ausreichend großes Bild erzeugen (nicht dekorativ)
+    from PIL import Image
+    img = tmp_path / "fig.png"
+    Image.new("RGB", (400, 300), "white").save(img)
+    md = (
+        "### 4.6.3 Ziele\n"
+        "![](fig.png)\n"
+        "**Abb. 43:** Theorie der Zielsetzung\n"
+    )
+    res = audit_figure_captions(md, base_path=str(tmp_path))
+    assert res['counts']['image'] == 1
+    assert res['counts']['text'] == 0
 
 
 # ---------------------------------------------------------------------------

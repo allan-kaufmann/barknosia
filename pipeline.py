@@ -1765,10 +1765,124 @@ def _is_decorative_image(img_path: str, min_px: int = 100) -> bool:
 
 
 _CAPTION_RE = re.compile(
-    r'^(\*\*)?(TABELLE|Tabelle|ABBILDUNG|Abbildung|TABLE|FIGURE|Figure|Abb\.|Tab\.)\b',
+    r'^\**\s*(?:[-•*]\s+)?\**\s*'
+    r'(?:Tabelle|Abbildung|Tab\.|Abb\.|Table|Figure|Fig\.)\s*(?:\d|:)',
     re.IGNORECASE
 )
 _HRULE_RE = re.compile(r'^-{3,}$|^\*{3,}$|^_{3,}$')
+
+
+_CAPTION_TITLE_RE = re.compile(
+    r'^\**\s*(?:[-•*]\s+)?\**\s*'
+    r'(?:Tabelle|Abbildung|Tab\.|Abb\.|Table|Figure|Fig\.)\s*\d*\s*[:.\-–)]?\s*(.*)',
+    re.IGNORECASE
+)
+
+
+def _textfigure_visible_lines(lines: list) -> set:
+    """Zeilen-Indizes, die zu einer *Text-Figur* gehören und im Embed-Modus (hide_text=True)
+    sichtbar bleiben sollen – analog zu Bild-/Tabellen-Figuren.
+
+    Hintergrund: Marker klassifiziert manche Abbildungen (z.B. Leitfragen-Kästen) als Text
+    statt als Bild. Solche Figuren haben eine Caption ('Abb. N: TITEL'), aber kein '![](…)'.
+    Ohne Sonderbehandlung verschwindet ihr Inhalt im ausgeblendeten Originaltext.
+
+    Vorgehen je Caption: Der sichtbare Block reicht von der zugehörigen Intro-Überschrift bis
+    zur Caption. Die Intro-Überschrift wird über Titel-Abgleich gefunden (Heading-Text ≈
+    Caption-Titel) – das ist das robuste Signal für genau den Figur-Kasten. Die Rückwärtssuche
+    stoppt an einem Bild oder einer nummerierten Kapitelüberschrift. Ohne passende Intro-
+    Überschrift bleibt nur die Caption-Zeile selbst sichtbar (kein Aufblähen der Kapitel-Prosa).
+    """
+    n = len(lines)
+
+    def is_heading(k):
+        return bool(re.match(r'^#{1,6}\s', lines[k]))
+
+    def is_image(k):
+        return bool(re.match(r'^\s*!\[[^\]]*\]\([^)]+\)\s*$', lines[k]))
+
+    visible = set()
+    for i, line in enumerate(lines):
+        if not _CAPTION_RE.match(line.strip()):
+            continue
+        m = _CAPTION_TITLE_RE.match(re.sub(r'<[^>]+>', '', line.strip()))
+        title = (m.group(1) if m else '').strip().strip('*').strip().lower()
+        start = i  # Fallback: nur die Caption-Zeile
+        j = i - 1
+        while j >= 0:
+            if is_image(j):
+                break
+            if is_heading(j):
+                hc = _clean_heading_text(lines[j]).lower()
+                if re.match(r'^\d', hc):
+                    break  # nummerierte Kapitelüberschrift = Grenze
+                if len(title) >= 8 and (hc in title or title in hc):
+                    start = j  # passende Intro-Überschrift gefunden
+                    break
+            j -= 1
+        visible.update(range(start, i + 1))
+    return visible
+
+
+def audit_figure_captions(text: str, base_path: str = None) -> dict:
+    """Prüft, ob zu jeder Abbildungs-/Tabellen-Caption eine sichtbare Abbildung gehört, und
+    gibt eine Warnung aus, falls Captions nur als Text (ohne Grafik) vorliegen oder ein
+    referenziertes Bild fehlt. Verhindert, dass unbemerkt Abbildungen fehlen.
+
+    Zuordnung je Caption über ihre Heading-Sektion: enthält die Sektion ein vorhandenes,
+    nicht-dekoratives Bild → 'image'; eine Tabelle → 'table'; ein referenziertes Bild, dessen
+    Datei fehlt → 'missing'; sonst 'text' (Text-Figur – Inhalt sichtbar, aber keine Grafik).
+    """
+    lines = text.split('\n')
+    head_idx = [i for i, l in enumerate(lines) if re.match(r'^#{1,6}\s', l)]
+    bounds = head_idx + [len(lines)]
+
+    def section_of(line_no):
+        # Body der Heading-Sektion, die line_no enthält (oder Gesamttext, falls kein Heading)
+        prev = [h for h in head_idx if h <= line_no]
+        if not prev:
+            return lines
+        s = prev[-1]
+        e = bounds[head_idx.index(s) + 1]
+        return lines[s:e]
+
+    counts = {'image': 0, 'table': 0, 'text': 0, 'missing': 0}
+    text_only, missing = [], []
+    for i, line in enumerate(lines):
+        if not _CAPTION_RE.match(line.strip()):
+            continue
+        body = section_of(i)
+        status = 'text'
+        for b in body:
+            im = re.match(r'^\s*!\[[^\]]*\]\(([^)]+)\)\s*$', b)
+            if im:
+                rel = im.group(1)
+                path = os.path.join(base_path, rel) if base_path else rel
+                if os.path.exists(path) and not _is_decorative_image(path):
+                    status = 'image'
+                    break
+                status = 'missing'
+            elif b.strip().startswith('|') and status != 'image':
+                status = 'table'
+        counts[status] += 1
+        cap = re.sub(r'<[^>]+>', '', line.strip())[:70]
+        if status == 'text':
+            text_only.append(cap)
+        elif status == 'missing':
+            missing.append(cap)
+
+    total = sum(counts.values())
+    if total:
+        msg = (f"[ABBILDUNG] {total} Caption(s): {counts['image']} mit Bild, "
+               f"{counts['table']} mit Tabelle, {counts['text']} nur Text")
+        if counts['missing']:
+            msg += f", {counts['missing']} Bild FEHLT"
+        print(msg)
+        for cap in missing:
+            print(f"    [!] Bilddatei fehlt: {cap}")
+        for cap in text_only:
+            print(f"    [i] nur als Text vorhanden (keine Grafik): {cap}")
+    return {'counts': counts, 'text_only': text_only, 'missing': missing}
 
 
 def _hide_paragraph(p, indent_cm: float = 1.5):
@@ -1814,6 +1928,8 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None,
         block_text = _clean_for_hidden(block_text)
 
     lines = block_text.split('\n')
+    # Text-Figuren (Caption ohne Bild) bleiben auch im Hidden-Block sichtbar – wie Bild-Figuren.
+    textfig_visible = _textfigure_visible_lines(lines) if hide_text else set()
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -1864,9 +1980,9 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None,
             i += 1
             continue
 
-        # Abbildungs-/Tabellenbeschriftungen nie ausblenden
+        # Abbildungs-/Tabellenbeschriftungen nie ausblenden; Text-Figuren-Inhalt sichtbar lassen
         is_caption = bool(_CAPTION_RE.match(stripped))
-        do_hide = hide_text and not is_caption
+        do_hide = hide_text and not is_caption and i not in textfig_visible
 
         # ── Sub-Bullets (2+ führende Leerzeichen, Strich/Stern) ──
         sub_m = re.match(r'^(\s{2,})([-*])\s+(.+)', line)
@@ -2171,6 +2287,9 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
       automatisch berechnet, z.B. '4.2.1.2' → 5).
     """
     print(f"--- Erstelle interleaved Word-Dokument -> {output_path} ---")
+
+    # Audit: Abbildungen/Tabellen-Captions auf sichtbare Abbildung prüfen (Warnung bei Lücken).
+    audit_figure_captions(translated_text, base_path=base_path)
 
     # Elternkapitel-Logik
     if parent_chapter:
