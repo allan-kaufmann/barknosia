@@ -2383,6 +2383,66 @@ def test_extract_chapter_from_none_unchanged():
 
 
 # ---------------------------------------------------------------------------
+# Gruppe 33c: extract_chapter --to (Teilkapitel bis einschließlich Unterkapitel)
+# ---------------------------------------------------------------------------
+
+def _chap46_md():
+    return (
+        "# 4.6 Führungsbezogene Personalentwicklungsinstrumente\n\nEinleitung 4.6.\n\n"
+        "## 4.6.1 Coaching\n\nCoachingtext.\n\n"
+        "## 4.6.2 Mentoring\n\nMentoringtext.\n\n"
+        "## 4.6.3 Feedback\n\nFeedbacktext.\n\n"
+        "### 4.6.3.1 360-Grad\n\n360-Text.\n\n"
+        "## 4.6.4 Sonstiges\n\nSonstigestext.\n\n"
+        "# 4.7 Nächstes\n\nNächstestext.\n"
+    )
+
+
+def test_extract_chapter_to_keeps_up_to_section_inclusive_with_subsections():
+    """--chapter 4.6 --to 4.6.3: 4.6.1–4.6.3 inkl. 4.6.3.1 bleiben, 4.6.4 entfällt,
+    4.7 ohnehin außerhalb."""
+    result = extract_chapter(_chap46_md(), "4.6", to_section="4.6.3")
+    assert "4.6 Führungsbezogene" in result          # Kapiteltitel bleibt
+    assert "4.6.1 Coaching" in result and "Coachingtext" in result
+    assert "4.6.2 Mentoring" in result
+    assert "4.6.3 Feedback" in result and "Feedbacktext" in result
+    assert "4.6.3.1 360-Grad" in result and "360-Text" in result  # Unterkapitel von 4.6.3 bleibt
+    assert "4.6.4 Sonstiges" not in result and "Sonstigestext" not in result
+    assert "4.7 Nächstes" not in result
+
+
+def test_extract_chapter_to_not_found_raises():
+    """--to auf ein nicht vorhandenes/außerhalb liegendes Unterkapitel → ValueError."""
+    with pytest.raises(ValueError):
+        extract_chapter(_chap46_md(), "4.6", to_section="4.6.9")
+
+
+def test_extract_chapter_from_and_to_combined():
+    """--from 4.6.2 --to 4.6.3: nur 4.6.2 und 4.6.3 (inkl. 4.6.3.1), Titel bleibt,
+    4.6.1 und 4.6.4 entfallen."""
+    result = extract_chapter(_chap46_md(), "4.6", from_section="4.6.2", to_section="4.6.3")
+    assert "4.6 Führungsbezogene" in result          # Titel bleibt
+    assert "4.6.1 Coaching" not in result and "Coachingtext" not in result
+    assert "4.6.2 Mentoring" in result and "Mentoringtext" in result
+    assert "4.6.3 Feedback" in result and "Feedbacktext" in result
+    assert "4.6.3.1 360-Grad" in result
+    assert "4.6.4 Sonstiges" not in result
+
+
+def test_extract_chapter_to_none_unchanged():
+    """to_section=None → identisches Verhalten wie ohne den Parameter (Regressionsschutz)."""
+    md = _chap46_md()
+    assert extract_chapter(md, "4.6", to_section=None) == extract_chapter(md, "4.6")
+
+
+def test_extract_chapter_to_last_section_keeps_all():
+    """--to auf das letzte Unterkapitel des Kapitels ändert nichts am Kapitelende."""
+    result = extract_chapter(_chap46_md(), "4.6", to_section="4.6.4")
+    assert "4.6.4 Sonstiges" in result and "Sonstigestext" in result
+    assert "4.7 Nächstes" not in result
+
+
+# ---------------------------------------------------------------------------
 # Gruppe 34: Tail-Normalisierung + Level-2+-Heading-Behandlung im Einbette-Modus
 # ---------------------------------------------------------------------------
 

@@ -131,7 +131,8 @@ def _clean_heading_text(line: str) -> str:
     return text.strip()
 
 
-def extract_chapter(text: str, chapter_id: str, from_section: str = None) -> str:
+def extract_chapter(text: str, chapter_id: str, from_section: str = None,
+                    to_section: str = None) -> str:
     """
     Extrahiert ein bestimmtes Kapitel (inkl. aller Unterkapitel) aus einem Markdown-Text.
     chapter_id: z.B. '4.2' oder '1' — robuste Erkennung auch bei HTML-Tags in Überschriften.
@@ -144,6 +145,11 @@ def extract_chapter(text: str, chapter_id: str, from_section: str = None) -> str
     Der Kapiteltitel bleibt erhalten, alles davor (Einleitung + frühere Unterkapitel wie 4.1)
     wird übersprungen – der Rest läuft bis zum Kapitelende. Nur sinnvoll mit chapter_id als
     Oberkapitel (z.B. chapter_id='4', from_section='4.2').
+
+    to_section (optional, z.B. '4.6.3'): Extrahiere das Kapitel nur BIS EINSCHLIESSLICH dieses
+    Unterkapitels. Die eigenen Unterkapitel von to_section (z.B. '4.6.3.1') bleiben erhalten;
+    erst beim nächsten gleichrangigen Kapitel (z.B. '4.6.4') wird abgeschnitten. Kombinierbar
+    mit from_section (z.B. chapter_id='4.6', from_section='4.6.1', to_section='4.6.3').
     """
     escaped = re.escape(chapter_id)
     _label_pat = r'(?:Kapitel|Chapter|Teil|Abschnitt)'
@@ -202,6 +208,25 @@ def extract_chapter(text: str, chapter_id: str, from_section: str = None) -> str
                         break
         result.append(line)
 
+    # Optional: nur bis einschließlich eines bestimmten Unterkapitels (inkl. dessen Unterkapitel).
+    if to_section:
+        ts_esc = re.escape(to_section)
+        ts_idx = next((j for j, line in enumerate(result)
+                       if re.match(r'^#{1,6}\s', line)
+                       and re.match(rf'^{ts_esc}(\s|$)', _clean_heading_text(line))), None)
+        if ts_idx is None:
+            raise ValueError(f"--to '{to_section}' nicht innerhalb von Kapitel "
+                             f"'{chapter_id}' gefunden (oder liegt außerhalb der Kapitelgrenzen).")
+        # Ende beim ersten Heading nach to_section, das weder to_section selbst noch
+        # ein Unterkapitel davon (to_section.x) ist – z.B. '4.6.4' nach '4.6.3'.
+        end_idx = len(result)
+        for j in range(ts_idx + 1, len(result)):
+            if re.match(r'^#{1,6}\s', result[j]) and \
+                    not re.match(rf'^{ts_esc}(\.|\s|$)', _clean_heading_text(result[j])):
+                end_idx = j
+                break
+        result = result[:end_idx]
+
     # Optional: erst ab einem bestimmten Unterkapitel beginnen (Titel bleibt erhalten).
     if from_section:
         fs_esc = re.escape(from_section)
@@ -220,7 +245,8 @@ def extract_chapter(text: str, chapter_id: str, from_section: str = None) -> str
         result = head + result[fs_idx:]
 
     extracted = '\n'.join(result)
-    _label = f"'{chapter_id}'" + (f" ab '{from_section}'" if from_section else "")
+    _label = f"'{chapter_id}'" + (f" ab '{from_section}'" if from_section else "") \
+                               + (f" bis '{to_section}'" if to_section else "")
     print(f"[KAPITEL] {_label} extrahiert: {len(result)} Zeilen, {len(extracted)} Zeichen")
     return extracted
 
@@ -2725,6 +2751,12 @@ if __name__ == "__main__":
                              "(z.B. --chapter 4 --from 4.2). Der Kapiteltitel bleibt erhalten; alles "
                              "davor (Einleitung + frühere Unterkapitel wie 4.1) wird übersprungen, "
                              "bis zum Kapitelende.")
+    parser.add_argument("--to", dest="to_section", type=str, default=None,
+                        help="Nur mit --chapter: Extrahiere das Kapitel nur BIS EINSCHLIESSLICH "
+                             "diesem Unterkapitel (z.B. --chapter 4.6 --to 4.6.3). Dessen eigene "
+                             "Unterkapitel (z.B. 4.6.3.1) bleiben erhalten; ab dem nächsten "
+                             "gleichrangigen Kapitel (z.B. 4.6.4) wird abgeschnitten. Kombinierbar "
+                             "mit --from.")
     parser.add_argument("--no-summary", action="store_true",
                         help="Nur Übersetzung ausgeben – keine Zusammenfassung, kein ausgeblendeter Text, "
                              "kein interleaved-Dokument. Das Übersetzungs-Docx ist das finale Ergebnis.")
@@ -2753,6 +2785,9 @@ if __name__ == "__main__":
 
         if args.from_section and not args.chapter:
             raise ValueError("--from benötigt --chapter (z.B. --chapter 4 --from 4.2).")
+
+        if args.to_section and not args.chapter:
+            raise ValueError("--to benötigt --chapter (z.B. --chapter 4.6 --to 4.6.3).")
 
         pdf_stem  = Path(args.pdf_path).stem
         doc_title = pdf_stem.replace('_', ' ')
@@ -2794,7 +2829,8 @@ if __name__ == "__main__":
 
         # --- Schritt 1b: Kapitel-Filter (optional) ---
         if args.chapter:
-            raw_md = extract_chapter(raw_md, args.chapter, from_section=args.from_section)
+            raw_md = extract_chapter(raw_md, args.chapter, from_section=args.from_section,
+                                     to_section=args.to_section)
 
         # --- Schritt 2: Sprache prüfen & ggf. übersetzen ---
         # Übersetzt wird NUR, wenn Quell- und Zielsprache verschieden sind. Default-Ziel ist
