@@ -1284,6 +1284,25 @@ def _textgrundlage_keys(textgrundlage: str) -> set:
     return {k for k in keys if k}
 
 
+def _remap_textgrundlage(textgrundlage: str, renumber: dict) -> str:
+    """Ersetzt die (Original-)Kapitelnummer einer QA-Textgrundlage durch die finale
+    Dokumentnummer aus `renumber` (Original-Schlüssel → neue Nummer), damit die in den
+    Lernfragen angezeigte 'Quelle' im Dokument navigierbar ist. Ohne Treffer unverändert.
+    """
+    if not renumber or not textgrundlage:
+        return textgrundlage
+    cand = _textgrundlage_keys(textgrundlage)
+    # Nummern-tragende Schlüssel zuerst (eindeutiger), dann Titel-Schlüssel.
+    ordered = sorted(cand, key=lambda k: (0 if re.search(r'\d', k) else 1, k))
+    for k in ordered:
+        if k in renumber:
+            new_num = renumber[k]
+            if re.match(r'^\s*[\d.]+', textgrundlage):
+                return re.sub(r'^\s*[\d.]+', new_num, textgrundlage, count=1)
+            return f"{new_num} {textgrundlage}".strip()
+    return textgrundlage
+
+
 def normalize_heading_levels(text: str) -> str:
     """
     Normalisiert inkonsistente Markdown-Überschriftenebenen.
@@ -2134,6 +2153,10 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                              'textgrundlage': item.get('textgrundlage', ''),
                              'beleg': item.get('beleg', '')})
 
+    # Original-Kapitelnummer → neue (rebasierte) Nummer im Dokument. Wird im Sektions-Loop
+    # gefüllt und remappt die in der QA angezeigte "Quelle" auf eine im Dokument navigierbare Nummer.
+    tg_renumber: dict = {}
+
     textgrundlage_map: dict = {}  # normalize_heading(textgrundlage) → [qa_unit, ...]
     for unit in qa_units:
         for key in _textgrundlage_keys(unit['textgrundlage']):
@@ -2335,6 +2358,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
 
         clean_heading = _clean_heading_text(heading)
         lookup_key = normalize_heading(clean_heading)  # vor Präfix-Addition für Lookups
+        orig_clean_heading = clean_heading  # Originalüberschrift (vor Rebase) für Quellen-Remapping
 
         if skip_references and _is_skip_heading(clean_heading):
             continue
@@ -2445,6 +2469,13 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                     clean_heading = f"{_auto_parent}.{_auto_counter} {clean_heading}"
                 _dots = clean_heading.split()[0].count('.')
                 display_level = min(_dots + 2, 9)
+
+        # Quellen-Remapping: Original-Überschrift (Schlüssel) → finale Dokumentnummer.
+        # clean_heading trägt hier bereits die rebasierte/aufgebaute Nummer.
+        _newnum_m = re.match(r'^([\d.]+)', clean_heading)
+        if _newnum_m:
+            for _k in _textgrundlage_keys(orig_clean_heading):
+                tg_renumber.setdefault(_k, _newnum_m.group(1))
 
         # Scoped lookup: Sub-Sections (freq>1, wiederkehrend) unter der aktuellen Kompetenz.
         # Verhindert dass sum_lookup["off the job"] immer den letzten Summary-Eintrag liefert.
@@ -2627,9 +2658,10 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                         r_q.add_break()
 
             def _qa_meta(src: dict):
+                quelle = _remap_textgrundlage(src.get('textgrundlage', '–'), tg_renumber)
                 meta = doc.add_paragraph()
                 r = meta.add_run(
-                    f"Quelle: {src.get('textgrundlage', '–')}  |  "
+                    f"Quelle: {quelle}  |  "
                     f"Schlüsselbegriffe: {src.get('schluessel', '–')}  |  "
                     f"Abdeckung: {src.get('abdeckung', '–')}"
                 )

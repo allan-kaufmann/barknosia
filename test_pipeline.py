@@ -467,6 +467,24 @@ def test_textgrundlage_keys_strips_brackets_and_detail():
     assert "blended learning" in keys
 
 
+def test_remap_textgrundlage_uses_doc_number():
+    """Quelle wird auf die finale Dokumentnummer umgeschrieben (Original-Nummer ersetzt)."""
+    renumber = {
+        "4.2.1 orientierung an lerndimensionen": "3.2.1.2.1",
+        "orientierung an lerndimensionen": "3.2.1.2.1",
+        "4.3.1 simulationsbasiertes training": "3.2.1.3.1",
+        "simulationsbasiertes training": "3.2.1.3.1",
+    }
+    assert pipeline._remap_textgrundlage(
+        "4.2.1 Orientierung an Lerndimensionen", renumber) == "3.2.1.2.1 Orientierung an Lerndimensionen"
+    # Zusatzdetail bleibt erhalten, nur die führende Nummer wird ersetzt
+    assert pipeline._remap_textgrundlage(
+        "4.3.1 Simulationsbasiertes Training, • Wirkungsweise", renumber
+    ).startswith("3.2.1.3.1 Simulationsbasiertes Training")
+    # Kein Treffer → unverändert
+    assert pipeline._remap_textgrundlage("9.9 Unbekannt", renumber) == "9.9 Unbekannt"
+
+
 def test_build_interleaved_subpoints_answers_and_comments(tmp_path):
     """Frage mit 2 Unterpunkten: beide Sub-Antworten erscheinen im Dokument und es werden
     pro Unterpunkt eine Beleg-Markierung (Word-Kommentar) verankert."""
@@ -515,6 +533,10 @@ def test_build_interleaved_subpoints_answers_and_comments(tmp_path):
     assert "Simulationsbasiertes Training" in cx
     assert "Microlearning" in cx
     assert cx.count("Frage 42") >= 2
+    # Quelle zeigt die finale Dokumentnummer (rebasiert), nicht die Originalnummer 4.1/4.2
+    quellen = [t for t in texts if t.startswith("Quelle:")]
+    assert any("2.4.1.2.1 Simulationsbasiertes Training" in q for q in quellen), quellen
+    assert any("2.4.1.2.2 Microlearning" in q for q in quellen), quellen
 
 
 def test_normalize_quote_strips_markdown_and_case():
