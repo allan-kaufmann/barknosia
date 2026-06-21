@@ -2033,6 +2033,146 @@ def audit_figure_captions(text: str, base_path: str = None) -> dict:
     return {'counts': counts, 'text_only': text_only, 'missing': missing}
 
 
+_IMG_LINE_RE = re.compile(r'^\s*!\[[^\]]*\]\(([^)]+)\)\s*$')
+
+
+def render_pdf_figure_region(pdf_path: str, page_index: int, out_path: str,
+                             scale: float = 2.5) -> bool:
+    """Rendert die Abbildungs-Region einer PDF-Seite als ein Bild (für Figuren, die Marker in
+    Text + Icons zerlegt hat). Region = Bounding-Box aller Pfad-Objekte (Diagrammlinien/Boxen),
+    erweitert um Textobjekte im selben vertikalen Band (Box-Beschriftungen/Erklärtext); die
+    Caption darunter und der Seitenkopf darüber bleiben außen vor.
+
+    Gibt True zurück, wenn ein Bild geschrieben wurde, sonst False (kein pypdfium2, keine Seite,
+    keine Pfad-Objekte). Bestehender Cache wird wiederverwendet."""
+    if os.path.exists(out_path):
+        return True
+    try:
+        import pypdfium2 as pdfium
+    except Exception:
+        return False
+    try:
+        pdf = pdfium.PdfDocument(pdf_path)
+    except Exception:
+        return False
+    try:
+        if page_index < 0 or page_index >= len(pdf):
+            return False
+        page = pdf[page_index]
+        W, H = page.get_size()
+        paths, texts = [], []
+        for obj in page.get_objects():
+            try:
+                pos = obj.get_pos()  # (left, bottom, right, top), PDF-Koordinaten (unten=0)
+            except Exception:
+                continue
+            if obj.type == 2:        # Pfad (Diagrammlinien/Boxen/Pfeile)
+                paths.append(pos)
+            elif obj.type in (1, 3): # Text / eingebettetes Bild
+                texts.append(pos)
+        if not paths:
+            return False
+        pl = min(b[0] for b in paths); pb = min(b[1] for b in paths)
+        pr = max(b[2] for b in paths); pt = max(b[3] for b in paths)
+        # Textobjekte im vertikalen Band der Pfade (Box-Texte) einbeziehen – Caption (unterhalb
+        # der Pfade) und Seitenkopf (oberhalb) bleiben außen vor.
+        for b in texts:
+            cy = (b[1] + b[3]) / 2
+            if pb - 6 <= cy <= pt + 6:
+                pl = min(pl, b[0]); pr = max(pr, b[2])
+                pb = min(pb, b[1]); pt = max(pt, b[3])
+        pad = 8.0
+        L = max(0.0, pl - pad); R = min(W, pr + pad)
+        B = max(0.0, pb - pad); T = min(H, pt + pad)
+        bitmap = page.render(scale=scale).to_pil()
+        # PDF-Koordinaten (unten=0) → Pixel (oben=0)
+        crop = bitmap.crop((int(L * scale), int((H - T) * scale),
+                            int(R * scale), int((H - B) * scale)))
+        if crop.width < 20 or crop.height < 20:
+            return False
+        crop.convert('RGB').save(out_path, 'JPEG', quality=85)
+        return True
+    except Exception as e:
+        print(f"   [ABBILDUNG] Rendern von Seite {page_index} fehlgeschlagen: {e}")
+        return False
+    finally:
+        try:
+            pdf.close()
+        except Exception:
+            pass
+
+
+def inline_decomposed_figures(text: str, pdf_path: str, base_path: str) -> str:
+    """Ersetzt zerstückelte Abbildungen (Marker hat eine Grafik in Text + winzige Icons zerlegt)
+    durch ein einziges, aus der Quell-PDF gerendertes Bild.
+
+    Vorgehen je Caption-Sektion (Heading-Segment mit 'Abb./Tab. N'-Caption): enthält die Sektion
+    KEINE Tabelle und NUR dekorative/winzige Bilder, gilt sie als zerstückelt. Die Seite wird aus
+    den '_page_N_'-Icon-Namen bestimmt, die Figur-Region gerendert und die erste Icon-Bildzeile
+    durch das gerenderte Bild ersetzt; weitere Icon-Bildzeilen der Sektion werden entfernt.
+
+    No-Op, wenn pdf_path/base_path fehlen oder das Rendern scheitert (Icons bleiben dann)."""
+    if not pdf_path or not base_path or not os.path.exists(pdf_path):
+        return text
+    lines = text.split('\n')
+    head_idx = [i for i, l in enumerate(lines) if re.match(r'^#{1,6}\s', l)]
+    bounds = head_idx + [len(lines)]
+
+    def seg_range(i):
+        prev = [h for h in head_idx if h <= i]
+        if not prev:
+            return 0, (head_idx[0] if head_idx else len(lines))
+        s = prev[-1]
+        return s, bounds[head_idx.index(s) + 1]
+
+    drop: set[int] = set()           # zu entfernende Icon-Zeilen
+    replace: dict[int, str] = {}     # Zeilenindex → neue Bildzeile
+    handled_segments: set = set()
+    rendered = 0
+    for i, line in enumerate(lines):
+        if not _CAPTION_RE.match(line.strip()):
+            continue
+        s, e = seg_range(i)
+        if s in handled_segments:
+            continue
+        handled_segments.add(s)
+        img_lines, has_table, has_real_img, pages = [], False, False, []
+        for k in range(s, e):
+            m = _IMG_LINE_RE.match(lines[k])
+            if m:
+                rel = m.group(1)
+                path = os.path.join(base_path, rel)
+                if os.path.exists(path) and not _is_decorative_image(path):
+                    has_real_img = True
+                else:
+                    img_lines.append(k)
+                pm = re.search(r'_page_(\d+)_', rel)
+                if pm:
+                    pages.append(int(pm.group(1)))
+            elif lines[k].strip().startswith('|'):
+                has_table = True
+        # Nur zerstückelte Figuren behandeln: kein echtes Bild, keine Tabelle, aber Icon-Bilder.
+        if has_real_img or has_table or not img_lines or not pages:
+            continue
+        page_index = max(set(pages), key=pages.count)
+        out_name = f"_rendered_fig_p{page_index}.jpeg"
+        out_path = os.path.join(base_path, out_name)
+        if render_pdf_figure_region(pdf_path, page_index, out_path):
+            replace[img_lines[0]] = f"![]({out_name})"
+            for k in img_lines[1:]:
+                drop.add(k)
+            rendered += 1
+    if not replace:
+        return text
+    out = []
+    for idx, line in enumerate(lines):
+        if idx in drop:
+            continue
+        out.append(replace.get(idx, line))
+    print(f"   [ABBILDUNG] {rendered} zerstückelte Abbildung(en) aus PDF gerendert.")
+    return '\n'.join(out)
+
+
 def _caption_protected_image_lines(lines: list) -> set:
     """Zeilen-Indizes von Bildern, die im selben Heading-Segment wie eine nummerierte
     Abbildungs-/Tabellen-Caption ('Abb./Tab. N') liegen. Solche Bilder werden NIE als
@@ -3312,6 +3452,10 @@ if __name__ == "__main__":
                                         encoding="utf-8")
             else:
                 print(f"Warnung: Fragen-Datei '{args.questions}' nicht gefunden. Überspringe QS.")
+
+        # Zerstückelte Abbildungen (Marker hat eine Grafik in Text + Icons zerlegt) als ganze
+        # Figur aus der Quell-PDF rendern und die scattered Icon-Bilder ersetzen.
+        working_text = inline_decomposed_figures(working_text, args.pdf_path, image_base)
 
         # --- Word-Dokument zusammensetzen ---
         suffix = f"_Einbetten_{args.parent_chapter.replace('.', '-')}" if args.parent_chapter else "_Lernskript"

@@ -58,6 +58,8 @@ from pipeline import (
     strip_toc_tables,
     _caption_protected_image_lines,
     _ensure_summary_heading,
+    inline_decomposed_figures,
+    render_pdf_figure_region,
 )
 import pipeline
 
@@ -3054,3 +3056,87 @@ def test_lernfragen_number_after_last_subchapter_in_rebase_mode():
     assert any(t.startswith("3.2.3.4 Lernfragen") for t in texts), \
         f"Lernfragen sollten 3.2.3.4 sein. Gefunden:\n{texts}"
     assert not any(t.startswith("3.2.3.1 Lernfragen") for t in texts)
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 41: Zerstückelte Abbildungen aus der Quell-PDF rendern
+# ---------------------------------------------------------------------------
+
+def _make_img(path, w, h):
+    from PIL import Image
+    Image.new("RGB", (w, h), (200, 200, 200)).save(path, "JPEG")
+
+
+def test_inline_decomposed_figures_replaces_icons(tmp_path, monkeypatch):
+    """Sektion mit nur winzigen Icon-Bildern + Caption → die Icon-Zeilen werden durch EIN
+    gerendertes Bild ersetzt (PDF-Rendern gemockt)."""
+    base = tmp_path
+    for n in (4, 7, 10):
+        _make_img(base / f"_page_50_Picture_{n}.jpeg", 40, 40)  # dekorativ (<100 px)
+    pdf = base / "src.pdf"
+    pdf.write_bytes(b"%PDF-1.4 dummy")
+
+    def fake_render(pdf_path, page_index, out_path, scale=2.5):
+        _make_img(out_path, 600, 400)
+        return True
+    monkeypatch.setattr(pipeline, "render_pdf_figure_region", fake_render)
+
+    md = (
+        "#### Exkurs: Modelllernen\n\n"
+        "![](_page_50_Picture_4.jpeg)\n\n"
+        "![](_page_50_Picture_7.jpeg)\n\n"
+        "![](_page_50_Picture_10.jpeg)\n\n"
+        "**Abb. 3.1** Prozess des Lernens am Modell\n"
+    )
+    out = inline_decomposed_figures(md, str(pdf), str(base))
+    assert out.count("![](") == 1
+    assert "_rendered_fig_p50.jpeg" in out
+    assert "_page_50_Picture" not in out
+
+
+def test_inline_decomposed_figures_keeps_real_figure(tmp_path, monkeypatch):
+    """Sektion mit echtem großem Bild bleibt unverändert (keine Zerstückelung)."""
+    base = tmp_path
+    _make_img(base / "_page_53_Figure_2.jpeg", 1100, 596)  # echtes Bild (>100 px)
+    pdf = base / "src.pdf"; pdf.write_bytes(b"%PDF-1.4 dummy")
+    monkeypatch.setattr(pipeline, "render_pdf_figure_region",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("darf nicht rendern")))
+    md = ("#### Cycles\n\n![](_page_53_Figure_2.jpeg)\n\n"
+          "**Abb. 3.2** High/Low Cycles\n")
+    assert inline_decomposed_figures(md, str(pdf), str(base)) == md
+
+
+def test_inline_decomposed_figures_keeps_table_section(tmp_path, monkeypatch):
+    """Caption-Sektion mit Tabelle (Tab. X) wird nicht angefasst."""
+    base = tmp_path
+    _make_img(base / "_page_60_Picture_1.jpeg", 30, 30)
+    pdf = base / "src.pdf"; pdf.write_bytes(b"%PDF-1.4 dummy")
+    monkeypatch.setattr(pipeline, "render_pdf_figure_region",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("darf nicht rendern")))
+    md = ("#### Tab-Sektion\n\n**Tab. 3.1** Übersicht\n\n"
+          "| A | B |\n|---|---|\n| 1 | 2 |\n\n![](_page_60_Picture_1.jpeg)\n")
+    assert inline_decomposed_figures(md, str(pdf), str(base)) == md
+
+
+def test_inline_decomposed_figures_noop_without_pdf(tmp_path):
+    """Fehlt die PDF, bleibt der Text unverändert (No-Op, kein Absturz)."""
+    md = "#### X\n\n![](_page_1_Picture_0.jpeg)\n\n**Abb. 1.1** Test\n"
+    assert inline_decomposed_figures(md, str(tmp_path / "missing.pdf"), str(tmp_path)) == md
+
+
+# Integrationstest gegen die echte Quell-PDF (übersprungen, wenn pypdfium2/PDF fehlen).
+_KAUFFELD_PDF = r"\wsl.localhost\Ubuntu\home\allan\barknosia\PaPe\Kauffeld_Nachhaltige_Personalentwicklung_und_Weiterbildung.pdf"
+
+
+def test_render_pdf_figure_region_real_pdf(tmp_path):
+    pytest.importorskip("pypdfium2")
+    import os
+    if not os.path.exists(_KAUFFELD_PDF):
+        pytest.skip("Kauffeld-PDF nicht verfügbar")
+    out = tmp_path / "fig.jpeg"
+    assert render_pdf_figure_region(_KAUFFELD_PDF, 50, str(out))
+    from PIL import Image
+    with Image.open(out) as im:
+        # Abb. 3.1 ist deutlich breiter als hoch und nicht winzig.
+        assert im.width > 300 and im.height > 150
+        assert im.width > im.height
