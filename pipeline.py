@@ -202,8 +202,25 @@ def extract_chapter(text: str, chapter_id: str, from_section: str = None,
             if m:
                 clean = _clean_heading_text(line)
                 if re.match(rf'^{escaped}\.', clean):
-                    start_idx = i
-                    heading_level = len(m.group(1))
+                    sub_idx = i
+                    sub_level = len(m.group(1))
+                    start_idx = sub_idx
+                    heading_level = sub_level
+                    # Unnummerierten Kapiteltitel mitnehmen: Bücher mit nummerierten
+                    # UNTER-, aber unnummerierten Hauptkapiteln (z.B. "## Lerntheorien"
+                    # über "#### 3.1 …"). Die nächste vorangehende Heading-Zeile, wenn sie
+                    # unnummeriert UND flacher ist, ist die Kapitel-Wurzel → Titel +
+                    # Einleitung bleiben erhalten und heading_level wird flacher (wichtig
+                    # für die Abbruchlogik gegen tiefe OCR-Artefakt-Headings).
+                    for j in range(sub_idx - 1, -1, -1):
+                        mj = re.match(r'^(#{1,6})\s', lines[j])
+                        if not mj:
+                            continue
+                        cj = _clean_heading_text(lines[j])
+                        if len(mj.group(1)) < sub_level and not re.match(r'^\d', cj):
+                            start_idx = j
+                            heading_level = len(mj.group(1))
+                        break  # nur das unmittelbar vorangehende Heading prüfen
                     break
 
     if start_idx is None:
@@ -218,16 +235,23 @@ def extract_chapter(text: str, chapter_id: str, from_section: str = None,
             m2 = re.match(r'^(#{1,6})\s', line)
             if m2:
                 clean2 = _clean_heading_text(line)
+                level2 = len(m2.group(1))
                 # Ende erst beim nächsten Heading mit echter Abschnittsnummer (z.B. '5 …'
                 # oder '4.7 …'), das weder das Kapitel selbst noch ein Unterkapitel
                 # (chapter_id.x) ist. KEIN Abbruch bei nummerierten Listen-Headings
                 # ('1. Vorphase' → '1.' ist keine Abschnittsnummer) oder bei OCR-Kolumnentitel-
                 # Resten ('316 | 4 Schritt 3 …') – beide würden sonst mitten im Kapitel
                 # (z.B. vor einer Abbildung) fälschlich beenden.
-                if re.match(r'^\d+(\.\d+)*(\s|$)', clean2) \
+                _num = re.match(r'^(\d+(?:\.\d+)*)(?:\s|$)', clean2)
+                if _num \
                         and not re.match(r'^\d{1,4}\s*\|', clean2) \
                         and not re.match(rf'^{escaped}(\.|\s|$)', clean2):
-                    break
+                    # Gepunktete Nummer ('4.1') = echtes (Unter-)Kapitel → immer Ende.
+                    # Nackte Ganzzahl ('4') nur, wenn sie auf Kapitel-Ebene (level2 <=
+                    # heading_level) steht; tiefere bloße Zahlen sind OCR-Icon-Listenmarker
+                    # ('#### 4 Modelllernen:') und beenden das Kapitel NICHT.
+                    if '.' in _num.group(1) or level2 <= heading_level:
+                        break
                 # Im label_mode: auch bei "Kapitel M" (M ≠ chapter_id) stoppen.
                 if label_mode and re.match(rf'^{_label_pat}\s+\d', clean2, re.IGNORECASE):
                     if not re.match(rf'^{_label_pat}\s+{escaped}(\s|$)', clean2, re.IGNORECASE):
@@ -2114,6 +2138,16 @@ _FRONT_MATTER_HEADINGS = frozenset([
     'inhalt', 'inhaltsverzeichnis', 'table of contents', 'contents',
 ])
 
+# Front-Matter-Überschriften, die nur über einen Präfix erkennbar sind (Titelvarianten).
+# 'Checklisten im Buch und online' (Springer-Vorspann) listet Download-Checklisten je
+# 'Kapitel N' auf – diese Einträge dürfen extract_chapter NICHT als echtes Kapitel sehen.
+_FRONT_MATTER_PREFIXES = ('checklisten im buch',)
+
+
+def _is_front_matter_heading(key: str) -> bool:
+    """True, wenn die (normalisierte) Überschrift ein Front-Matter-Block-Anfang ist."""
+    return key in _FRONT_MATTER_HEADINGS or key.startswith(_FRONT_MATTER_PREFIXES)
+
 
 def strip_front_matter(text: str) -> str:
     """Entfernt Front-Matter-Blöcke (Impressum, Inhaltsverzeichnis) am Dokumentanfang.
@@ -2134,7 +2168,7 @@ def strip_front_matter(text: str) -> str:
             if skipping and level <= skip_level:
                 # Block endet bei gleich-/höherrangiger Überschrift.
                 skipping = False
-            if key in _FRONT_MATTER_HEADINGS:
+            if _is_front_matter_heading(key):
                 skipping = True
                 skip_level = level
                 continue

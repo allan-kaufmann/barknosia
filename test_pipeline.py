@@ -2334,6 +2334,63 @@ def test_extract_chapter_missing_toplevel_uses_first_subchapter():
     assert "9 Nächstes Kapitel" not in result
 
 
+def test_extract_chapter_unnumbered_root_captures_title_and_intro():
+    """Buch mit nummerierten Unter-, aber unnummerierten Hauptkapiteln (z.B. Kauffeld):
+    '## Lerntheorien' über '#### 3.1 …'. Der unnummerierte Titel + Einleitung bleiben
+    erhalten, weil der Fallback die vorangehende flachere Heading-Zeile als Wurzel nimmt."""
+    md = (
+        "## **Lerntheorien**\n\nEinleitung zu den Lerntheorien.\n\n"
+        "#### **3.1 Behavioristische Ansätze**\n\nText 3.1.\n\n"
+        "#### **3.2 Kognitivistische Ansätze**\n\nText 3.2.\n\n"
+        "## **Trainings in Organisationen**\n\nKap-4-Einleitung.\n\n"
+        "#### **4.1 Der Zeitpunkt**\n\nText 4.1.\n"
+    )
+    result = extract_chapter(md, "3")
+    assert "Lerntheorien" in result
+    assert "Einleitung zu den Lerntheorien" in result
+    assert "3.1 Behavioristische Ansätze" in result and "Text 3.1" in result
+    assert "3.2 Kognitivistische Ansätze" in result
+    assert "4.1 Der Zeitpunkt" not in result and "Text 4.1" not in result
+
+
+def test_extract_chapter_bare_integer_artifact_does_not_terminate():
+    """OCR-Icon-Listenmarker '#### 4 Modelllernen:' (nackte Zahl, tiefer als der
+    Kapitel-Heading) darf das Kapitel NICHT beenden – nur der echte gepunktete
+    Terminator '#### 4.1 …' beendet es."""
+    md = (
+        "## **Lerntheorien**\n\nEinleitung.\n\n"
+        "#### **3.1 Behavioristische Ansätze**\n\nText 3.1.\n\n"
+        "#### 4 **Modelllernen:**\n\nArtefakt-Inhalt.\n\n"
+        "#### **3.2 Kognitivistische Ansätze**\n\nText 3.2.\n\n"
+        "## **Trainings in Organisationen**\n\n"
+        "#### **4.1 Der Zeitpunkt**\n\nText 4.1.\n"
+    )
+    result = extract_chapter(md, "3")
+    assert "3.1 Behavioristische Ansätze" in result
+    assert "Modelllernen" in result and "Artefakt-Inhalt" in result
+    assert "3.2 Kognitivistische Ansätze" in result and "Text 3.2" in result
+    assert "Text 4.1" not in result
+
+
+def test_strip_front_matter_removes_checklisten_im_buch_block():
+    """Springer-Vorspann 'Checklisten im Buch und online' (mit '#### **Kapitel N**'-
+    Download-Liste) wird als Front-Matter entfernt, sodass die 'Kapitel N'-Einträge
+    nicht fälschlich als echtes Kapitel extrahiert werden."""
+    md = (
+        "# Buchtitel\n\n"
+        "### **Checklisten im Buch und online**\n\nDownload-Hinweis.\n\n"
+        "#### **Kapitel 3**\n\n- Eine Checkliste\n- Noch eine\n\n"
+        "#### **Kapitel 4**\n\n- Weitere Checkliste\n\n"
+        "## **Standard Betriebliche Weiterbildung**\n\nEchter Inhalt.\n"
+    )
+    out = strip_front_matter(md)
+    assert "Checklisten im Buch und online" not in out
+    assert "Kapitel 3" not in out
+    assert "Eine Checkliste" not in out
+    assert "Standard Betriebliche Weiterbildung" in out
+    assert "Echter Inhalt" in out
+
+
 # ---------------------------------------------------------------------------
 # Gruppe 33b: extract_chapter --from (Teilkapitel ab Unterkapitel)
 # ---------------------------------------------------------------------------
