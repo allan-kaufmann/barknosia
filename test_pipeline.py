@@ -54,6 +54,10 @@ from pipeline import (
     _CAPTION_RE,
     _textfigure_visible_lines,
     audit_figure_captions,
+    normalize_ocr_glyph_artifacts,
+    strip_toc_tables,
+    _caption_protected_image_lines,
+    _ensure_summary_heading,
 )
 import pipeline
 
@@ -2935,3 +2939,118 @@ def test_embed_summary_heading_with_span_still_matches():
     texts = [p.text for p in paras]
     assert any("Stichpunkt-Erwerb-Inhalt" in t for t in texts), \
         f"Summary-Stichpunkt soll trotz <span> im Heading erscheinen. Gefunden:\n{texts}"
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 40: OCR-Glyph-Artefakte, Captions, TOC-Tabellen, Einleitung, Lernfragen-Nr.
+# ---------------------------------------------------------------------------
+
+def test_glyph_heading_artifact_becomes_bullet():
+    """'#### 4 **Modelllernen:**' (bloße Ziffer als Icon-Listenmarker) → Bullet, kein Heading."""
+    assert normalize_ocr_glyph_artifacts("#### 4 **Modelllernen:**") == "- **Modelllernen:**"
+    assert normalize_ocr_glyph_artifacts("#### j **Wie arbeitet das Gehirn?**") == "- **Wie arbeitet das Gehirn?**"
+
+
+def test_glyph_bullet_artifact_stripped():
+    """'- 4 **Positive Verstärkung:**' → bloße Ziffer entfernt, Bullet bleibt."""
+    assert normalize_ocr_glyph_artifacts("- 4 **Positive Verstärkung:**") == "- **Positive Verstärkung:**"
+
+
+def test_glyph_normalize_preserves_real_numbering():
+    """Echte Sektionsnummern und echte nummerierte Listen bleiben unverändert."""
+    assert normalize_ocr_glyph_artifacts("#### **3.1 Behavioristische Ansätze**") == "#### **3.1 Behavioristische Ansätze**"
+    assert normalize_ocr_glyph_artifacts("#### 3.2.3 Erwartungs-Mal-Wert-Theorie") == "#### 3.2.3 Erwartungs-Mal-Wert-Theorie"
+    assert normalize_ocr_glyph_artifacts("- 1. **Behavioristische Ansätze,** Text") == "- 1. **Behavioristische Ansätze,** Text"
+
+
+def test_caption_glyph_prefix_normalized_and_matches():
+    """Caption-Präfixe ('. ', '■ ', '#### . ') werden entfernt, _CAPTION_RE matcht danach."""
+    for raw in [". **Abb. 3.1** Prozess des Lernens am Modell",
+                "■ Abb. 3.2 High-Performance/Low-Performance Cycles",
+                "#### . **Tab. 3.3** Lernprinzipien",
+                ". Tab. 3.1 Kognitive Ebenen"]:
+        out = normalize_ocr_glyph_artifacts(raw)
+        assert not out.startswith('#'), out
+        assert _CAPTION_RE.match(out.strip()), f"Caption nicht erkannt: {out!r}"
+
+
+def test_strip_toc_tables_removes_chapter_toc():
+    """Mini-TOC-Tabelle (Sektionsnummer + Seitenzahl) wird entfernt, echte Tabelle bleibt."""
+    md = (
+        "## Lerntheorien\n\n"
+        "| 3.1   | Behavioristische<br>– 40 |\n"
+        "|---|---|\n"
+        "| 3.2   | Kognitivistische<br>– 43 |\n"
+        "| 3.2.1 | Theorie<br>– 43 |\n\n"
+        "Text.\n\n"
+        "| Erwartung | Valenz |\n|---|---|\n| a | b |\n"
+    )
+    out = strip_toc_tables(md)
+    assert "Behavioristische" not in out
+    assert "– 40" not in out
+    assert "| Erwartung | Valenz |" in out and "| a | b |" in out
+
+
+def test_strip_toc_tables_keeps_normal_table():
+    """Eine gewöhnliche Datentabelle ohne Sektionsnummer/Seitenmuster bleibt unverändert."""
+    md = "| Name | Wert |\n|---|---|\n| x | 1 |\n| y | 2 |\n"
+    assert strip_toc_tables(md) == md
+
+
+def test_caption_protected_image_lines_protects_panel_images():
+    """Bilder in einem Abschnitt mit nummerierter Caption werden geschützt (nicht dekorativ)."""
+    lines = [
+        "#### Exkurs: Soziales Lernen",
+        "![](_page_50_Picture_4.jpeg)",
+        "![](_page_50_Picture_7.jpeg)",
+        "**Abb. 3.1** Prozess des Lernens am Modell",
+    ]
+    protected = _caption_protected_image_lines(lines)
+    assert protected == {1, 2}
+
+
+def test_caption_protected_image_lines_no_caption_no_protection():
+    """Ohne Caption im Abschnitt werden Bilder nicht geschützt."""
+    lines = ["#### Irgendwas", "![](icon.jpeg)", "Normaler Text."]
+    assert _caption_protected_image_lines(lines) == set()
+
+
+def test_ensure_summary_heading_prepends_when_missing():
+    """Fehlt das Kapitel-Heading in der Zusammenfassung, wird es vorangestellt (Einleitung sichtbar)."""
+    out = _ensure_summary_heading("- Stichpunkt eins\n- Stichpunkt zwei", "Lerntheorien")
+    assert out.startswith("## Lerntheorien")
+    assert "Stichpunkt eins" in out
+
+
+def test_ensure_summary_heading_keeps_existing():
+    """Ist das passende Heading schon da, bleibt die Zusammenfassung unverändert."""
+    s = "## Lerntheorien\n\n- Punkt"
+    assert _ensure_summary_heading(s, "Lerntheorien") == s
+
+
+def test_lernfragen_number_after_last_subchapter_in_rebase_mode():
+    """Im Rebase-Modus erhalten die Lernfragen die nächste freie Geschwister-Nummer
+    (Kinder 3.2.3.1..3.2.3.3 → Lernfragen 3.2.3.4), nicht fälschlich 3.2.3.1."""
+    orig = (
+        "#### **3.1 Behavioristische Ansätze**\n\nBody A.\n\n"
+        "#### **3.2 Kognitivistische Ansätze**\n\nBody B.\n\n"
+        "#### **3.3 Motivationstheoretische Ansätze**\n\nBody C.\n"
+    )
+    summ = (
+        "## 3.1 Behavioristische Ansätze\n\n- Punkt A\n\n"
+        "## 3.2 Kognitivistische Ansätze\n\n- Punkt B\n\n"
+        "## 3.3 Motivationstheoretische Ansätze\n\n- Punkt C\n"
+    )
+    qa = (
+        "**Frage 1**\n"
+        "**Antwort:** Test.\n"
+        "**Textgrundlage:** 3.1 Behavioristische Ansätze\n"
+        "**Schlüsselbegriffe:** x\n"
+        "**Abdeckung:** vollständig\n"
+    )
+    paras = _run_interleaved_embedded(orig, summ, parent_chapter="3.2.3",
+                                      extracted_chapter="3", qa_text=qa)
+    texts = [p.text for p in paras]
+    assert any(t.startswith("3.2.3.4 Lernfragen") for t in texts), \
+        f"Lernfragen sollten 3.2.3.4 sein. Gefunden:\n{texts}"
+    assert not any(t.startswith("3.2.3.1 Lernfragen") for t in texts)

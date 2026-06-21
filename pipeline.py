@@ -895,6 +895,22 @@ def _summarize_single_chapter(heading: str, chapter_text: str, output_lang: str 
         raise
 
 
+def _ensure_summary_heading(summary: str, heading: str) -> str:
+    """Stellt sicher, dass eine Kapitel-Zusammenfassung mit der zugehörigen Überschrift beginnt,
+    damit der Docx-Builder sie per sum_lookup der Original-Sektion zuordnen kann.
+    Hängt '## {heading}' nur voran, wenn die erste Überschrift fehlt oder eine andere ist –
+    so erhält der Vorspann (Einleitung vor dem ersten Unterkapitel) eine sichtbare Summary."""
+    norm = normalize_heading(_clean_heading_text(heading))
+    for ln in summary.lstrip().splitlines():
+        if re.match(r'^#{1,6}\s', ln):
+            if normalize_heading(_clean_heading_text(ln)) == norm:
+                return summary  # passendes Heading bereits vorhanden
+            break  # erstes Heading gehört zu einem Unterabschnitt → Kapitel-Heading davorsetzen
+        if ln.strip():
+            break  # Fließtext vor erstem Heading → Heading davorsetzen
+    return f"## {heading}\n\n{summary.lstrip()}"
+
+
 def generate_summary_by_chapter(text: str, out_dir: Path, output_lang: str = "de") -> str:
     """
     Schritt 4: Erstellt die Zusammenfassung kapitelweise (je Level-1-Kapitel ein API-Call).
@@ -908,13 +924,25 @@ def generate_summary_by_chapter(text: str, out_dir: Path, output_lang: str = "de
 
     # Preamble-Text (vor erstem nummerierten Heading) extrahieren.
     # split_into_level1_chapters() verwirft diesen Text sonst kommentarlos.
-    _first_num = re.search(r'^#{1,6}\s+\d', text, re.MULTILINE)
-    _preamble_text = text[:_first_num.start()].strip() if _first_num and _first_num.start() > 0 else ''
+    # Bold-Marker für die Nummern-Erkennung ignorieren ('#### **3.1 …**' ist nummeriert).
+    _lines_nb = text.split('\n')
+    _first_num_idx = next(
+        (k for k, ln in enumerate(_lines_nb)
+         if re.match(r'^#{1,6}\s+\d', re.sub(r'<[^>]+>', '', ln).replace('**', ''))),
+        None,
+    )
+    _preamble_text = ('\n'.join(_lines_nb[:_first_num_idx]).strip()
+                      if _first_num_idx not in (None, 0) else '')
 
     chapters = split_into_level1_chapters(text)
 
-    # Preamble zum ersten Kapitel hinzufügen damit Gemini es mitfasst.
-    if _preamble_text and chapters:
+    # Preamble nur dann an das erste Kapitel hängen, wenn split_into_level1_chapters den
+    # Vorspann verworfen hat (erstes Kapitel ist nummeriert). Hat es bereits ein unnummeriertes
+    # Wurzel-Kapitel (Kapiteltitel) erzeugt, steckt der Vorspann dort schon drin → kein Duplikat.
+    _root_unnumbered = bool(
+        chapters and not re.match(r'^\d', normalize_heading(chapters[0]['heading']))
+    )
+    if _preamble_text and chapters and not _root_unnumbered:
         chapters[0]['full_text'] = _preamble_text + '\n\n' + chapters[0]['full_text']
 
     _CHUNK_LIMIT = 15_000  # ~30 Seiten; Kapitel über diesem Limit werden chunk-weise verarbeitet
@@ -991,6 +1019,11 @@ def generate_summary_by_chapter(text: str, out_dir: Path, output_lang: str = "de
             lambda ch=chapter, ci=i: _summarize_chapter_smart(ch, ci),
             label
         )
+        # Unnummeriertes Wurzel-Kapitel (Kapiteltitel-Vorspann/Einleitung): Heading erzwingen,
+        # damit die Einleitungs-Zusammenfassung sicher unter der Kapitelüberschrift erscheint
+        # (Regel: Vorspanntext ⇒ sichtbare Zusammenfassung).
+        if i == 1 and not re.match(r'^\d', normalize_heading(chapter['heading'])):
+            chapter_summary = _ensure_summary_heading(chapter_summary, chapter['heading'])
         summaries.append(chapter_summary)
         time.sleep(1)
 
@@ -1802,6 +1835,95 @@ _CAPTION_TITLE_RE = re.compile(
     re.IGNORECASE
 )
 
+# Caption-Schlüsselwort ohne Anker (für Präfix-Normalisierung).
+_CAPTION_KEYWORD = r'(?:Tabelle|Abbildung|Tab\.|Abb\.|Table|Figure|Fig\.)'
+
+# Ein einzelnes OCR-Streuzeichen (verlorener Icon-/Bullet-/Symbolfont-Glyph): bloße Ziffer
+# OHNE folgenden Punkt/Ziffer (echte Sektionsnummern wie '3.1' bleiben unberührt), einzelner
+# Buchstabe (j, y …) oder ein Symbol. Bewusst eng gehalten, um echten Inhalt nicht zu treffen.
+_OCR_GLYPH = r'(?:\d(?![\d.])|[A-Za-zÄÖÜäöüß](?![A-Za-zÄÖÜäöüß])|[.■▪●•·∎◾◼])'
+
+_CAPTION_GLYPH_PREFIX_RE = re.compile(
+    rf'^\s*(?:#{{1,6}}\s+)?{_OCR_GLYPH}\s+(\**\s*{_CAPTION_KEYWORD}.*)$',
+    re.IGNORECASE,
+)
+_HEADING_GLYPH_ARTIFACT_RE = re.compile(rf'^#{{1,6}}\s+{_OCR_GLYPH}\s+(\*\*.+)$')
+_BULLET_GLYPH_ARTIFACT_RE = re.compile(rf'^(\s*[-*]\s+){_OCR_GLYPH}\s+(\*\*.+)$')
+
+
+def normalize_ocr_glyph_artifacts(text: str) -> str:
+    """Bereinigt verlorene OCR-Icon-/Bullet-Glyphen am Zeilenanfang (Marker liest Symbolfont-
+    Zeichen als Streuzeichen wie '.', '■', 'j' oder bloße Ziffern '4'/'5').
+
+    Drei zeilenweise Transformationen (Reihenfolge wichtig):
+      1. Caption-Präfix: '. **Abb. 3.1** …' / '■ Abb. 3.2 …' / '#### . **Tab. 3.3** …'
+         → reine Caption ('**Abb. 3.1** …'), damit _CAPTION_RE greift und sie sichtbar bleibt.
+      2. Heading-Artefakt: '#### 4 **Modelllernen:**' → Bullet '- **Modelllernen:**'
+         (bloße Glyph-Headings sind Icon-Listenpunkte, keine Unterkapitel → keine Nummer).
+      3. Bullet-Artefakt: '- 4 **Positive Verstärkung:**' → '- **Positive Verstärkung:**'.
+
+    Echte Sektionsnummern ('#### **3.1 …**', '#### 3.2.3 …') und echte nummerierte Listen
+    ('- 1. **…**') bleiben unberührt (Glyph-Regex schließt 'Ziffer + Punkt' aus)."""
+    out = []
+    for line in text.split('\n'):
+        m_cap = _CAPTION_GLYPH_PREFIX_RE.match(line)
+        if m_cap:
+            out.append(m_cap.group(1).strip())
+            continue
+        m_h = _HEADING_GLYPH_ARTIFACT_RE.match(line)
+        if m_h:
+            out.append(f"- {m_h.group(1)}")
+            continue
+        m_b = _BULLET_GLYPH_ARTIFACT_RE.match(line)
+        if m_b:
+            out.append(f"{m_b.group(1)}{m_b.group(2)}")
+            continue
+        out.append(line)
+    return '\n'.join(out)
+
+
+_TOC_SEP_RE = re.compile(r'^\s*\|[\s:|-]+\|?\s*$')
+# Datenzeile eines Kapitel-Inhaltsverzeichnisses: erste Zelle = Sektionsnummer (3.1, 3.2.1),
+# irgendwo eine Seitenangabe als '– 40' / '<br>– 40' (Bindestrich/Gedankenstrich + Zahl).
+_TOC_PAGE_RE = re.compile(r'[-–—]\s*\d{1,4}\b')
+
+
+def strip_toc_tables(text: str) -> str:
+    """Entfernt Kapitel-Mini-Inhaltsverzeichnisse, die als Markdown-Tabelle vorliegen
+    ('| 3.1 | Behavioristische Ansätze<br>– 40 |' …). Solche TOC-Tabellen stehen oft am
+    Kapitelanfang und sind kein Inhalt – sie stören Einleitung, Zusammenfassung und Layout.
+
+    Erkennung je zusammenhängendem Tabellenblock: Mehrheit der Datenzeilen hat als erste Zelle
+    eine reine Sektionsnummer UND eine Seitenangabe ('– NN'); Schwelle ≥3 solcher Zeilen.
+    Echte Datentabellen (ohne dieses Muster) bleiben unberührt."""
+    lines = text.split('\n')
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        if not lines[i].lstrip().startswith('|'):
+            out.append(lines[i])
+            i += 1
+            continue
+        # Zusammenhängenden Tabellenblock einsammeln.
+        j = i
+        block = []
+        while j < n and lines[j].lstrip().startswith('|'):
+            block.append(lines[j])
+            j += 1
+        data_rows = [b for b in block if not _TOC_SEP_RE.match(b)]
+        toc_rows = 0
+        for b in data_rows:
+            cells = [c.strip() for c in b.strip().strip('|').split('|')]
+            first = next((c for c in cells if c), '')
+            if re.match(r'^\d+(\.\d+)*$', first) and _TOC_PAGE_RE.search(b):
+                toc_rows += 1
+        is_toc = toc_rows >= 3 and toc_rows >= len(data_rows) / 2
+        if not is_toc:
+            out.extend(block)
+        i = j
+    return '\n'.join(out)
+
 
 def _textfigure_visible_lines(lines: list) -> set:
     """Zeilen-Indizes, die zu einer *Text-Figur* gehören und im Embed-Modus (hide_text=True)
@@ -1882,7 +2004,9 @@ def audit_figure_captions(text: str, base_path: str = None) -> dict:
             if im:
                 rel = im.group(1)
                 path = os.path.join(base_path, rel) if base_path else rel
-                if os.path.exists(path) and not _is_decorative_image(path):
+                if os.path.exists(path):
+                    # Vorhandenes Bild in einer Caption-Sektion wird eingebettet – auch kleine
+                    # Panels (Fix C schützt sie vor dem Dekorativ-Filter).
                     status = 'image'
                     break
                 status = 'missing'
@@ -1907,6 +2031,31 @@ def audit_figure_captions(text: str, base_path: str = None) -> dict:
         for cap in text_only:
             print(f"    [i] nur als Text vorhanden (keine Grafik): {cap}")
     return {'counts': counts, 'text_only': text_only, 'missing': missing}
+
+
+def _caption_protected_image_lines(lines: list) -> set:
+    """Zeilen-Indizes von Bildern, die im selben Heading-Segment wie eine nummerierte
+    Abbildungs-/Tabellen-Caption ('Abb./Tab. N') liegen. Solche Bilder werden NIE als
+    dekorativ verworfen – z.B. die vier kleinen Panels von Abb. 3.1, die einzeln < 100 px
+    sind, zusammen aber die prüfungsrelevante Abbildung bilden."""
+    head_idx = [k for k, l in enumerate(lines) if re.match(r'^#{1,6}\s', l)]
+    bounds = head_idx + [len(lines)]
+
+    def segment(k):
+        prev = [h for h in head_idx if h <= k]
+        if not prev:
+            return 0, (bounds[0] if head_idx else len(lines))
+        s = prev[-1]
+        return s, bounds[head_idx.index(s) + 1]
+
+    img_idx = [k for k, l in enumerate(lines)
+               if re.match(r'^\s*!\[[^\]]*\]\([^)]+\)\s*$', l)]
+    protected = set()
+    for k in img_idx:
+        s, e = segment(k)
+        if any(_CAPTION_RE.match(lines[m].strip()) for m in range(s, e)):
+            protected.add(k)
+    return protected
 
 
 def _hide_paragraph(p, indent_cm: float = 1.5):
@@ -1954,6 +2103,9 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None,
     lines = block_text.split('\n')
     # Text-Figuren (Caption ohne Bild) bleiben auch im Hidden-Block sichtbar – wie Bild-Figuren.
     textfig_visible = _textfigure_visible_lines(lines) if hide_text else set()
+    # Bilder, die zu einer nummerierten Abbildungs-/Tabellen-Caption gehören, NIE als dekorativ
+    # verwerfen (kleine Panels einer Abb., z.B. Abb. 3.1, sind prüfungsrelevant).
+    caption_protected_imgs = _caption_protected_image_lines(lines)
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -1986,8 +2138,8 @@ def process_markdown_to_docx(doc, block_text, hide_text=False, base_path=None,
             img_rel = img_m.group(2)
             img_path = os.path.join(base_path, img_rel) if base_path else img_rel
             if os.path.exists(img_path):
-                if _is_decorative_image(img_path):
-                    # Icons, Logos, Randsymbole überspringen
+                if _is_decorative_image(img_path) and i not in caption_protected_imgs:
+                    # Icons, Logos, Randsymbole überspringen (außer Caption-gebundene Panels)
                     i += 1
                     continue
                 try:
@@ -2435,6 +2587,7 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             _unnumbered_freq[_k] = _unnumbered_freq.get(_k, 0) + 1
     _auto_parent: str | None = None  # z. B. "5.3" – aktuelles nummeriertes Elternkapitel
     _auto_counter: int = 0
+    _max_child: int = 0  # höchstes unmittelbares Kind-Segment unter parent_chapter (für Lernfragen-Nr.)
 
     # Vorberechnung: hat jede Section mindestens einen Nachfolger mit Summary-Inhalt?
     # Verhindert sichtbare Leer-Überschriften bei Elternkapiteln, deren Kinder alle
@@ -2681,6 +2834,14 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
         if _newnum_m:
             for _k in _textgrundlage_keys(orig_clean_heading):
                 tg_renumber.setdefault(_k, _newnum_m.group(1))
+            # Höchstes unmittelbares Kind-Segment unter parent_chapter mitführen, damit die
+            # Lernfragen die nächste freie Geschwister-Nummer erhalten (z.B. nach 3.2.3.8 → 3.2.3.9).
+            if parent_chapter:
+                _full = _newnum_m.group(1).rstrip('.')
+                if _full.startswith(parent_chapter + '.'):
+                    _seg = _full[len(parent_chapter) + 1:].split('.')[0]
+                    if _seg.isdigit():
+                        _max_child = max(_max_child, int(_seg))
 
         # Scoped lookup: Sub-Sections (freq>1, wiederkehrend) unter der aktuellen Kompetenz.
         # Verhindert dass sum_lookup["off the job"] immer den letzten Summary-Eintrag liefert.
@@ -2824,9 +2985,11 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
                 # Lernfragen ist das nächste Geschwister auf Tiefe 1.
                 qa_top_num = counters[0] + 1
             elif extracted_chapter and has_numbered_chapters:
-                # Rebase-Modus: Unterkapitel werden über _auto_counter gezählt;
-                # Lernfragen ist das nächste Geschwister.
-                qa_top_num = _auto_counter + 1
+                # Rebase-Modus: Die direkten Kinder unter parent_chapter tragen rebasierte
+                # Nummern (3.2.3.1 … 3.2.3.8). Lernfragen ist das nächste freie Geschwister
+                # (→ 3.2.3.9). _max_child trackt das höchste vergebene Kind-Segment; Fallback
+                # _auto_counter für rein auto-nummerierte Unterkapitel ohne Eigennummer.
+                qa_top_num = max(_max_child, _auto_counter) + 1
             elif not has_numbered_chapters:
                 qa_top_num = counters[1] + 1
             else:
@@ -3004,6 +3167,12 @@ if __name__ == "__main__":
         _removed = _lines_before - (raw_md.count('\n') + 1)
         if _removed > 0:
             print(f"[OCR-CLEANUP] {_removed} Seiten-Kolumnentitel als Überschrift entfernt.")
+
+        # Verlorene OCR-Icon-/Bullet-Glyphen ('. **Abb…**', '#### 4 **X:**', '- 4 **X**')
+        # bereinigen: hält Captions sichtbar und verhindert Schein-Unterkapitel/-Nummern.
+        raw_md = normalize_ocr_glyph_artifacts(raw_md)
+        # Kapitel-Mini-Inhaltsverzeichnis ('| 3.1 | Titel – 40 |') als TOC-Tabelle entfernen.
+        raw_md = strip_toc_tables(raw_md)
 
         # --- Schritt 1a: Front-Matter überspringen (Impressum, Inhaltsverzeichnis) ---
         # Standardmäßig aktiv; Titel + Titelbild bleiben erhalten. Spart außerdem
