@@ -3336,6 +3336,13 @@ if __name__ == "__main__":
         transl_path = cache_dir / "de_uebersetzung.md"
         if args.force and transl_path.exists():
             transl_path.unlink()
+        # Legacy-Fallback: ältere Läufe legten die Übersetzung direkt in out_dir ab (vor dem
+        # work/-Layout). Eine dort vorhandene, bereits verifizierte Übersetzung wiederverwenden,
+        # damit der eingebettete Originaltext deutsch ist statt englisch.
+        if not transl_path.exists():
+            legacy_transl_path = out_dir / "de_uebersetzung.md"
+            if legacy_transl_path.exists():
+                transl_path = legacy_transl_path
 
         target_lang = (args.target_language or "de").lower()
         is_translated = False
@@ -3346,6 +3353,14 @@ if __name__ == "__main__":
             print("--no-translate: Übersetzung übersprungen, Originalsprache bleibt erhalten.")
             working_text = raw_md
             content_lang = (args.source_language or "de").lower()
+        elif transl_path.exists():
+            # Bereits vorhandene Übersetzung (auch aus altem Cache-Ort) immer wiederverwenden –
+            # unabhängig von der Spracherkennung. Verhindert englischen Originaltext trotz
+            # existierender deutscher Übersetzung.
+            print(f"[SKIP] Übersetzung – bereits vorhanden: {transl_path}")
+            working_text = transl_path.read_text(encoding="utf-8")
+            is_translated = True
+            content_lang = target_lang
         else:
             source_lang = (args.source_language or detect_language(raw_md)).lower()
             if source_lang == "unknown":
@@ -3355,13 +3370,6 @@ if __name__ == "__main__":
             elif source_lang == target_lang:
                 print(f"Quelle ist bereits {_language_name(target_lang)}. Keine Übersetzung notwendig.")
                 working_text = raw_md
-                content_lang = target_lang
-            elif transl_path.exists():
-                # Gecachte Übersetzung aus einem vorherigen Lauf wiederverwenden – aber nur,
-                # nachdem feststeht, dass tatsächlich übersetzt werden soll.
-                print(f"[SKIP] Übersetzung – bereits vorhanden: {transl_path}")
-                working_text = transl_path.read_text(encoding="utf-8")
-                is_translated = True
                 content_lang = target_lang
             else:
                 print(f"Quelle ist {_language_name(source_lang)}. Starte Übersetzung nach "
