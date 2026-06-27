@@ -7,6 +7,7 @@ import re
 import json
 from pathlib import Path
 from dotenv import load_dotenv
+import httpx  # transitive Abhängigkeit von google-genai; für Retry auf Netzwerk-Timeouts
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
@@ -39,14 +40,22 @@ load_dotenv()
 # Verhindert dass Tests ohne API-Key scheitern.
 _gemini_client = None
 
+# Pro-Anfrage-Timeout (ms): verhindert, dass ein hängender Socket den Prozess endlos
+# blockiert (z.B. wenn der Server die Antwort-Header nie sendet). Großzügig genug, dass
+# auch lange Gemini-2.5-Pro-Generierungen für große Abschnitte nicht abgewürgt werden.
+GEMINI_TIMEOUT_MS = 600_000  # 10 Minuten
+
 def _get_gemini_client():
     global _gemini_client
     if _gemini_client is None:
-        _gemini_client = genai.Client()
+        _gemini_client = genai.Client(
+            http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS)
+        )
     return _gemini_client
 
 def call_gemini_with_retry(model_name: str, contents, config, max_retries: int = 5, delay: int = 5):
-    """Hilfsfunktion: Ruft Gemini auf und wiederholt den Versuch bei Serverüberlastung (503)."""
+    """Hilfsfunktion: Ruft Gemini auf und wiederholt den Versuch bei Serverüberlastung (503/429)
+    sowie bei Netzwerk-Timeouts/Verbindungsfehlern (hängender Socket)."""
     client = _get_gemini_client()
     for attempt in range(1, max_retries + 1):
         try:
@@ -59,6 +68,14 @@ def call_gemini_with_retry(model_name: str, contents, config, max_retries: int =
         except APIError as e:
             if e.code in [503, 429] and attempt < max_retries:
                 print(f"      [Server ausgelastet] Fehler {e.code}. Warte {delay} Sekunden (Versuch {attempt}/{max_retries})...")
+                time.sleep(delay)
+                delay *= 2
+            else:
+                raise e
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            # Hängende oder abgebrochene Verbindung: erneut versuchen statt endlos zu warten.
+            if attempt < max_retries:
+                print(f"      [Netzwerk-Problem] {type(e).__name__}. Warte {delay} Sekunden (Versuch {attempt}/{max_retries})...")
                 time.sleep(delay)
                 delay *= 2
             else:
@@ -555,11 +572,16 @@ def split_text_by_headings(text: str, max_chars: int = 15000) -> list:
     return chunks
 
 
-def translate_text(text: str, source_lang: str = "en", target_lang: str = "de") -> str:
+def translate_text(text: str, source_lang: str = "en", target_lang: str = "de",
+                   cache_dir: Path = None) -> str:
     """Schritt 2b: Übersetzt den Text abschnittsweise nach den strengen Regeln.
 
     source_lang/target_lang sind ISO-639-1-Codes; der Prompt wird daraus dynamisch gebaut,
     damit nie versehentlich in die falsche Richtung (z.B. Deutsch → Englisch) übersetzt wird.
+
+    Wird cache_dir übergeben, wird jeder fertige Abschnitt einzeln zwischengespeichert
+    (de_uebersetzung_chunk_NN.md). Ein Abbruch/Neustart übersetzt dann nur die noch
+    fehlenden Abschnitte neu, statt von vorne zu beginnen.
     """
     src_name = _language_name(source_lang)
     tgt_name = _language_name(target_lang)
@@ -589,6 +611,11 @@ def translate_text(text: str, source_lang: str = "en", target_lang: str = "de") 
     translated_chunks = []
 
     for i, chunk in enumerate(chunks, 1):
+        chunk_cache = cache_dir / f"de_uebersetzung_chunk_{i:02d}.md" if cache_dir else None
+        if chunk_cache and chunk_cache.exists():
+            print(f"   -> [SKIP] Abschnitt {i} von {len(chunks)} – bereits übersetzt.")
+            translated_chunks.append(chunk_cache.read_text(encoding="utf-8"))
+            continue
         print(f"   -> Übersetze Abschnitt {i} von {len(chunks)}...")
         try:
             response = call_gemini_with_retry(
@@ -597,12 +624,20 @@ def translate_text(text: str, source_lang: str = "en", target_lang: str = "de") 
                 config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=0.1)
             )
             translated_chunks.append(response.text)
+            if chunk_cache:
+                chunk_cache.write_text(response.text, encoding="utf-8")
             time.sleep(2)
         except Exception as e:
             print(f"Fehler bei der Übersetzung von Abschnitt {i}: {e}")
             raise
 
-    return '\n\n'.join(translated_chunks)
+    result = '\n\n'.join(translated_chunks)
+    # Alle Abschnitte erfolgreich → Einzel-Caches aufräumen (die vollständige
+    # de_uebersetzung.md übernimmt ab jetzt das Caching).
+    if cache_dir:
+        for f in cache_dir.glob("de_uebersetzung_chunk_*.md"):
+            f.unlink()
+    return result
 
 
 def split_into_level1_chapters(text: str) -> list:
@@ -3334,8 +3369,11 @@ if __name__ == "__main__":
         # Deutsch: englische Quellen werden automatisch übersetzt, deutsche bleiben deutsch.
         # Eine explizite --target-language oder --source-language überschreibt die Automatik.
         transl_path = cache_dir / "de_uebersetzung.md"
-        if args.force and transl_path.exists():
-            transl_path.unlink()
+        if args.force:
+            if transl_path.exists():
+                transl_path.unlink()
+            for f in cache_dir.glob("de_uebersetzung_chunk_*.md"):
+                f.unlink()
         # Legacy-Fallback: ältere Läufe legten die Übersetzung direkt in out_dir ab (vor dem
         # work/-Layout). Eine dort vorhandene, bereits verifizierte Übersetzung wiederverwenden,
         # damit der eingebettete Originaltext deutsch ist statt englisch.
@@ -3374,7 +3412,7 @@ if __name__ == "__main__":
             else:
                 print(f"Quelle ist {_language_name(source_lang)}. Starte Übersetzung nach "
                       f"{_language_name(target_lang)}...")
-                working_text = translate_text(raw_md, source_lang=source_lang, target_lang=target_lang)
+                working_text = translate_text(raw_md, source_lang=source_lang, target_lang=target_lang, cache_dir=cache_dir)
                 transl_path.write_text(working_text, encoding="utf-8")
                 print(f"       Übersetzung gespeichert: {transl_path}")
                 is_translated = True
