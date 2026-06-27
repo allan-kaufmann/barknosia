@@ -345,6 +345,11 @@ def parse_qa_response(qa_text: str) -> list:
 
         item = {'num': num}
         item.update(_parse_qa_fields(block))
+        # Fragetext (vom Fallback-Parser via serialize_qa_items mitgeführt) zurücklesen,
+        # damit er nach der Nachbearbeitung im Lernfragen-Kapitel angezeigt werden kann.
+        _ftm = re.search(r'(?m)^Fragetext:\s*(.+)', block)
+        if _ftm:
+            item['frage_text'] = _ftm.group(1).strip()
 
         # Unterpunkt-Modus: mehrere "**Label**"-Blöcke (fett, ohne Doppelpunkt), die jeweils
         # eine eigene Antwort tragen (z.B. eine Frage mit aufgelisteten Methoden).
@@ -424,6 +429,8 @@ def serialize_qa_items(items: list) -> str:
     blocks = []
     for it in items:
         lines = [f"**Frage {it['num']}**"]
+        if it.get('frage_text'):
+            lines.append(f"**Fragetext:** {it['frage_text']}")
         if it.get('subs'):
             for sub in it['subs']:
                 lines.append(f"**{sub.get('label', '–')}**")
