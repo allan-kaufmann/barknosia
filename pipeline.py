@@ -1678,6 +1678,19 @@ def _drop_empty_columns(rows_data: list) -> list:
     return [[r[c] if c < len(r) else '' for c in keep] for r in rows_data]
 
 
+def _clean_table_cell(cell: str) -> str:
+    """Bereinigt eine einzelne Tabellenzelle von OCR-Artefakten:
+    - normalisiert geschützte Leerzeichen und kollabiert lange Whitespace-Läufe
+      (OCR hängt teils Tausende Leerzeichen an → sonst riesige Spaltenbreiten),
+    - leert Zellen, die nur aus Trennstrichen/Unterstrichen bestehen (als Tabellenlinie
+      fehlerkannte horizontale Rule → erscheint sonst als '------'-Spalte)."""
+    cell = cell.replace('\xa0', ' ')
+    cell = re.sub(r'\s{2,}', ' ', cell).strip()
+    if cell and not re.search(r'[^\s\-–—_]', cell):
+        return ''
+    return cell
+
+
 def add_markdown_table_to_doc(doc, table_lines: list):
     """
     Konvertiert eine Liste von Markdown-Pipe-Zeilen in eine Word-Tabelle.
@@ -1691,11 +1704,13 @@ def add_markdown_table_to_doc(doc, table_lines: list):
         line = raw_line.strip()
         if SEP_RE.match(line):
             continue
-        cells = [c.strip() for c in line.split('|')]
+        cells = [_clean_table_cell(c) for c in line.split('|')]
         if cells and cells[0] == '':
             cells = cells[1:]
         if cells and cells[-1] == '':
             cells = cells[:-1]
+        if not any(c for c in cells):
+            continue  # komplett leere Zeile (z.B. reine Strich-/Linienzeile) überspringen
         rows_data.append(cells)
 
     if not rows_data:
@@ -1713,9 +1728,13 @@ def add_markdown_table_to_doc(doc, table_lines: list):
     num_cols = max(len(r) for r in rows_data)
     num_rows = len(rows_data)
 
-    # Titel-Zeile erkennen: Zeile 0 hat ≤1 Non-Empty-Cell bei mehreren Spalten
+    # Titel-Zeile erkennen: Zeile 0 hat ≤1 Non-Empty-Cell bei mehreren Spalten – oder sie
+    # beginnt mit einer Tabellen-Caption ("TABELLE 1 …" / "TABLE 1 …"), die die OCR als erste
+    # Tabellenzeile statt als Überschrift erfasst hat. Sie wird dann zu einer zusammengeführten
+    # Titelzeile, sodass der eigentliche Spaltenkopf in Zeile 1 erhalten bleibt.
     non_empty_row0 = sum(1 for c in rows_data[0] if c.strip())
-    has_title_row = (num_rows > 1 and num_cols > 1 and non_empty_row0 <= 1)
+    row0_is_caption = bool(re.match(r'(?i)^\**\s*tab(?:elle|le)\s+\d', rows_data[0][0].strip()))
+    has_title_row = (num_rows > 1 and num_cols > 1 and (non_empty_row0 <= 1 or row0_is_caption))
     header_row_idx = 1 if has_title_row else 0
 
     table = doc.add_table(rows=num_rows, cols=num_cols)
