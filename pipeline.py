@@ -327,6 +327,10 @@ def parse_qa_response(qa_text: str) -> list:
     items = []
     # Splitten an "Frage N" Zeilen
     blocks = re.split(r'(?m)^\*{0,2}(?:##\s*)?Frage\s+(\d+)\*{0,2}:?\s*$', qa_text)
+    # Kein "Frage N"-Header gefunden (z.B. weil das LLM das Format einer kategorisierten,
+    # unnummerierten Fragendatei gespiegelt hat) → Fallback über fett gesetzte Frage-Header.
+    if len(blocks) <= 1:
+        return _parse_qa_by_headers(qa_text)
     # blocks[0] = text vor Frage 1, dann abwechselnd: Fragenummer, Frageblock
     i = 1
     while i < len(blocks) - 1:
@@ -357,6 +361,27 @@ def parse_qa_response(qa_text: str) -> list:
         if len(subs) >= 2:
             item['subs'] = subs
 
+        items.append(item)
+    return items
+
+
+def _parse_qa_by_headers(qa_text: str) -> list:
+    """Fallback-Parser für QA-Output ohne 'Frage N'-Header: splittet an fett gesetzten
+    Frage-Überschriften (**…**). Jeder Abschnitt mit einem 'Antwort:'-Feld wird ein Item;
+    ###-Kategorie-Überschriften und ein evtl. LLM-Vorspann ('Absolut, als Ihr Lerncoach…')
+    werden ignoriert. Der Header-Text wird als 'frage_text' mitgeführt (Anzeige im
+    Lernfragen-Kapitel, falls die Fragendatei keine nummerierten Fragen liefert)."""
+    items: list = []
+    num = 0
+    headers = list(re.finditer(r'(?m)^\*\*\s*(.+?)\s*\*\*\s*$', qa_text))
+    for i, hm in enumerate(headers):
+        seg_end = headers[i + 1].start() if i + 1 < len(headers) else len(qa_text)
+        seg = qa_text[hm.end():seg_end]
+        if not re.search(r'(?m)^Antwort:', seg):
+            continue
+        num += 1
+        item = {'num': num, 'frage_text': hm.group(1).strip()}
+        item.update(_parse_qa_fields(seg))
         items.append(item)
     return items
 
@@ -1030,13 +1055,10 @@ def generate_summary_by_chapter(text: str, out_dir: Path, output_lang: str = "de
     if not chapters:
         print("   Keine Level-1-Kapitel gefunden, fasse Gesamttext zusammen...")
         fallback_path = out_dir / "zusammenfassung_kap_00.md"
-        # Wenn substanzieller Preamble-Inhalt existiert (Abstract etc.), einen fixen
-        # "## Einleitung"-Abschnitt voranstellen, damit die KI ihn explizit zusammenfasst
-        # und sum_lookup["einleitung"] später im Docx-Builder verwendet werden kann.
-        _pre, _ = _split_at_level(text, 2)
-        _pre_body = re.sub(r'^#{1,6}\s.*$', '', _pre, flags=re.MULTILINE).strip()
-        full_text_for_summary = ('## Einleitung\n\n' + text) if len(_pre_body) > 300 else text
-        fallback_ch = {'heading': 'Volltext', 'full_text': full_text_for_summary, 'level': 1}
+        # Die Artikel-Einleitung erhält bereits in main() via insert_intro_heading() eine
+        # eigene "## Einleitung"-Überschrift; der frühere Top-Prepend-Hack entfällt damit
+        # (er platzierte das Heading fälschlich ganz oben vor dem Journal-Namen).
+        fallback_ch = {'heading': 'Volltext', 'full_text': text, 'level': 1}
         result = load_or_run(
             fallback_path,
             lambda: _summarize_chapter_smart(fallback_ch, 0),
@@ -1113,6 +1135,11 @@ def verify_with_questions(summary_text: str, questions_path: str) -> str:
         "Schlüsselbegriffe: [1–3 Begriffe]\n"
         "Beleg: [wörtliches Zitat aus der Zusammenfassung, 5–15 Wörter]\n"
         "Abdeckung: vollständig / teilweise / nicht enthalten\n\n"
+        "WICHTIG zum Format:\n"
+        "- Nummeriere die Fragen fortlaufend als 'Frage 1', 'Frage 2', … in der Reihenfolge "
+        "ihres Auftretens – unabhängig davon, wie die Eingabe gegliedert ist.\n"
+        "- KEINE Kategorie-Überschriften, KEINE Einleitung, KEINE 'Schritt 1/2/3'-Zeilen im "
+        "Ergebnis. Gib NUR die Frage-Blöcke im obigen Format aus.\n\n"
         f"Wissensbasis (Zusammenfassung):\n{summary_text}\n\n"
         f"Fragen:\n{questions}"
     )
@@ -2507,6 +2534,58 @@ def strip_front_matter(text: str) -> str:
     return '\n'.join(out)
 
 
+def collapse_duplicate_title(text: str) -> str:
+    """Entfernt einen doppelten Titel-/Journal-Banner am Dokumentanfang.
+
+    Erscheint der Dokumenttitel im Front-Bereich (vor der ersten inhaltlichen Überschrift wie
+    ZUSAMMENFASSUNG/ABSTRACT/SCHLÜSSELWÖRTER/EINLEITUNG bzw. einer nummerierten Überschrift)
+    mehrfach, wird alles vor der letzten Titel-Wiederholung verworfen – Journal-Banner,
+    Zitationsdaten und die erste Titel-Dublette fallen weg, der saubere Artikelkopf
+    (Titel + Autoren + Affiliationen + Abstract) bleibt. No-op ohne wiederholten Titel."""
+    lines = text.split('\n')
+    content_re = re.compile(
+        r'(?i)^#{1,6}\s.*(ZUSAMMENFASSUNG|ABSTRACT|SCHLÜSSELWÖRTER|KEYWORDS|EINLEITUNG)\b'
+        r'|^#{1,6}\s+\d')
+    seen: dict = {}
+    last_dup = None
+    for idx, ln in enumerate(lines):
+        if content_re.match(ln):
+            break                                   # Front-Bereich endet bei erstem Inhalt
+        if not re.match(r'^#{1,6}\s+\S', ln):
+            continue
+        norm = normalize_heading(_clean_heading_text(ln))
+        if norm and norm in seen:
+            last_dup = idx                          # spätere (Artikelkopf-)Variante behalten
+        else:
+            seen[norm] = idx
+    return '\n'.join(lines[last_dup:]).strip() if last_dup is not None else text
+
+
+def insert_intro_heading(text: str) -> str:
+    """Gibt dem unbeschrifteten Artikel-Intro eine eigene '## Einleitung'-Überschrift.
+
+    In vielen Artikeln folgt der Einleitungstext direkt der Schlüsselwörter-Liste, ohne eigene
+    Überschrift – er hängt dann als Body an der 'SCHLÜSSELWÖRTER'-Sektion und wird vom
+    Summarizer (der nach Überschriften gliedert) auf die Stichwörter reduziert. Diese Funktion
+    trennt den Intro-Text als eigene Sektion ab, damit er in der Pflichtliste landet und
+    zwingend zusammengefasst wird. No-op ohne Keyword-Heading oder ohne substanziellen
+    Intro-Text (z.B. Lehrbuch-Kapitel); idempotent (bricht ab, wenn 'Einleitung' schon existiert)."""
+    m = re.search(r'(?im)^#{1,6}\s*\**\s*(SCHLÜSSELWÖRTER|SCHLAGWÖRTER|KEYWORDS)\b.*$', text)
+    if not m or re.search(r'(?im)^#{1,6}\s*\**\s*Einleitung\b', text):
+        return text
+    body_start = m.end()
+    nxt = re.search(r'(?m)^#{1,6}\s+\S', text[body_start:])
+    body_end = body_start + nxt.start() if nxt else len(text)
+    paras = re.split(r'\n\s*\n', text[body_start:body_end].strip())
+    if len(paras) < 2:
+        return text                                 # nur Stichwörter, kein Intro
+    intro = '\n\n'.join(paras[1:]).strip()
+    if len(intro) < 600:
+        return text
+    new_body = f"\n\n{paras[0]}\n\n## Einleitung\n\n{intro}\n\n"
+    return text[:body_start] + new_body + text[body_end:]
+
+
 def _advance_counter(counters: list, level: int) -> str:
     """
     Erhöht den Zähler für `level` (1-basiert) und setzt tiefere Ebenen zurück.
@@ -3189,7 +3268,9 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
             _set_heading_color(h_f, MM_HEADING_COLORS.get(q_sub_level, MM_HEADING_COLORS[9]))
 
             # Fragetext anzeigen wenn verfügbar (mehrzeilig inkl. Unterpunkte)
-            q_text = questions_map.get(item['num'])
+            # Fragetext bevorzugt aus der (nummerierten) Fragendatei; sonst den vom
+            # Fallback-Parser mitgeführten Header-Text der Frage nutzen.
+            q_text = questions_map.get(item['num']) or item.get('frage_text')
             if q_text:
                 q_lines = q_text.split('\n')
                 p_q = doc.add_paragraph()
@@ -3449,6 +3530,10 @@ if __name__ == "__main__":
         else:
             print("--- Schritt 3: Box-Strukturreparatur (Kästen vom Fließtext trennen) ---")
             working_text = repair_box_structure(working_text)
+            # Front-Matter entdoppeln (Journal-Banner + doppelter Titel) und die unbeschriftete
+            # Artikel-Einleitung mit eigener Überschrift versehen, damit sie zusammengefasst wird.
+            working_text = collapse_duplicate_title(working_text)
+            working_text = insert_intro_heading(working_text)
             struct_path.write_text(working_text, encoding="utf-8")
 
         # --- Schritt 4: Zusammenfassung (kapitelweise) ---
