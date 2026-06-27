@@ -2266,6 +2266,55 @@ def inline_decomposed_figures(text: str, pdf_path: str, base_path: str) -> str:
     return '\n'.join(out)
 
 
+def inline_flattened_tables(text: str, pdf_path: str, base_path: str) -> str:
+    """Fügt für 'flachgewalzte' Tabellen ein aus der Quell-PDF gerendertes Bild ein.
+
+    Hintergrund: Manche Tabellen erfasst die OCR nicht als Pipe-Tabelle, sondern walzt sie in
+    einen Riesen-Caption-Absatz ('Tabelle N …' mit dem kompletten Tabelleninhalt) plus
+    Pseudo-Überschriften flach – sie sind dann nicht mehr als Tabelle erkennbar.
+
+    Erkennung: Caption-Zeile 'Tabelle N …'/'Table N …' mit auffälliger Länge (> 300 Zeichen)
+    und ohne Pipe ('|'). Seitenindex aus dem page-N-Span der Caption (Fallback: nächster Span
+    darüber). Das gerenderte Bild wird direkt NACH der Caption eingefügt; der zerlegte Text
+    bleibt als Fallback erhalten. No-op, wenn pdf_path/base_path fehlen oder das Rendern
+    scheitert (kein pypdfium2 / keine Pfad-Objekte)."""
+    if not pdf_path or not base_path or not os.path.exists(pdf_path):
+        return text
+    lines = text.split('\n')
+    # Echte (flachgewalzte) Tabellen-Caption beginnt mit einem page-Span, den Marker beim
+    # Tabellenobjekt setzt – Fließtext-Sätze wie "Tabelle 2 zeigt …" tun das nicht. Genau diese
+    # Span-am-Zeilenanfang-Bedingung trennt Caption von Tabellen-Verweis im Text.
+    LEAD_PAGE_SPAN_RE = re.compile(r'^<span[^>]*id="page-(\d+)-\d+"[^>]*>')
+    LEAD_SPAN_RE = re.compile(r'^(?:<span[^>]*>\s*|</span>\s*)+')
+    CAP_RE = re.compile(r'^\*{0,2}\s*(?:Tabelle|Table)\s+\d+\b')
+    inserts: dict[int, str] = {}     # Zeilenindex → Bildzeile (danach einfügen)
+    rendered = 0
+    for i, line in enumerate(lines):
+        s = line.strip()
+        m_span = LEAD_PAGE_SPAN_RE.match(s)
+        if not m_span or len(s) <= 300 or '|' in s:
+            continue
+        core = LEAD_SPAN_RE.sub('', s)
+        if not CAP_RE.match(core):
+            continue
+        page_index = int(m_span.group(1))
+        out_name = f"_rendered_table_p{page_index}.jpeg"
+        out_path = os.path.join(base_path, out_name)
+        if render_pdf_figure_region(pdf_path, page_index, out_path):
+            inserts[i] = f"![]({out_name})"
+            rendered += 1
+    if not inserts:
+        return text
+    out = []
+    for idx, line in enumerate(lines):
+        out.append(line)
+        if idx in inserts:
+            out.append('')
+            out.append(inserts[idx])
+    print(f"   [TABELLE] {rendered} flachgewalzte Tabelle(n) aus PDF gerendert.")
+    return '\n'.join(out)
+
+
 def _caption_protected_image_lines(lines: list) -> set:
     """Zeilen-Indizes von Bildern, die im selben Heading-Segment wie eine nummerierte
     Abbildungs-/Tabellen-Caption ('Abb./Tab. N') liegen. Solche Bilder werden NIE als
@@ -2563,6 +2612,42 @@ def strip_front_matter(text: str) -> str:
             continue
         out.append(line)
     return '\n'.join(out)
+
+
+_PUBMETA_PATTERNS = [
+    r'urheberrechtlich geschützt durch die American Psychological',
+    r'copyrighted by the American Psychological',
+    r'ausschließlich für (die persönliche|den persönlichen Gebrauch)',
+    r'intended solely for the personal',
+    r'(Nutzung durch den einzelnen Anwender|use of the individual user)',
+    r'(darf nicht (weiter|weit) verbreitet|disseminated broadly)',
+    r'©\s*\d{4}\s+American Psychological Association',
+    r'\bISSN:',
+    r'^\s*\d{4},\s*(Bd\.|Vol\.)\s*\d+',
+    r'(online erstveröffentlicht|published online first)',
+    r'(fungierte als Action Editor|served as action editor)',
+]
+_PUBMETA_RE = re.compile('|'.join(_PUBMETA_PATTERNS), re.IGNORECASE)
+
+
+def strip_publication_metadata(text: str) -> str:
+    """Entfernt verstreute Journal-Publikations-Metadaten (Copyright-/Personal-Use-Hinweis,
+    ISSN/Heft/DOI-Kopf, 'Online First'/Action-Editor), die die OCR zwischen den eigentlichen
+    Inhalt streut und die den Lesefluss stören. Arbeitet zeilenweise; Bild- und
+    Überschriftenzeilen bleiben unangetastet. Behält bewusst Autorenbeiträge, Förderung,
+    ORCID und Korrespondenz. No-op bei Dokumenten ohne diese Muster."""
+    out: list[str] = []
+    removed = False
+    for line in text.split('\n'):
+        stripped = line.strip()
+        if stripped and not stripped.startswith(('!', '#')) and _PUBMETA_RE.search(stripped):
+            removed = True
+            continue
+        out.append(line)
+    if not removed:
+        return text
+    # durch entfernte Zeilen entstandene Mehrfach-Leerzeilen auf eine reduzieren
+    return re.sub(r'\n{3,}', '\n\n', '\n'.join(out))
 
 
 def collapse_duplicate_title(text: str) -> str:
@@ -3535,7 +3620,11 @@ if __name__ == "__main__":
         if is_translated:
             transl_docx_path = out_dir / f"{pdf_stem}{kap_infix}_Uebersetzung.docx"
             if args.force or not transl_docx_path.exists():
-                build_translation_word_document(working_text, str(transl_docx_path), base_path=image_base)
+                # Auch das Übersetzungs-Docx von Publikations-Metadaten bereinigen und
+                # flachgewalzte Tabellen als Bild einfügen (lokale Kopie, ohne den Cache zu ändern).
+                transl_text = strip_publication_metadata(working_text)
+                transl_text = inline_flattened_tables(transl_text, args.pdf_path, image_base)
+                build_translation_word_document(transl_text, str(transl_docx_path), base_path=image_base)
             else:
                 print(f"[SKIP] Übersetzungs-Docx – bereits vorhanden: {transl_docx_path}")
 
@@ -3615,9 +3704,15 @@ if __name__ == "__main__":
             else:
                 print(f"Warnung: Fragen-Datei '{args.questions}' nicht gefunden. Überspringe QS.")
 
+        # Publikations-Metadaten (Copyright/ISSN/DOI/Online-First) entfernen, die die OCR
+        # zwischen den Inhalt streut und die den Lesefluss stören.
+        working_text = strip_publication_metadata(working_text)
         # Zerstückelte Abbildungen (Marker hat eine Grafik in Text + Icons zerlegt) als ganze
         # Figur aus der Quell-PDF rendern und die scattered Icon-Bilder ersetzen.
         working_text = inline_decomposed_figures(working_text, args.pdf_path, image_base)
+        # Flachgewalzte Tabellen (von der OCR nicht als Pipe-Tabelle erkannt) als Bild der
+        # PDF-Seite einfügen.
+        working_text = inline_flattened_tables(working_text, args.pdf_path, image_base)
 
         # --- Word-Dokument zusammensetzen ---
         suffix = f"_Einbetten_{args.parent_chapter.replace('.', '-')}" if args.parent_chapter else "_Lernskript"
