@@ -3671,6 +3671,361 @@ def build_condensed_word_document(condensed_text: str, output_path: str, base_pa
 
 
 # ---------------------------------------------------------------------------
+# Leitfragen-Quiz-Prüfung (bestehende .docx-Lernunterlage bearbeiten)
+# ---------------------------------------------------------------------------
+#
+# Neuer Verarbeitungspfad, getrennt vom PDF→Lernmittel-Flow: Eingabe ist eine
+# fertige .docx-Lernunterlage mit einem Kapitel "Leitfragen-Quiz", dessen Fragen
+# nur als Screenshots (Bilder) vorliegen. Das Dokument wird ausschließlich
+# ERGÄNZT (nie umgeschrieben/gelöscht):
+#   1. Fragebilder → Text (Gemini-Vision)
+#   2. Prüfung gegen den restlichen Dokumenttext (bestehendes QA-Feature)
+#   3. Antwort + Abdeckungsgrad unter jede Frage in Kapitel 10 einfügen
+#   4. Kommentar-Marker ("Quizfrage N") an den relevanten Quellkapiteln setzen
+#      bzw. bestehende Kommentare erweitern
+# Ausgabe in eine neue Kopie; das Original bleibt unangetastet.
+
+DEFAULT_QUIZ_CHAPTER = '10 Leitfragen-Quiz zum Kurs "Personalauswahl"'
+
+
+def _iter_paragraph_image_blobs(doc, paragraph):
+    """Liefert (blob, mime) für jedes eingebettete Bild (w:blip r:embed) eines Absatzes."""
+    out = []
+    for blip in paragraph._p.findall('.//' + qn('a:blip')):
+        rId = blip.get(qn('r:embed'))
+        if not rId:
+            continue
+        part = doc.part.related_parts.get(rId)
+        if part is not None:
+            out.append((part.blob, part.content_type))
+    return out
+
+
+def extract_quiz_questions(doc, quiz_chapter_heading: str):
+    """Findet das Quiz-Kapitel (Heading 2) und sammelt pro 'Frage N' (Heading 3) die
+    folgenden Bild-Absätze. Gibt (questions, quiz_range) zurück:
+      questions: [{'num', 'heading_para', 'anchor', 'images': [(blob, mime), ...]}]
+      quiz_range: (lo, hi) Absatz-Indizes des Kapitels (für KB-Ausschluss)
+    'anchor' ist der Absatz DIREKT nach dem Bildblock der Frage (Einfügepunkt der Antwort).
+    """
+    paras = doc.paragraphs
+    target = normalize_heading(quiz_chapter_heading)
+
+    def style_of(p):
+        return p.style.name if p.style else ""
+
+    start = None
+    for i, p in enumerate(paras):
+        if style_of(p) == "Heading 2" and normalize_heading(p.text) == target:
+            start = i
+            break
+    if start is None:  # Fallback: enthält-Vergleich
+        for i, p in enumerate(paras):
+            if "Heading" in style_of(p) and target[:20] in normalize_heading(p.text):
+                start = i
+                break
+    if start is None:
+        raise ValueError(f"Quiz-Kapitel '{quiz_chapter_heading}' nicht gefunden.")
+
+    hi = len(paras)
+    for i in range(start + 1, len(paras)):
+        if style_of(paras[i]) in ("Heading 1", "Heading 2"):
+            hi = i
+            break
+
+    questions = []
+    i = start + 1
+    frage_re = re.compile(r'^Frage\s+(\d+)\b')
+    while i < hi:
+        m = frage_re.match(paras[i].text.strip())
+        if style_of(paras[i]) == "Heading 3" and m:
+            num = int(m.group(1))
+            images = []
+            j = i + 1
+            while j < hi:
+                if style_of(paras[j]) == "Heading 3" and frage_re.match(paras[j].text.strip()):
+                    break
+                images.extend(_iter_paragraph_image_blobs(doc, paras[j]))
+                j += 1
+            anchor = paras[j] if j < len(paras) else None
+            questions.append({'num': num, 'heading_para': paras[i], 'anchor': anchor, 'images': images})
+            i = j
+        else:
+            i += 1
+    return questions, (start, hi)
+
+
+def _ocr_quiz_image(images) -> str:
+    """Transkribiert eine Quiz-Frage aus ihren Screenshot(s) via Gemini-Vision."""
+    supported = {'image/png', 'image/jpeg', 'image/webp', 'image/heic', 'image/heif'}
+    parts = []
+    for blob, mime in images:
+        if mime in supported:
+            parts.append(types.Part.from_bytes(data=blob, mime_type=mime))
+    if not parts:
+        return ""
+    prompt = (
+        "Dies ist ein Screenshot einer einzelnen Quiz-/Prüfungsfrage aus einer "
+        "Lernunterlage. Transkribiere den vollständigen Fragetext wörtlich, inklusive "
+        "aller Antwortoptionen (z.B. a), b), c)) falls vorhanden. Gib NUR den reinen "
+        "Fragetext aus – keine Einleitung, keine Erklärung, keine Bildbeschreibung."
+    )
+    parts.append(prompt)
+    resp = call_gemini_with_retry(
+        model_name='gemini-2.5-pro',
+        contents=parts,
+        config=types.GenerateContentConfig(temperature=0.0),
+    )
+    return (resp.text or "").strip()
+
+
+def ocr_quiz_questions(questions, cache_path: Path, force: bool = False) -> dict:
+    """Vision-OCR aller Fragebilder mit JSON-Cache. Gibt {num: fragetext} zurück."""
+    cache = {}
+    if cache_path.exists() and not force:
+        cache = {int(k): v for k, v in json.loads(cache_path.read_text(encoding="utf-8")).items()}
+    updated = False
+    for q in questions:
+        num = q['num']
+        if num in cache and cache[num].strip():
+            continue
+        print(f"   [Vision] Frage {num} ({len(q['images'])} Bild(er)) …")
+        cache[num] = _ocr_quiz_image(q['images']) or "(Bild nicht lesbar)"
+        updated = True
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    if updated:
+        print(f"   Vision-OCR abgeschlossen: {len(cache)} Fragen → {cache_path}")
+    else:
+        print(f"[SKIP] Vision-OCR – bereits vorhanden: {cache_path}")
+    return cache
+
+
+def _heading_match_keys(text: str) -> set:
+    """Präzise Matching-Schlüssel einer Überschrift/Textgrundlage: volle Überschrift,
+    führende Kapitelnummer (z.B. '3.4.1') und der nummernfreie Titel. Keine bloßen
+    Einzelziffern (Mehrdeutigkeit)."""
+    t = _clean_heading_text(text or '').replace('[', '').replace(']', '')
+    t = re.split(r'[,;•]', t)[0].strip()
+    keys = set()
+    full = normalize_heading(t)
+    if full:
+        keys.add(full)
+    numm = re.match(r'^(\d+(?:\.\d+)*)\b', t)
+    if numm:
+        keys.add(numm.group(1))
+    title = normalize_heading(re.sub(r'^\d+(?:\.\d+)*\.?\s*', '', t))
+    if len(title) > 2:
+        keys.add(title)
+    return {k for k in keys if k}
+
+
+def _enclosing_h1_range(doc, para_idx: int):
+    """Absatz-Bereich (start, end) der Heading-1-Kurseinheit, die para_idx enthält.
+    Fallback: gesamtes Dokument, falls keine H1 vorhanden."""
+    paras = doc.paragraphs
+    h1s = [i for i, p in enumerate(paras) if p.style and p.style.name == "Heading 1"]
+    start, end = 0, len(paras)
+    for i in h1s:
+        if i <= para_idx:
+            start = i
+        elif i > para_idx:
+            end = i
+            break
+    return start, end
+
+
+def build_quiz_knowledge_base(doc, include_range, exclude_range):
+    """Baut aus dem Dokument-Bereich `include_range` (ohne das Quiz-Kapitel `exclude_range`)
+    eine gegliederte Markdown-Wissensbasis und eine Map {match_key: Absatz} zur
+    Marker-Verankerung."""
+    inc_lo, inc_hi = include_range
+    exc_lo, exc_hi = exclude_range
+    lines = []
+    heading_map = {}
+    for i, p in enumerate(doc.paragraphs):
+        if not (inc_lo <= i < inc_hi):
+            continue
+        if exc_lo <= i < exc_hi:
+            continue
+        txt = p.text.strip()
+        if not txt:
+            continue
+        st = p.style.name if p.style else ""
+        m = re.match(r'Heading (\d)', st)
+        if m:
+            lvl = int(m.group(1))
+            lines.append('#' * min(lvl, 6) + ' ' + txt)
+            for key in _heading_match_keys(txt):
+                heading_map.setdefault(key, p)
+        else:
+            lines.append(txt)
+    return '\n\n'.join(lines), heading_map
+
+
+def _resolve_tg_para(textgrundlage: str, heading_map: dict):
+    """Löst eine QA-Textgrundlage auf den zugehörigen Überschrift-Absatz auf (oder None)."""
+    if not textgrundlage or textgrundlage.strip() in ('–', '-', ''):
+        return None
+    keys = sorted(_heading_match_keys(textgrundlage),
+                  key=lambda k: (0 if re.search(r'\d', k) else 1, -len(k)))
+    for key in keys:
+        if key in heading_map:
+            return heading_map[key]
+    return None
+
+
+def _existing_comment_id(paragraph):
+    """Kommentar-ID, falls der Absatz bereits in einem Kommentarbereich liegt, sonst None."""
+    el = paragraph._p.find(qn('w:commentRangeStart'))
+    if el is None:
+        el = paragraph._p.find('.//' + qn('w:commentReference'))
+    if el is not None:
+        try:
+            return int(el.get(qn('w:id')))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _insert_qa_answer_before(anchor, item):
+    """Fügt Antwort- und Meta-Absätze VOR dem Anker-Absatz ein (nur Insert, nichts löschen)."""
+    def emit(antwort, quelle, schluessel, abdeckung, label=None):
+        if label:
+            pl = anchor.insert_paragraph_before()
+            pl.add_run(label).bold = True
+        pa = anchor.insert_paragraph_before()
+        pa.add_run("Antwort: ").bold = True
+        pa.add_run(antwort or "–")
+        pm = anchor.insert_paragraph_before()
+        r = pm.add_run(
+            f"Quelle: {quelle or '–'}  |  "
+            f"Schlüsselbegriffe: {schluessel or '–'}  |  "
+            f"Abdeckung: {abdeckung or '–'}"
+        )
+        r.font.size = Pt(9)
+        low = (abdeckung or '').lower()
+        if 'nicht enthalten' in low or 'teilweise' in low:
+            r.font.color.rgb = RGBColor(0xC0, 0x00, 0x00)
+        else:
+            r.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+
+    if item.get('subs'):
+        for sub in item['subs']:
+            emit(sub.get('antwort'), sub.get('textgrundlage'),
+                 sub.get('schluessel'), sub.get('abdeckung'), label=sub.get('label'))
+    else:
+        emit(item.get('antwort'), item.get('textgrundlage'),
+             item.get('schluessel'), item.get('abdeckung'))
+
+
+def _apply_quiz_markers(doc, items_by_num, heading_map):
+    """Setzt je Quizfrage einen Kommentar-Marker am relevanten Quellabschnitt.
+    Bereits kommentierte Stellen werden erweitert statt doppelt markiert."""
+    marked = extended = skipped = 0
+    for num, item in sorted(items_by_num.items()):
+        tgs = ([s.get('textgrundlage', '') for s in item['subs']]
+               if item.get('subs') else [item.get('textgrundlage', '')])
+        targets = {}
+        for tg in tgs:
+            para = _resolve_tg_para(tg, heading_map)
+            if para is not None:
+                targets[id(para._p)] = para
+        if not targets:
+            skipped += 1
+            continue
+        label = f"Quizfrage {num}"
+        for para in targets.values():
+            existing = _existing_comment_id(para)
+            if existing is not None:
+                c = doc.comments.get(existing)
+                if c is not None:
+                    c.add_paragraph(label)
+                    extended += 1
+                    continue
+            runs = para.runs or [para.add_run("")]
+            doc.add_comment(runs, text=label, author="Quiz", initials="QZ")
+            marked += 1
+    print(f"   Marker: {marked} neu, {extended} erweitert, {skipped} ohne Fundstelle.")
+    return marked, extended, skipped
+
+
+def run_quiz_check(docx_path: str, quiz_chapter_heading: str = DEFAULT_QUIZ_CHAPTER,
+                   output_path: str = None, force: bool = False) -> str:
+    """End-to-End: prüft ein Leitfragen-Quiz gegen die Lernunterlage, schreibt Antworten
+    in das Quiz-Kapitel und setzt Kommentar-Marker. Speichert eine neue Kopie."""
+    src = Path(docx_path)
+    if not src.exists():
+        raise FileNotFoundError(f"Datei nicht gefunden: {docx_path}")
+    if output_path is None:
+        output_path = str(src.with_name(f"{src.stem}_Quizgeprueft.docx"))
+    work_dir = src.parent / f".quizcheck_{src.stem}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    if force:
+        # load_or_run/OCR-Cache honorieren --force nur teilweise; hier alle Zwischen-
+        # ergebnisse gezielt entfernen, damit --force wirklich neu berechnet.
+        for f in ("quiz_fragen.json", "quiz_fragen.txt", "quiz_wissensbasis.md",
+                  "quiz_qa_ergebnis.md"):
+            (work_dir / f).unlink(missing_ok=True)
+
+    print(f"--- Quiz-Prüfung: {src.name} ---")
+    doc = Document(str(src))
+    para_count_before = len(doc.paragraphs)
+
+    # Schritt 1: Fragen + Bilder extrahieren
+    questions, quiz_range = extract_quiz_questions(doc, quiz_chapter_heading)
+    print(f"   {len(questions)} Quizfragen in Kapitel gefunden (Absätze {quiz_range[0]}–{quiz_range[1]}).")
+
+    # Schritt 2: Vision-OCR (Bilder → Fragetext), gecacht
+    ocr_map = ocr_quiz_questions(questions, work_dir / "quiz_fragen.json", force=force)
+    questions_txt_path = work_dir / "quiz_fragen.txt"
+    q_lines = []
+    for q in sorted(questions, key=lambda x: x['num']):
+        text = ' '.join(ocr_map.get(q['num'], '').split())
+        q_lines.append(f"{q['num']}. {text}")
+    questions_txt_path.write_text('\n'.join(q_lines), encoding="utf-8")
+
+    # Schritt 3: Wissensbasis auf die umschließende Kurseinheit (Heading 1) begrenzen
+    # (thematisch passend: ein Personalauswahl-Quiz wird gegen die KE Personalauswahl
+    # geprüft, nicht gegen fremde Kurseinheiten) und das Quiz-Kapitel selbst ausschließen.
+    kb_path = work_dir / "quiz_wissensbasis.md"
+    kb_scope = _enclosing_h1_range(doc, quiz_range[0])
+    kb, heading_map = build_quiz_knowledge_base(doc, kb_scope, quiz_range)
+    kb_path.write_text(kb, encoding="utf-8")
+    print(f"   Wissensbasis (Absätze {kb_scope[0]}–{kb_scope[1]}): {len(kb)} Zeichen, "
+          f"{len(heading_map)} Überschrift-Schlüssel.")
+
+    # Schritt 4: Vollständigkeitsprüfung (bestehendes QA-Feature wiederverwenden)
+    qa_path = work_dir / "quiz_qa_ergebnis.md"
+    qa_text = load_or_run(
+        qa_path,
+        lambda: verify_with_questions(kb, str(questions_txt_path)),
+        "Quiz-Vollständigkeitsprüfung",
+    )
+    items = parse_qa_response(qa_text)
+    items_by_num = {it['num']: it for it in items}
+    print(f"   QA geparst: {len(items)} Antwort-Items.")
+
+    # Schritt 5: Antworten in Kapitel 10 einfügen (nur Insert)
+    inserted = 0
+    for q in questions:
+        item = items_by_num.get(q['num'])
+        if item and q['anchor'] is not None:
+            _insert_qa_answer_before(q['anchor'], item)
+            inserted += 1
+    print(f"   Antworten eingefügt: {inserted}/{len(questions)}.")
+
+    # Schritt 6: Kommentar-Marker an Quellkapiteln
+    _apply_quiz_markers(doc, items_by_num, heading_map)
+
+    # Schritt 7: neue Kopie speichern
+    doc.save(output_path)
+    added = len(doc.paragraphs) - para_count_before
+    print(f"Fertig: {output_path}  (+{added} Absätze eingefügt, Originalinhalt unverändert)")
+    return output_path
+
+
+# ---------------------------------------------------------------------------
 # Hauptprogramm
 # ---------------------------------------------------------------------------
 
@@ -3687,8 +4042,16 @@ if __name__ == "__main__":
             "  python pipeline.py dok.pdf --force   # alle Zwischenergebnisse neu berechnen\n"
         ),
     )
-    parser.add_argument("pdf_path", type=str, help="Pfad zur Quell-PDF-Datei")
+    parser.add_argument("pdf_path", type=str, nargs="?", default=None, help="Pfad zur Quell-PDF-Datei")
     parser.add_argument("--questions", type=str, default=None, help="Pfad zu den leseleitenden Fragen (optional)")
+    parser.add_argument("--quiz-docx", type=str, default=None,
+                        help="Getrennter Modus: prüft ein Leitfragen-Quiz in einer bestehenden "
+                             ".docx-Lernunterlage (Fragen als Screenshots) gegen den Dokumenttext, "
+                             "schreibt Antworten + Abdeckungsgrad in das Quiz-Kapitel und setzt "
+                             "Kommentar-Marker an den Quellkapiteln. Ausgabe: '<name>_Quizgeprueft.docx'.")
+    parser.add_argument("--quiz-chapter", type=str, default=DEFAULT_QUIZ_CHAPTER,
+                        help="Überschrift (Heading 2) des Quiz-Kapitels für --quiz-docx. "
+                             f"Standard: '{DEFAULT_QUIZ_CHAPTER}'.")
     parser.add_argument("--force", action="store_true", help="Alle Schritte neu berechnen (kein Resume)")
     parser.add_argument("--parent-chapter", type=str, default=None,
                         help="Elternkapitel im Zieldokument, z.B. '4.2.1.2'. "
@@ -3743,6 +4106,14 @@ if __name__ == "__main__":
     try:
         if not os.getenv("GEMINI_API_KEY"):
             raise ValueError("GEMINI_API_KEY fehlt in der .env-Datei!")
+
+        # --- Getrennter Modus: Leitfragen-Quiz-Prüfung einer bestehenden .docx ---
+        if args.quiz_docx:
+            run_quiz_check(args.quiz_docx, quiz_chapter_heading=args.quiz_chapter, force=args.force)
+            sys.exit(0)
+
+        if not args.pdf_path:
+            raise ValueError("Kein PDF angegeben. (Für den Quiz-Modus: --quiz-docx <datei>.)")
 
         if not os.path.exists(args.pdf_path):
             raise FileNotFoundError(f"Die Datei {args.pdf_path} wurde nicht gefunden.")
