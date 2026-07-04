@@ -583,14 +583,24 @@ def detect_language(text: str) -> str:
         return "unknown"
 
 
+_ANY_HEADING_RE = re.compile(r'^#{1,6}\s')
+
+
 def split_text_by_headings(text: str, max_chars: int = 15000) -> list:
-    """Hilfsfunktion: Splittet Markdown-Text an Überschriften in logische Abschnitte."""
+    """Hilfsfunktion: Splittet Markdown-Text an Überschriften in logische Abschnitte.
+
+    Erkennt Überschriften JEDER Tiefe (#-######) als möglichen Splitpunkt, nicht nur #/##:
+    Dokumente mit uneinheitlicher Verschachtelung (z.B. Sammelbände, bei denen einzelne
+    Kapitel nur ### statt # sind) könnten sonst ohne jeden Splitpunkt auf ein Vielfaches von
+    max_chars anwachsen, bevor überhaupt ein Chunk-Ende möglich ist - mit dem Risiko, dass ein
+    einzelner, zu großer Übersetzungs-Call Inhalte verliert.
+    """
     chunks = []
     current_chunk = []
     current_length = 0
 
     for line in text.split('\n'):
-        if (line.startswith('# ') or line.startswith('## ')) and current_length > max_chars:
+        if _ANY_HEADING_RE.match(line) and current_length > max_chars:
             chunks.append('\n'.join(current_chunk))
             current_chunk = []
             current_length = 0
@@ -743,12 +753,24 @@ def split_into_level1_chapters(text: str) -> list:
     return chapters
 
 
+_ROMAN_LABEL_RE = re.compile(r'^\**\s*[IVXLCDM]+\.\s+\S')
+_DIGIT_LABEL_RE = re.compile(r'^\**\s*\d+\.\s+\S')
+
+
 def split_into_articles(text: str) -> list:
     """
-    Splittet Markdown-Text an der FLACHSTEN vorkommenden Überschriftenebene, unabhängig vom
-    Präfix (Ziffern, römische Zahlen oder gar keiner). Für Sammelbände/Festschriften mit
-    unabhängigen Artikeln (z.B. römisch nummerierte Kapitel wie "I. Titel"), die
-    split_into_level1_chapters (nur ziffernbasiert) nicht erkennt.
+    Splittet Markdown-Text in einzelne Artikel für Sammelbände/Festschriften. Primär anhand
+    römisch nummerierter Überschriften-Labels ("I. Titel"), UNABHÄNGIG von der #-Tiefe - notwendig,
+    weil einzelne Artikel eines Sammelbands oft uneinheitlich tief verschachtelt sind (z.B. manche
+    Artikel als "#", andere als "###", je nach OCR/Layout der Originalseite),
+    split_into_level1_chapters aber nur Ziffern erkennt und nur eine einzige Ebene splittet.
+    Ziffern-Labels (z.B. "0. Vorwort") zählen nur als Artikelgrenze, wenn sie auf derselben
+    #-Tiefe wie mindestens eine römische Überschrift liegen - sonst würden normale nummerierte
+    Unterabschnitte innerhalb eines Artikels (z.B. "1. Einleitung", "2. Prozessschritte") fälschlich
+    als eigene Artikel erkannt. Kein Kollisionsrisiko mit Fließtext (z.B. "I. Definition" als
+    Aufzählungspunkt), da nur echte Markdown-Heading-Zeilen (beginnend mit #) geprüft werden.
+    Fallback ohne jedes römische Label (z.B. Sammelband ganz ohne Nummerierung): flachste
+    Heading-Ebene.
     Jeder Eintrag: {'heading': str, 'full_text': str, 'level': int}.
     """
     lines = text.split('\n')
@@ -758,22 +780,38 @@ def split_into_articles(text: str) -> list:
         m = re.match(r'^(#{1,6})\s+(\S.*)$', line)
         return len(m.group(1)) if m else None
 
-    levels = [lv for line in lines if (lv := _heading_level(line)) is not None]
-    if not levels:
-        return []
-    split_level = min(levels)
+    def _clean_heading_line(line: str, level: int) -> str:
+        stripped = _html_re.sub('', line).replace('**', '')
+        return re.sub(r'^#{1,6}\s+', '', stripped).strip()
+
+    all_levels = [(i, lv) for i, line in enumerate(lines) if (lv := _heading_level(line)) is not None]
+    roman_levels = {lv for i, lv in all_levels if _ROMAN_LABEL_RE.match(_clean_heading_line(lines[i], lv))}
+
+    if roman_levels:
+        def is_split_point(i, lv):
+            cleaned = _clean_heading_line(lines[i], lv)
+            if _ROMAN_LABEL_RE.match(cleaned):
+                return True
+            return lv in roman_levels and bool(_DIGIT_LABEL_RE.match(cleaned))
+    else:
+        if not all_levels:
+            return []
+        split_level = min(lv for _, lv in all_levels)
+        is_split_point = lambda i, lv: lv == split_level
 
     chapters = []
     current_heading = None
+    current_level = None
     current_lines: list = []
     pre_lines: list = []
 
-    for line in lines:
-        if _heading_level(line) == split_level:
+    for i, line in enumerate(lines):
+        lv = _heading_level(line)
+        if lv is not None and is_split_point(i, lv):
             if current_heading is not None:
-                chapters.append({'heading': current_heading, 'full_text': '\n'.join(current_lines), 'level': split_level})
-            stripped = _html_re.sub('', line).replace('**', '')
-            current_heading = re.sub(r'^#{1,6}\s+', '', stripped).strip()
+                chapters.append({'heading': current_heading, 'full_text': '\n'.join(current_lines), 'level': current_level})
+            current_heading = _clean_heading_line(line, lv)
+            current_level = lv
             current_lines = [line]
         else:
             if current_heading is None:
@@ -782,7 +820,7 @@ def split_into_articles(text: str) -> list:
                 current_lines.append(line)
 
     if current_heading is not None:
-        chapters.append({'heading': current_heading, 'full_text': '\n'.join(current_lines), 'level': split_level})
+        chapters.append({'heading': current_heading, 'full_text': '\n'.join(current_lines), 'level': current_level})
 
     # Vorspann vor der ersten Artikelüberschrift (z.B. Titelseite/Vorwort) an den ersten
     # Artikel anhängen, statt ihn stillschweigend zu verwerfen.

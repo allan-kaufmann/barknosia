@@ -65,6 +65,7 @@ from pipeline import (
     _extract_quotes_block,
     generate_condensed_summary,
     build_condensed_word_document,
+    split_text_by_headings,
 )
 import pipeline
 
@@ -3362,3 +3363,93 @@ def test_build_condensed_word_document_standalone_without_parent_chapter():
     heading_texts = [p.text for p in doc.paragraphs if "Heading" in p.style.name]
     assert any(t == "Vertiefende Literatur" for t in heading_texts)
     assert any("Artikel" in t and not t[0].isdigit() for t in heading_texts)
+
+
+# ---------------------------------------------------------------------------
+# Bugfix (2026-07-04): split_into_articles erkannte in einem realen Sammelband nur
+# 8 von 20 Artikeln, weil Artikelüberschriften zwischen # und ### wechseln (uneinheitliche
+# #-Tiefe je nach OCR/Layout). split_text_by_headings splittete zudem nur an #/##, wodurch
+# ein einzelner ~63.000-Zeichen-Block ohne Splitpunkt an Gemini ging und Inhalte verlor.
+# ---------------------------------------------------------------------------
+
+def test_split_into_articles_mixed_heading_levels():
+    """Artikelüberschriften auf UNTERSCHIEDLICHEN #-Tiefen (# und ###) müssen trotzdem alle als
+    eigene Artikel erkannt werden - wie im realen Sammelband (Mohr_VII...pdf)."""
+    md = (
+        "### 0. Vorwort\n\nVorwort-Text.\n\n"
+        "### I. Erster Artikel\n\nText I.\n\n"
+        "### II. Zweiter Artikel\n\nText II.\n\n"
+        "# III. Dritter Artikel\n\nText III.\n\n"
+        "### IV. Vierter Artikel\n\nText IV.\n"
+    )
+    articles = split_into_articles(md)
+    headings = [a['heading'] for a in articles]
+    assert len(articles) == 5
+    assert any("0. Vorwort" in h for h in headings)
+    assert any("I. Erster Artikel" in h for h in headings)
+    assert any("II. Zweiter Artikel" in h for h in headings)
+    assert any("III. Dritter Artikel" in h for h in headings)
+    assert any("IV. Vierter Artikel" in h for h in headings)
+
+
+def test_split_into_articles_ignores_numbered_subsections_at_other_level():
+    """Nummerierte Unterabschnitte innerhalb eines Artikels (z.B. '1. Einleitung' auf einer
+    #-Tiefe, die kein römisch nummerierter Artikel nutzt) dürfen NICHT fälschlich als eigener
+    Artikel erkannt werden - Regressionsschutz für den realen Fall (Artikel VII hatte interne
+    '#### 1. Einleitung' / '#### 2. Prozessschritte'-Unterabschnitte)."""
+    md = (
+        "# I. Erster Artikel\n\nText I.\n\n"
+        "#### 1. Einleitung\n\nUnterabschnitt, kein eigener Artikel.\n\n"
+        "#### 2. Hauptteil\n\nNoch ein Unterabschnitt.\n\n"
+        "# II. Zweiter Artikel\n\nText II.\n"
+    )
+    articles = split_into_articles(md)
+    assert len(articles) == 2
+    assert "1. Einleitung" in articles[0]['full_text']
+    assert "2. Hauptteil" in articles[0]['full_text']
+
+
+def test_split_into_articles_digit_label_counts_only_at_roman_level():
+    """Ein Ziffern-Label ('0. Vorwort') zählt nur als Artikelgrenze, wenn es auf derselben
+    #-Tiefe wie mindestens eine römische Überschrift liegt."""
+    md = (
+        "#### 0. Sollte kein Artikel sein\n\nFalsche Ebene.\n\n"
+        "### I. Artikel\n\nText.\n\n"
+        "### II. Zweiter Artikel\n\nText 2.\n"
+    )
+    articles = split_into_articles(md)
+    assert len(articles) == 2
+    assert "0. Sollte kein Artikel sein" in articles[0]['full_text']
+
+
+# ---------------------------------------------------------------------------
+# split_text_by_headings – Chunk-Grenze an jeder Heading-Tiefe (nicht nur #/##)
+# ---------------------------------------------------------------------------
+
+def test_split_text_by_headings_splits_at_level3_when_no_shallower_heading():
+    """Ohne jede #/##-Überschrift muss trotzdem an ###-Überschriften gesplittet werden, sobald
+    max_chars überschritten ist - sonst wächst ein Chunk unbegrenzt (realer Bug: 63.000 Zeichen
+    ohne Splitpunkt vor der ersten #-Überschrift)."""
+    filler = "x" * 20
+    md = "### Erster Abschnitt\n\n" + "\n".join([filler] * 20) + "\n\n### Zweiter Abschnitt\n\nText.\n"
+    chunks = split_text_by_headings(md, max_chars=100)
+    assert len(chunks) == 2
+    assert "Erster Abschnitt" in chunks[0]
+    assert "Zweiter Abschnitt" in chunks[1]
+
+
+def test_split_text_by_headings_existing_level1_level2_behavior_unchanged():
+    """Bestehendes Verhalten (Split an # und ##) bleibt für reine #/##-Dokumente unverändert."""
+    filler = "x" * 20
+    md = "# Kapitel 1\n\n" + "\n".join([filler] * 20) + "\n\n## Kapitel 2\n\nText.\n"
+    chunks = split_text_by_headings(md, max_chars=100)
+    assert len(chunks) == 2
+    assert "Kapitel 1" in chunks[0]
+    assert "Kapitel 2" in chunks[1]
+
+
+def test_split_text_by_headings_no_split_below_max_chars():
+    """Unterhalb von max_chars entsteht weiterhin nur ein einziger Chunk."""
+    md = "### A\n\nkurz\n\n### B\n\nauch kurz\n"
+    chunks = split_text_by_headings(md, max_chars=1000)
+    assert len(chunks) == 1
