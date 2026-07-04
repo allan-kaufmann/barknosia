@@ -66,6 +66,7 @@ from pipeline import (
     generate_condensed_summary,
     build_condensed_word_document,
     split_text_by_headings,
+    collapse_duplicate_title,
 )
 import pipeline
 
@@ -3453,3 +3454,47 @@ def test_split_text_by_headings_no_split_below_max_chars():
     md = "### A\n\nkurz\n\n### B\n\nauch kurz\n"
     chunks = split_text_by_headings(md, max_chars=1000)
     assert len(chunks) == 1
+
+
+# ---------------------------------------------------------------------------
+# Bugfix (2026-07-04, Bug C): collapse_duplicate_title verschluckte in einem realen Sammelband
+# Titel, Vorwort und zwei ganze Artikel, weil ihre fett-formatierten, römisch/ziffern-gelabelten
+# Artikelüberschriften (z.B. "### **0. Vorwort**") das bestehende content_re-Abbruchkriterium nie
+# trafen - die Funktion scannte dadurch bis zu einer beliebigen, in mehreren Artikeln wiederkehrenden
+# Abschnittsüberschrift ("Literaturverzeichnis") und hielt das für die gesuchte Titel-Dublette.
+# ---------------------------------------------------------------------------
+
+def test_collapse_duplicate_title_removes_journal_banner():
+    """Bestehendes Verhalten bleibt unverändert: doppelter Titel vor einem Ziffern-Kapitel wird
+    entfernt, der saubere Artikelkopf bleibt."""
+    md = (
+        "### Journal of Something\n\n"
+        "# Mein Artikeltitel\n\n"
+        "Autor A, Autor B\n\n"
+        "# Mein Artikeltitel\n\n"
+        "Autor A, Autor B, Affiliation X\n\n"
+        "## 1 Einleitung\n\nText.\n"
+    )
+    result = collapse_duplicate_title(md)
+    assert result.startswith("# Mein Artikeltitel\n\nAutor A, Autor B, Affiliation X")
+    assert "Journal of Something" not in result
+
+
+def test_collapse_duplicate_title_noop_for_mixed_level_article_labels():
+    """Regressionsschutz: Sammelband mit fett-formatierten, römisch/ziffern-gelabelten
+    Artikelüberschriften (unterschiedliche #-Tiefe) und wiederkehrender Abschnittsüberschrift
+    ('Literaturverzeichnis') in mehreren Artikeln darf NICHT bei der zweiten Wiederholung kappen -
+    Titel, Vorwort und Artikel I/II müssen vollständig erhalten bleiben."""
+    md = (
+        "### **Verlag XY**\n\n"
+        "# Der Wert der Arbeit\n\n"
+        "### **0. Vorwort**\n\nVorwort-Text.\n\n"
+        "### **I. Erster Artikel**\n\nText I.\n\n#### **Literaturverzeichnis**\n\nQuelle A.\n\n"
+        "### **II. Zweiter Artikel**\n\nText II.\n\n#### **Literaturverzeichnis**\n\nQuelle B.\n\n"
+        "# **III. Dritter Artikel**\n\nText III.\n"
+    )
+    result = collapse_duplicate_title(md)
+    assert result == md
+    assert "0. Vorwort" in result
+    assert "I. Erster Artikel" in result
+    assert "II. Zweiter Artikel" in result

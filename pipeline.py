@@ -2835,10 +2835,16 @@ def collapse_duplicate_title(text: str) -> str:
     """Entfernt einen doppelten Titel-/Journal-Banner am Dokumentanfang.
 
     Erscheint der Dokumenttitel im Front-Bereich (vor der ersten inhaltlichen Überschrift wie
-    ZUSAMMENFASSUNG/ABSTRACT/SCHLÜSSELWÖRTER/EINLEITUNG bzw. einer nummerierten Überschrift)
+    ZUSAMMENFASSUNG/ABSTRACT/SCHLÜSSELWÖRTER/EINLEITUNG, einer nummerierten Überschrift, oder
+    einer römisch/ziffern-gelabelten Artikelüberschrift wie in Sammelbänden, z.B. "I. Titel")
     mehrfach, wird alles vor der letzten Titel-Wiederholung verworfen – Journal-Banner,
     Zitationsdaten und die erste Titel-Dublette fallen weg, der saubere Artikelkopf
-    (Titel + Autoren + Affiliationen + Abstract) bleibt. No-op ohne wiederholten Titel."""
+    (Titel + Autoren + Affiliationen + Abstract) bleibt. No-op ohne wiederholten Titel.
+    Ohne die Artikel-Label-Erkennung würde die Funktion bei Sammelbänden mit fett formatierten
+    Artikelüberschriften (z.B. "### **0. Vorwort**") nie beim echten Front-Ende abbrechen und
+    stattdessen bis zu einer beliebigen, in mehreren Artikeln wiederkehrenden Abschnittsüberschrift
+    (z.B. "Literaturverzeichnis") weiterscannen – mit dem Risiko, ganze Artikel fälschlich als
+    "Front-Matter-Dublette" zu verwerfen."""
     lines = text.split('\n')
     content_re = re.compile(
         r'(?i)^#{1,6}\s.*(ZUSAMMENFASSUNG|ABSTRACT|SCHLÜSSELWÖRTER|KEYWORDS|EINLEITUNG)\b'
@@ -2850,7 +2856,10 @@ def collapse_duplicate_title(text: str) -> str:
             break                                   # Front-Bereich endet bei erstem Inhalt
         if not re.match(r'^#{1,6}\s+\S', ln):
             continue
-        norm = normalize_heading(_clean_heading_text(ln))
+        norm_text = _clean_heading_text(ln)
+        if _ROMAN_LABEL_RE.match(norm_text) or _DIGIT_LABEL_RE.match(norm_text):
+            break                                   # Artikel-/Kapitelüberschrift (Sammelband) = Inhalt
+        norm = normalize_heading(norm_text)
         if norm and norm in seen:
             last_dup = idx                          # spätere (Artikelkopf-)Variante behalten
         else:
