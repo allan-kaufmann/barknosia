@@ -224,6 +224,30 @@ Dies ist der wichtigste und komplexeste Teil der Pipeline. Alle Regeln hier sind
 - Maximale Ebene: H9
 - Auto-nummerierte Überschriften erhalten die Ebene ihrer berechneten Nummer
 
+### US-6.8 — Verdichteter Modus für nicht-prüfungsrelevante Zusatzliteratur (`--condensed`)
+**Als** Nutzer  
+**möchte ich** umfangreiche, nicht prüfungsrelevante Zusatzliteratur (z.B. Sammelbände/Festschriften mit
+mehreren eigenständigen Artikeln) nur verdichtet in meine Lernunterlage übernehmen,  
+**damit** ich nicht den vollständigen Originaltext von Inhalten mitschleppen muss, die für die Prüfung
+irrelevant sind.
+
+**Bewusste Ausnahme von US-6.1:** Für diesen Modus gilt die Regel "kein Wort des Originaltexts geht
+verloren" **nicht**. Statt des vollständigen Originaltexts wird pro Artikel nur eine kurze
+Kernaussagen-Übersicht sowie 2–3 wörtliche Zitate im ausgeblendeten Text abgelegt.
+
+**Akzeptanzkriterien:**
+- Artikel-Erkennung erfolgt präfix-unabhängig über die flachste vorkommende Heading-Ebene
+  (`split_into_articles`) — funktioniert auch bei römisch nummerierten oder unnummerierten
+  Artikelüberschriften, im Gegensatz zum ziffernbasierten `split_into_level1_chapters`
+- Pro Artikel: sichtbare Kurzübersicht (3–5 Stichpunkte: Thema, zentrale Erkenntnis/Schlussfolgerung)
+- Pro Artikel: 2–3 wörtliche Zitate aus dem Original, ausschließlich als ausgeblendeter Text
+  (nicht der vollständige Artikeltext)
+- Einbettbar als Unterkapitel in eine bestehende Lernunterlage über den bestehenden
+  `--parent-chapter`/`--title-as-parent`-Mechanismus (z.B. neues Unterkapitel 6.9 mit 6.9.1, 6.9.2, …)
+- Nicht kombinierbar mit `--questions`, `--chapter`, `--from`/`--to`
+- Der bestehende Hauptmodus (`build_interleaved_word_document`, `generate_summary_by_chapter`,
+  `split_into_level1_chapters`, `_summarize_single_chapter`) bleibt davon vollständig unberührt
+
 ---
 
 ## Epic 7 — Tabellenverarbeitung
@@ -298,6 +322,7 @@ Dies ist der wichtigste und komplexeste Teil der Pipeline. Alle Regeln hier sind
 | `--questions FILE` | QA-Lernfragen einbinden |
 | `--force` | Cache ignorieren, alle Schritte neu berechnen |
 | `--include-references` | Referenzen/Literaturverzeichnis nicht überspringen |
+| `--condensed` | Verdichteter Modus für nicht-prüfungsrelevante Zusatzliteratur (siehe US-6.8): pro Artikel nur Kurzübersicht + 2–3 Zitate statt vollständigem Original |
 
 ---
 

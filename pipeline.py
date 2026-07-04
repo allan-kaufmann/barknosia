@@ -743,6 +743,56 @@ def split_into_level1_chapters(text: str) -> list:
     return chapters
 
 
+def split_into_articles(text: str) -> list:
+    """
+    Splittet Markdown-Text an der FLACHSTEN vorkommenden Überschriftenebene, unabhängig vom
+    Präfix (Ziffern, römische Zahlen oder gar keiner). Für Sammelbände/Festschriften mit
+    unabhängigen Artikeln (z.B. römisch nummerierte Kapitel wie "I. Titel"), die
+    split_into_level1_chapters (nur ziffernbasiert) nicht erkennt.
+    Jeder Eintrag: {'heading': str, 'full_text': str, 'level': int}.
+    """
+    lines = text.split('\n')
+    _html_re = re.compile(r'<[^>]+>')
+
+    def _heading_level(line: str):
+        m = re.match(r'^(#{1,6})\s+(\S.*)$', line)
+        return len(m.group(1)) if m else None
+
+    levels = [lv for line in lines if (lv := _heading_level(line)) is not None]
+    if not levels:
+        return []
+    split_level = min(levels)
+
+    chapters = []
+    current_heading = None
+    current_lines: list = []
+    pre_lines: list = []
+
+    for line in lines:
+        if _heading_level(line) == split_level:
+            if current_heading is not None:
+                chapters.append({'heading': current_heading, 'full_text': '\n'.join(current_lines), 'level': split_level})
+            stripped = _html_re.sub('', line).replace('**', '')
+            current_heading = re.sub(r'^#{1,6}\s+', '', stripped).strip()
+            current_lines = [line]
+        else:
+            if current_heading is None:
+                pre_lines.append(line)
+            else:
+                current_lines.append(line)
+
+    if current_heading is not None:
+        chapters.append({'heading': current_heading, 'full_text': '\n'.join(current_lines), 'level': split_level})
+
+    # Vorspann vor der ersten Artikelüberschrift (z.B. Titelseite/Vorwort) an den ersten
+    # Artikel anhängen, statt ihn stillschweigend zu verwerfen.
+    pre_str = '\n'.join(pre_lines).strip()
+    if pre_str and chapters:
+        chapters[0]['full_text'] = pre_str + '\n\n' + chapters[0]['full_text']
+
+    return chapters
+
+
 def _split_at_level2(chapter_text: str) -> tuple[str, list[dict]]:
     """
     Teilt einen Kapiteltext an ## Überschriften (genau 2 Rauten, nicht ###) auf.
@@ -962,6 +1012,63 @@ def _summarize_single_chapter(heading: str, chapter_text: str, output_lang: str 
         raise
 
 
+def _summarize_article_condensed(heading: str, article_text: str, output_lang: str = "de") -> str:
+    """
+    Erstellt eine VERDICHTETE Kurzübersicht für einen einzelnen Artikel eines Sammelbands
+    (z.B. Festschrift-Beitrag): worum es geht, zentrale Erkenntnisse/Schlussfolgerungen, plus
+    2-3 wörtliche Zitate. Im Gegensatz zu _summarize_single_chapter KEINE Pflicht zur
+    vollständigen Unterkapitelabdeckung - der Artikel wird bewusst nicht vollständig
+    aufbereitet, da er nicht prüfungsrelevant ist (verdichteter Modus, --condensed).
+    """
+    lang_name = _language_name(output_lang)
+    prompt = (
+        f"Erstelle eine VERDICHTETE Kurzübersicht für den folgenden Artikel: \"{heading}\"\n\n"
+        f"AUSGABESPRACHE: Der Fließtext (Zusammenfassung) MUSS auf {lang_name} verfasst sein. "
+        f"Die ÜBERSCHRIFT dagegen EXAKT und unverändert aus dem Original übernehmen (gleicher "
+        f"Wortlaut, gleiche Sprache) - sie dient als Zuordnungsschlüssel und muss 1:1 mit dem "
+        f"Original übereinstimmen.\n\n"
+        "Anforderungen:\n"
+        "1. 3-5 Stichpunkte: Worum geht es im Artikel (Thema, Fragestellung, Perspektive des "
+        "Autors) und was wurde erkannt bzw. gefolgert (zentrale Ergebnisse, Thesen, "
+        "Schlussfolgerungen).\n"
+        "2. KEINE vollständige Unterkapitelabdeckung nötig - nur die wesentliche Kernaussage, "
+        "so kurz wie möglich.\n"
+        "3. Danach ein eigener Block '**Zitate:**' mit genau 2-3 kurzen, WÖRTLICHEN Zitaten aus "
+        "dem Original (im Originalwortlaut, NICHT übersetzt, NICHT paraphrasiert), die die "
+        "Kernaussagen des Artikels am besten belegen. Format exakt:\n"
+        "**Zitate:**\n"
+        "1. \"...\"\n"
+        "2. \"...\"\n"
+        "3. \"...\"\n"
+        "4. Keine neuen Informationen ergänzen, keine Bewertung.\n\n"
+        f"Artikeltext:\n{article_text}"
+    )
+    try:
+        response = call_gemini_with_retry(
+            model_name='gemini-2.5-pro',
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=8192)
+        )
+        return response.text
+    except Exception as e:
+        print(f"Fehler bei verdichteter Zusammenfassung von '{heading}': {e}")
+        raise
+
+
+def _extract_quotes_block(condensed_text: str) -> tuple[str, str]:
+    """
+    Trennt einen verdichteten Artikel-Block in (sichtbarer_Zusammenfassungstext, Zitate_Block).
+    Erkennt den '**Zitate:**'-Marker (auch als '## Zitate' o.ä.); ohne Treffer ist der
+    Zitate-Block leer und der gesamte Text gilt als sichtbare Zusammenfassung.
+    """
+    m = re.search(r'(?im)^\s*#{0,6}\s*\**\s*Zitate\s*:?\**\s*$', condensed_text)
+    if not m:
+        return condensed_text.strip(), ''
+    summary_part = condensed_text[:m.start()].strip()
+    quotes_part = condensed_text[m.end():].strip()
+    return summary_part, quotes_part
+
+
 def _ensure_summary_heading(summary: str, heading: str) -> str:
     """Stellt sicher, dass eine Kapitel-Zusammenfassung mit der zugehörigen Überschrift beginnt,
     damit der Docx-Builder sie per sum_lookup der Original-Sektion zuordnen kann.
@@ -1094,6 +1201,42 @@ def generate_summary_by_chapter(text: str, out_dir: Path, output_lang: str = "de
     combined = "\n\n".join(summaries)
     (out_dir / "zusammenfassung.md").write_text(combined, encoding="utf-8")
     print(f"   Zusammenfassung aus {len(chapters)} Kapiteln kombiniert.")
+    return combined
+
+
+def generate_condensed_summary(text: str, out_dir: Path, output_lang: str = "de") -> str:
+    """
+    Verdichteter Modus (--condensed): Erstellt für jeden Artikel eines Sammelbands
+    (per split_into_articles erkannt, auch römisch nummerierte Überschriften) eine kurze
+    Kernaussagen-Übersicht + 2-3 wörtliche Zitate statt einer vollständigen, kapitelweisen
+    Zusammenfassung. Ein API-Call pro Artikel, Caching pro Artikel: verdichtung_artikel_XX.md.
+    Kombiniert am Ende zu verdichtung.md.
+    """
+    print("--- Verdichteter Modus: Erstelle Kurzübersicht je Artikel (via Gemini 2.5 Pro) ---")
+
+    text = normalize_heading_levels(text)
+    articles = split_into_articles(text)
+
+    if not articles:
+        print("   Keine Artikelüberschriften gefunden, verdichte Gesamttext...")
+        articles = [{'heading': 'Volltext', 'full_text': text, 'level': 1}]
+
+    summaries = []
+    for i, article in enumerate(articles, 1):
+        cache_path = out_dir / f"verdichtung_artikel_{i:02d}.md"
+        label = f"Verdichtung Artikel {i}: {article['heading'][:60]}"
+        article_summary = load_or_run(
+            cache_path,
+            lambda a=article: _summarize_article_condensed(a['heading'], a['full_text'], output_lang),
+            label
+        )
+        article_summary = _ensure_summary_heading(article_summary, article['heading'])
+        summaries.append(article_summary)
+        time.sleep(1)
+
+    combined = "\n\n".join(summaries)
+    (out_dir / "verdichtung.md").write_text(combined, encoding="utf-8")
+    print(f"   Verdichtung aus {len(articles)} Artikeln kombiniert.")
     return combined
 
 
@@ -3426,6 +3569,60 @@ def build_interleaved_word_document(translated_text: str, summary_text: str, qa_
     print(f"Word-Dokument erstellt ({len(comment_list)} Kommentare).")
 
 
+def build_condensed_word_document(condensed_text: str, output_path: str, base_path: str = None,
+                                  parent_chapter: str = None, parent_level: int = None,
+                                  doc_title: str = "Vertiefende Literatur") -> None:
+    """
+    Verdichteter Modus (--condensed): Baut ein Word-Dokument mit einer Elternüberschrift
+    (Sammelband-Titel) und je einem Unterkapitel pro Artikel. Sichtbar ist nur die
+    Kurzübersicht; ausgeblendet sind ausschließlich die 2-3 vom Modell gewählten Zitate
+    (NICHT der vollständige Originaltext - anders als build_interleaved_word_document).
+    Kein QA-Overlay, keine Vollständigkeitsprüfung, keine strukturelle Neu-Nummerierung -
+    die Dokumentstruktur ist bewusst einfach: Elternkapitel → Artikel 1..N.
+    """
+    print(f"--- Erstelle verdichtetes Word-Dokument -> {output_path} ---")
+
+    condensed_text = normalize_heading_levels(condensed_text)
+    condensed_text = _strip_selbstpruefung(condensed_text)
+    sections = [s for s in parse_sections(condensed_text) if s['heading'] != '__preamble__']
+
+    doc = Document()
+    style = doc.styles['Normal']
+    style.font.name = 'Arial'
+    style.font.size = Pt(11)
+    style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+    if parent_chapter:
+        p_level = min(parent_level or _parent_level_from_chapter(parent_chapter), 9)
+        h = doc.add_heading(level=p_level)
+        add_formatted_text(h, f"{parent_chapter} {doc_title}",
+                           default_color=MM_HEADING_COLORS.get(p_level, MM_HEADING_COLORS[9]))
+        child_level = min(p_level + 1, 9)
+    else:
+        h = doc.add_heading(doc_title, level=1)
+        _set_heading_color(h, MM_HEADING_COLORS[1])
+        child_level = 2
+
+    for i, sec in enumerate(sections, 1):
+        heading_text = _clean_heading_text(sec['heading'])
+        if parent_chapter:
+            heading_text = f"{parent_chapter}.{i} {heading_text}"
+        h = doc.add_heading(level=child_level)
+        add_formatted_text(h, heading_text,
+                           default_color=MM_HEADING_COLORS.get(child_level, MM_HEADING_COLORS[9]))
+
+        summary_body, quotes_body = _extract_quotes_block(sec['body'])
+        if summary_body:
+            process_markdown_to_docx(doc, summary_body, hide_text=False,
+                                     base_path=base_path, headings_as_bold=True)
+        if quotes_body:
+            process_markdown_to_docx(doc, quotes_body, hide_text=True,
+                                     base_path=base_path, headings_as_bold=True)
+
+    doc.save(output_path)
+    print(f"Word-Dokument erstellt ({len(sections)} Artikel, verdichteter Modus).")
+
+
 # ---------------------------------------------------------------------------
 # Hauptprogramm
 # ---------------------------------------------------------------------------
@@ -3486,6 +3683,12 @@ if __name__ == "__main__":
                         help="Nur mit --parent-chapter (ohne --chapter): Der Artikeltitel trägt direkt "
                              "die Elternkapitelnummer (z.B. 6.2.4.1) statt 6.2.4.1.1; alle Abschnitte "
                              "inkl. Studien werden zu dessen Unterpunkten (6.2.4.1.1, 6.2.4.1.2 …).")
+    parser.add_argument("--condensed", action="store_true",
+                        help="Verdichteter Modus für nicht-prüfungsrelevante Zusatzliteratur "
+                             "(z.B. Sammelbände/Festschriften mit römisch nummerierten Artikeln): "
+                             "pro Artikel nur eine Kurzübersicht (Kernaussage) + 2-3 wörtliche Zitate "
+                             "im ausgeblendeten Text, statt vollständigem Originaltext. "
+                             "Kombinierbar mit --parent-chapter/--title-as-parent zum Einbetten.")
 
     args = parser.parse_args()
     OUTPUT_BASE = "workspace/output"
@@ -3502,6 +3705,12 @@ if __name__ == "__main__":
 
         if args.to_section and not args.chapter:
             raise ValueError("--to benötigt --chapter (z.B. --chapter 4.6 --to 4.6.3).")
+
+        if args.condensed and args.chapter:
+            raise ValueError("--condensed ist nicht mit --chapter kombinierbar.")
+
+        if args.condensed and args.questions:
+            raise ValueError("--condensed ist nicht mit --questions kombinierbar.")
 
         pdf_stem  = Path(args.pdf_path).stem
         doc_title = pdf_stem.replace('_', ' ')
@@ -3655,6 +3864,34 @@ if __name__ == "__main__":
             working_text = collapse_duplicate_title(working_text)
             working_text = insert_intro_heading(working_text)
             struct_path.write_text(working_text, encoding="utf-8")
+
+        # --- Verdichteter Modus (--condensed): Kurzübersicht je Artikel statt vollständiger,
+        # kapitelweiser Zusammenfassung. Umgeht Schritt 4/5 (Zusammenfassung/QA) sowie den
+        # interleaved Builder vollständig - eigener, einfacherer Docx-Aufbau ohne vollen
+        # Originaltext (bewusste Ausnahme von der 100%-Erhaltungsregel, siehe Epic 6).
+        if args.condensed:
+            cond_path = cache_dir / "verdichtung.md"
+            if args.force:
+                if cond_path.exists():
+                    cond_path.unlink()
+                for f in cache_dir.glob("verdichtung_artikel_*.md"):
+                    f.unlink()
+            condensed_result = load_or_run(
+                cond_path,
+                lambda: generate_condensed_summary(working_text, cache_dir, output_lang=content_lang),
+                "Verdichtete Zusammenfassung"
+            )
+            cond_suffix = f"_Verdichtet_Einbetten_{args.parent_chapter.replace('.', '-')}" if args.parent_chapter else "_Verdichtet"
+            cond_docx_path = out_dir / f"{pdf_stem}{cond_suffix}.docx"
+            build_condensed_word_document(
+                condensed_result, str(cond_docx_path), base_path=image_base,
+                parent_chapter=args.parent_chapter, parent_level=args.parent_level,
+                doc_title=doc_title,
+            )
+            print(f"\n=== PIPELINE ERFOLGREICH BEENDET (verdichteter Modus) ===")
+            print(f"Zwischenergebnisse: {cache_dir}")
+            print(f"Fertiges Dokument:  {cond_docx_path}")
+            sys.exit(0)
 
         # --- Schritt 4: Zusammenfassung (kapitelweise) ---
         sum_path = cache_dir / "zusammenfassung.md"

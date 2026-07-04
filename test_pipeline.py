@@ -60,6 +60,11 @@ from pipeline import (
     _ensure_summary_heading,
     inline_decomposed_figures,
     render_pdf_figure_region,
+    split_into_articles,
+    _summarize_article_condensed,
+    _extract_quotes_block,
+    generate_condensed_summary,
+    build_condensed_word_document,
 )
 import pipeline
 
@@ -3140,3 +3145,220 @@ def test_render_pdf_figure_region_real_pdf(tmp_path):
         # Abb. 3.1 ist deutlich breiter als hoch und nicht winzig.
         assert im.width > 300 and im.height > 150
         assert im.width > im.height
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 42: split_into_articles – Artikel-Splitting unabhängig von Ziffern
+# (verdichteter Modus --condensed, z.B. Sammelbände mit römisch nummerierten Artikeln)
+# ---------------------------------------------------------------------------
+
+def test_split_into_articles_roman_numerals():
+    """Römisch nummerierte Artikelüberschriften werden erkannt, obwohl
+    split_into_level1_chapters (nur ziffernbasiert) das nicht könnte."""
+    md = (
+        "# I. Wandel der Arbeitssituation\n\nText A.\n\n"
+        "# II. Psychische Gefährdungsbeurteilung\n\nText B.\n\n"
+        "# III. Der Wert der Arbeit\n\nText C.\n"
+    )
+    articles = split_into_articles(md)
+    assert len(articles) == 3
+    headings = [a['heading'] for a in articles]
+    assert any("I. Wandel der Arbeitssituation" in h for h in headings)
+    assert any("II. Psychische Gefährdungsbeurteilung" in h for h in headings)
+    assert any("III. Der Wert der Arbeit" in h for h in headings)
+    assert "Text A." in articles[0]['full_text']
+    assert "Text B." in articles[1]['full_text']
+
+
+def test_split_into_articles_no_headings_returns_empty():
+    """Ohne jede Überschrift gibt es nichts zu splitten."""
+    assert split_into_articles("Nur Fließtext ohne Überschrift.") == []
+
+
+def test_split_into_articles_ignores_body_text_roman_numerals():
+    """Ein römisches-Zahl-artiges Muster im Fließtext (kein '#'-Präfix) darf keinen
+    falschen Artikel-Split auslösen - nur echte Markdown-Headings zählen."""
+    md = (
+        "# I. Titel\n\n"
+        "Ein Absatz mit einer Aufzählung:\nI. Definition\nII. Beispiel\n\n"
+        "# II. Zweiter Titel\n\nText.\n"
+    )
+    articles = split_into_articles(md)
+    assert len(articles) == 2
+    assert "I. Definition" in articles[0]['full_text']  # Fließtext bleibt im Artikel, kein Split
+
+
+def test_split_into_articles_preamble_attached_to_first_article():
+    """Text vor der ersten Artikelüberschrift (z.B. Titelseite) wird an den ersten Artikel
+    angehängt statt verworfen."""
+    md = "Vorwort-Text.\n\n# I. Erster Artikel\n\nInhalt.\n"
+    articles = split_into_articles(md)
+    assert len(articles) == 1
+    assert "Vorwort-Text" in articles[0]['full_text']
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 43: _summarize_article_condensed / _extract_quotes_block
+# (verdichteter Prompt: Kernaussage statt Vollständigkeit, plus Zitate-Block)
+# ---------------------------------------------------------------------------
+
+def test_summarize_article_condensed_prompt_has_no_completeness_mandate(monkeypatch):
+    """Der verdichtete Prompt verlangt KEINE vollständige Unterkapitelabdeckung -
+    im Gegensatz zu _summarize_single_chapter."""
+    captured_prompt = []
+
+    def fake_call(model_name, contents, config, **kwargs):
+        captured_prompt.append(contents)
+        class R:
+            text = "## I. Titel\n- Kernaussage.\n\n**Zitate:**\n1. \"Zitat eins.\"\n"
+        return R()
+
+    monkeypatch.setattr('pipeline.call_gemini_with_retry', fake_call)
+    _summarize_article_condensed("I. Titel", "Artikeltext mit vielen Details.")
+    assert "PFLICHT-VOLLSTÄNDIGKEIT" not in captured_prompt[0]
+    assert "ALLE Unterkapitel müssen vorhanden sein" not in captured_prompt[0]
+    assert "Zitate" in captured_prompt[0]
+
+
+def test_summarize_article_condensed_uses_small_token_limit(monkeypatch):
+    """Verdichteter Modus braucht kein 32768/65536-Limit wie der Vollständigkeits-Modus."""
+    captured_config = []
+
+    def fake_call(model_name, contents, config, **kwargs):
+        captured_config.append(config)
+        class R:
+            text = "## I. Titel\n- Kernaussage.\n"
+        return R()
+
+    monkeypatch.setattr('pipeline.call_gemini_with_retry', fake_call)
+    _summarize_article_condensed("I. Titel", "Kurzer Artikeltext.")
+    assert captured_config[0].max_output_tokens <= 8192
+
+
+def test_extract_quotes_block_splits_summary_and_quotes():
+    text = (
+        "- Worum es geht: Thema X.\n"
+        "- Erkenntnis: Y.\n\n"
+        "**Zitate:**\n"
+        "1. \"Erstes Zitat.\"\n"
+        "2. \"Zweites Zitat.\"\n"
+    )
+    summary, quotes = _extract_quotes_block(text)
+    assert "Thema X" in summary
+    assert "Zitate" not in summary
+    assert "Erstes Zitat" in quotes
+    assert "Zweites Zitat" in quotes
+
+
+def test_extract_quotes_block_without_marker_returns_empty_quotes():
+    text = "- Nur eine Zusammenfassung ohne Zitate-Block."
+    summary, quotes = _extract_quotes_block(text)
+    assert summary == text.strip()
+    assert quotes == ''
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 44: generate_condensed_summary – ein Call je Artikel, Caching/Resume
+# ---------------------------------------------------------------------------
+
+def test_generate_condensed_summary_one_call_per_article(tmp_path, monkeypatch):
+    captured_headings = []
+
+    def fake_condensed(heading, text, output_lang="de"):
+        captured_headings.append(heading)
+        return f"## {heading}\n- Kernaussage.\n\n**Zitate:**\n1. \"Zitat.\"\n"
+
+    monkeypatch.setattr('pipeline._summarize_article_condensed', fake_condensed)
+    monkeypatch.setattr('pipeline.time.sleep', lambda _: None)
+
+    md = (
+        "# I. Erster Artikel\n\nText 1.\n\n"
+        "# II. Zweiter Artikel\n\nText 2.\n\n"
+        "# III. Dritter Artikel\n\nText 3.\n"
+    )
+    result = generate_condensed_summary(md, tmp_path)
+
+    assert len(captured_headings) == 3
+    assert "I. Erster Artikel" in result
+    assert "III. Dritter Artikel" in result
+    assert (tmp_path / "verdichtung.md").exists()
+    assert (tmp_path / "verdichtung_artikel_01.md").exists()
+
+
+def test_generate_condensed_summary_resumes_from_cache(tmp_path, monkeypatch):
+    call_count = [0]
+
+    def fake_condensed(heading, text, output_lang="de"):
+        call_count[0] += 1
+        return f"## {heading}\n- Kernaussage.\n"
+
+    monkeypatch.setattr('pipeline._summarize_article_condensed', fake_condensed)
+    monkeypatch.setattr('pipeline.time.sleep', lambda _: None)
+
+    md = "# I. Artikel\n\nText.\n\n# II. Artikel Zwei\n\nText 2.\n"
+    generate_condensed_summary(md, tmp_path)
+    assert call_count[0] == 2
+
+    # Zweiter Lauf: beide Artikel-Caches vorhanden → kein weiterer API-Call.
+    generate_condensed_summary(md, tmp_path)
+    assert call_count[0] == 2
+
+
+# ---------------------------------------------------------------------------
+# Gruppe 45: build_condensed_word_document – sichtbare Kurzübersicht,
+# ausgeblendet sind NUR die Zitate (nicht der volle Originaltext)
+# ---------------------------------------------------------------------------
+
+def _build_condensed_doc(condensed_md: str, **kwargs):
+    import tempfile, os
+    fd, tmp = tempfile.mkstemp(suffix=".docx")
+    os.close(fd)
+    try:
+        build_condensed_word_document(condensed_md, tmp, **kwargs)
+        doc = Document(tmp)
+        return doc
+    finally:
+        os.unlink(tmp)
+
+
+def test_build_condensed_word_document_summary_visible_quotes_hidden():
+    condensed_md = (
+        "## I. Wandel der Arbeitssituation\n\n"
+        "- Zentrale Erkenntnis: Wandel über 20 Jahre.\n\n"
+        "**Zitate:**\n"
+        "1. \"Ein wörtliches Zitat aus dem Original.\"\n"
+    )
+    doc = _build_condensed_doc(condensed_md, parent_chapter="6.9", doc_title="Vertiefende Literatur")
+
+    visible_texts = [p.text for p in doc.paragraphs if p.text.strip()
+                     and not any(r.font.hidden for r in p.runs)]
+    hidden_texts = [p.text for p in doc.paragraphs if p.text.strip()
+                    and any(r.font.hidden for r in p.runs)]
+
+    assert any("Zentrale Erkenntnis" in t for t in visible_texts)
+    assert not any("wörtliches Zitat" in t for t in visible_texts), \
+        "Zitat darf nicht sichtbar sein"
+    assert any("wörtliches Zitat" in t for t in hidden_texts), \
+        "Zitat muss im ausgeblendeten Text stehen"
+
+
+def test_build_condensed_word_document_parent_and_child_numbering():
+    condensed_md = (
+        "## I. Erster Artikel\n\n- Kernaussage 1.\n\n"
+        "## II. Zweiter Artikel\n\n- Kernaussage 2.\n"
+    )
+    doc = _build_condensed_doc(condensed_md, parent_chapter="6.9", doc_title="Vertiefende Literatur")
+    heading_texts = [p.text for p in doc.paragraphs if "Heading" in p.style.name]
+
+    assert any(t.startswith("6.9 ") and "Vertiefende Literatur" in t for t in heading_texts)
+    assert any(t.startswith("6.9.1 ") and "Erster Artikel" in t for t in heading_texts)
+    assert any(t.startswith("6.9.2 ") and "Zweiter Artikel" in t for t in heading_texts)
+
+
+def test_build_condensed_word_document_standalone_without_parent_chapter():
+    """Ohne --parent-chapter: eigenständiger Dokumenttitel, keine Nummern-Präfixe."""
+    condensed_md = "## I. Artikel\n\n- Kernaussage.\n"
+    doc = _build_condensed_doc(condensed_md, doc_title="Vertiefende Literatur")
+    heading_texts = [p.text for p in doc.paragraphs if "Heading" in p.style.name]
+    assert any(t == "Vertiefende Literatur" for t in heading_texts)
+    assert any("Artikel" in t and not t[0].isdigit() for t in heading_texts)
