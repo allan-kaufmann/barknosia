@@ -3684,8 +3684,8 @@ def build_condensed_word_document(condensed_text: str, output_path: str, base_pa
 #   4. Kommentar-Marker ("Quizfrage N") an den relevanten Quellkapiteln setzen
 #      bzw. bestehende Kommentare erweitern
 # Ausgabe in eine neue Kopie; das Original bleibt unangetastet.
-
-DEFAULT_QUIZ_CHAPTER = '10 Leitfragen-Quiz zum Kurs "Personalauswahl"'
+# Das Quiz-Kapitel wird IMMER explizit über --quiz-chapter benannt (kein Standard):
+# ein fester Default wäre falsch, sobald sich Nummer/Wortlaut ändert.
 
 
 def _iter_paragraph_image_blobs(doc, paragraph):
@@ -3709,42 +3709,74 @@ def extract_quiz_questions(doc, quiz_chapter_heading: str):
     'anchor' ist der Absatz DIREKT nach dem Bildblock der Frage (Einfügepunkt der Antwort).
     """
     paras = doc.paragraphs
-    target = normalize_heading(quiz_chapter_heading)
 
-    def style_of(p):
-        return p.style.name if p.style else ""
+    def heading_level(p):
+        """Heading-Ebene (1..9) oder None, wenn der Absatz keine Überschrift ist."""
+        st = p.style.name if p.style else ""
+        m = re.match(r'Heading (\d)', st)
+        return int(m.group(1)) if m else None
 
-    start = None
+    def norm(text):
+        """Zeichensetzungs-tolerante Normalisierung (entfernt Anführungszeichen/Markdown,
+        kollabiert Whitespace, lowercase) – siehe _normalize_quote."""
+        return _normalize_quote(text)
+
+    def core(text):
+        """Wie norm(), zusätzlich ohne führende Kapitelnummer ('10 ', '3.4.1 '),
+        damit der Abgleich unabhängig von Nummerierung UND Zeichensetzung ist."""
+        return re.sub(r'^\s*\d+(?:\.\d+)*\.?\s*', '', norm(text)).strip()
+
+    target_full = norm(quiz_chapter_heading)
+    target_core = core(quiz_chapter_heading)
+
+    # 1) Exakter (nummern-/zeichensetzungs-toleranter) Treffer, beliebige Ebene
+    start = start_level = None
     for i, p in enumerate(paras):
-        if style_of(p) == "Heading 2" and normalize_heading(p.text) == target:
-            start = i
+        lvl = heading_level(p)
+        if lvl is None:
+            continue
+        if norm(p.text) == target_full or (target_core and core(p.text) == target_core):
+            start, start_level = i, lvl
             break
-    if start is None:  # Fallback: enthält-Vergleich
+    # 2) Fallback: Teiltext-Treffer ('enthält')
+    if start is None and target_core:
         for i, p in enumerate(paras):
-            if "Heading" in style_of(p) and target[:20] in normalize_heading(p.text):
-                start = i
+            lvl = heading_level(p)
+            if lvl is None:
+                continue
+            if target_core in norm(p.text):
+                start, start_level = i, lvl
                 break
     if start is None:
-        raise ValueError(f"Quiz-Kapitel '{quiz_chapter_heading}' nicht gefunden.")
+        raise ValueError(
+            f"Quiz-Kapitel '{quiz_chapter_heading}' nicht gefunden. "
+            "Tipp: den stabilen Textteil ohne Kapitelnummer angeben, z.B. "
+            "--quiz-chapter \"Leitfragen-Quiz zum Kurs Personalauswahl\"."
+        )
 
+    # Kapitelende: nächste Überschrift gleicher oder höherer Ebene (<= start_level)
     hi = len(paras)
     for i in range(start + 1, len(paras)):
-        if style_of(paras[i]) in ("Heading 1", "Heading 2"):
+        lvl = heading_level(paras[i])
+        if lvl is not None and lvl <= start_level:
             hi = i
             break
 
+    # Fragen: 'Frage N'-Überschriften (beliebige Ebene) + folgende Bild-Absätze
     questions = []
-    i = start + 1
     frage_re = re.compile(r'^Frage\s+(\d+)\b')
+
+    def is_frage_heading(p):
+        return heading_level(p) is not None and frage_re.match(p.text.strip())
+
+    i = start + 1
     while i < hi:
         m = frage_re.match(paras[i].text.strip())
-        if style_of(paras[i]) == "Heading 3" and m:
+        if heading_level(paras[i]) is not None and m:
             num = int(m.group(1))
             images = []
             j = i + 1
-            while j < hi:
-                if style_of(paras[j]) == "Heading 3" and frage_re.match(paras[j].text.strip()):
-                    break
+            while j < hi and not is_frage_heading(paras[j]):
                 images.extend(_iter_paragraph_image_blobs(doc, paras[j]))
                 j += 1
             anchor = paras[j] if j < len(paras) else None
@@ -3752,6 +3784,11 @@ def extract_quiz_questions(doc, quiz_chapter_heading: str):
             i = j
         else:
             i += 1
+    if not questions:
+        raise ValueError(
+            f"Im Kapitel '{paras[start].text.strip()}' wurden keine 'Frage N'-Überschriften "
+            "gefunden. Ist es wirklich das Quiz-Kapitel?"
+        )
     return questions, (start, hi)
 
 
@@ -3950,7 +3987,7 @@ def _apply_quiz_markers(doc, items_by_num, heading_map):
     return marked, extended, skipped
 
 
-def run_quiz_check(docx_path: str, quiz_chapter_heading: str = DEFAULT_QUIZ_CHAPTER,
+def run_quiz_check(docx_path: str, quiz_chapter_heading: str,
                    output_path: str = None, force: bool = False) -> str:
     """End-to-End: prüft ein Leitfragen-Quiz gegen die Lernunterlage, schreibt Antworten
     in das Quiz-Kapitel und setzt Kommentar-Marker. Speichert eine neue Kopie."""
@@ -4049,9 +4086,11 @@ if __name__ == "__main__":
                              ".docx-Lernunterlage (Fragen als Screenshots) gegen den Dokumenttext, "
                              "schreibt Antworten + Abdeckungsgrad in das Quiz-Kapitel und setzt "
                              "Kommentar-Marker an den Quellkapiteln. Ausgabe: '<name>_Quizgeprueft.docx'.")
-    parser.add_argument("--quiz-chapter", type=str, default=DEFAULT_QUIZ_CHAPTER,
-                        help="Überschrift (Heading 2) des Quiz-Kapitels für --quiz-docx. "
-                             f"Standard: '{DEFAULT_QUIZ_CHAPTER}'.")
+    parser.add_argument("--quiz-chapter", type=str, default=None,
+                        help="PFLICHT bei --quiz-docx: Überschrift des Quiz-Kapitels (beliebige "
+                             "Ebene/Position). Der Abgleich ist nummern-tolerant – der stabile "
+                             "Textteil ohne Kapitelnummer genügt, z.B. "
+                             "\"Leitfragen-Quiz zum Kurs Personalauswahl\".")
     parser.add_argument("--force", action="store_true", help="Alle Schritte neu berechnen (kein Resume)")
     parser.add_argument("--parent-chapter", type=str, default=None,
                         help="Elternkapitel im Zieldokument, z.B. '4.2.1.2'. "
@@ -4109,6 +4148,12 @@ if __name__ == "__main__":
 
         # --- Getrennter Modus: Leitfragen-Quiz-Prüfung einer bestehenden .docx ---
         if args.quiz_docx:
+            if not args.quiz_chapter:
+                raise ValueError(
+                    "--quiz-docx benötigt --quiz-chapter (Überschrift des Quiz-Kapitels), z.B. "
+                    "--quiz-chapter \"Leitfragen-Quiz zum Kurs Personalauswahl\". "
+                    "Der Abgleich ist nummern-tolerant; der stabile Textteil ohne Nummer genügt."
+                )
             run_quiz_check(args.quiz_docx, quiz_chapter_heading=args.quiz_chapter, force=args.force)
             sys.exit(0)
 
