@@ -394,14 +394,26 @@ def _parse_qa_by_headers(qa_text: str) -> list:
 def _parse_qa_fields(text: str) -> dict:
     """Extrahiert die QA-Standardfelder (Antwort/Textgrundlage/Schlüsselbegriffe/Beleg/Abdeckung)
     aus einem Block- oder Unterpunkt-Segment."""
-    def _extract(pattern, default='–'):
+    def _extract(pattern, default='–', multiline=False):
         m = re.search(pattern, text, re.MULTILINE | re.DOTALL)
         if m:
-            return m.group(1).strip().split('\n')[0].strip()
+            val = m.group(1).strip()
+            # Einzeilige Felder auf ihre erste Zeile beschränken; das Antwortfeld darf
+            # mehrzeilig bleiben (strukturierte Quiz-Antworten: Zuordnung/Reihenfolge/Lücken).
+            return val if multiline else val.split('\n')[0].strip()
         return default
 
+    # Antwort bis zum nächsten Feld-Schlüsselwort erfassen (NICHT an Leerzeilen abschneiden),
+    # damit mehrzeilige Antworten vollständig erhalten bleiben. Fallback: bis Textende.
+    antwort = _extract(
+        r'^Antwort:\s*(.+?)(?=\n(?:Textgrundlage:|Schlüsselbegriffe:|Beleg:|Abdeckung:))',
+        multiline=True,
+    )
+    if antwort == '–':
+        antwort = _extract(r'^Antwort:\s*(.+)', multiline=True)
+
     return {
-        'antwort':       _extract(r'^Antwort:\s*(.+?)(?=\n(?:Textgrundlage|Schlüsselbegriffe|Beleg|Abdeckung|$))'),
+        'antwort':       antwort,
         'textgrundlage': _extract(r'^Textgrundlage:\s*(.+)'),
         'schluessel':    _extract(r'^Schlüsselbegriffe:\s*(.+)'),
         'beleg':         _extract(r'^Beleg:\s*(.+)', default=''),
@@ -3925,6 +3937,43 @@ def _existing_comment_id(paragraph):
     return None
 
 
+def _render_multiline_answer(paragraph, text):
+    """Rendert eine (ggf. mehrzeilige, strukturierte) Antwort in einen Absatz:
+    Zeilenumbrüche via Break, ganze Zeilen in **…** als fettes Label (z.B. Kategorie/
+    Lücke bei Zuordnungs-/Reihenfolge-/Lückenfragen)."""
+    lines = (text or "–").split('\n')
+    for i, ln in enumerate(lines):
+        if i > 0:
+            paragraph.add_run().add_break()
+        s = ln.strip()
+        if not s:
+            continue
+        m = re.fullmatch(r'\*\*\s*(.+?)\s*\*\*', s)
+        if m:
+            paragraph.add_run(m.group(1)).bold = True
+        else:
+            paragraph.add_run(s)
+
+
+_QA_META_RE = re.compile(r'^Quelle:.*\bAbdeckung:')
+
+
+def _strip_previous_quiz_answers(doc, quiz_range):
+    """Entfernt frühere, vom Tool eingefügte Antwort-/Meta-Absätze im Quiz-Kapitel
+    (Signatur 'Antwort:' bzw. 'Quelle: … | Abdeckung:'). Macht den Lauf idempotent, falls
+    die Eingabedatei bereits eine frühere Quiz-Prüfung enthält. Auf einer sauberen Basis
+    ein No-op. Rührt ausschließlich diese eindeutig signierten Absätze an – Fragen,
+    Bilder und sonstiger Inhalt bleiben unberührt."""
+    lo, hi = quiz_range
+    removed = 0
+    for p in list(doc.paragraphs[lo:hi]):
+        t = p.text.strip()
+        if t.startswith("Antwort:") or _QA_META_RE.match(t):
+            p._p.getparent().remove(p._p)
+            removed += 1
+    return removed
+
+
 def _insert_qa_answer_before(anchor, item):
     """Fügt Antwort- und Meta-Absätze VOR dem Anker-Absatz ein (nur Insert, nichts löschen)."""
     def emit(antwort, quelle, schluessel, abdeckung, label=None):
@@ -3933,7 +3982,11 @@ def _insert_qa_answer_before(anchor, item):
             pl.add_run(label).bold = True
         pa = anchor.insert_paragraph_before()
         pa.add_run("Antwort: ").bold = True
-        pa.add_run(antwort or "–")
+        # Mehrzeilige, strukturierte Antworten (Zuordnung/Reihenfolge/Lücken) auf eigener
+        # Zeile beginnen; einzeilige Antworten bleiben inline hinter "Antwort: ".
+        if antwort and '\n' in antwort:
+            pa.add_run().add_break()
+        _render_multiline_answer(pa, antwort or "–")
         pm = anchor.insert_paragraph_before()
         r = pm.add_run(
             f"Quelle: {quelle or '–'}  |  "
@@ -3987,6 +4040,37 @@ def _apply_quiz_markers(doc, items_by_num, heading_map):
     return marked, extended, skipped
 
 
+def _retry_single_question(full_kb: str, num: int, question_text: str) -> str:
+    """Beantwortet GENAU EINE Quizfrage gegen eine (große) Wissensbasis – strikt, damit das
+    Modell nicht die dokumenteigenen Folien-/Übungsfragen aufzählt. Gibt Roh-QA-Text zurück."""
+    prompt = (
+        "Rolle:\nDu bist Prüfer für Wirtschaftspsychologie.\n\n"
+        "Aufgabe:\nDu erhältst eine Wissensbasis (ein Lerndokument) und GENAU EINE Quizfrage.\n"
+        "Beantworte AUSSCHLIESSLICH diese eine Frage anhand der Wissensbasis.\n"
+        "- Erfinde KEINE weiteren Fragen und beantworte NICHTS anderes aus dem Dokument.\n"
+        "- Wenn die Antwort nicht eindeutig in der Wissensbasis steht, setze Abdeckung auf "
+        "'nicht enthalten' und rate NICHT.\n"
+        "- Bei Zuordnungs-/Reihenfolge-/Lückenfragen die konkrete Lösung strukturiert angeben "
+        "(pro Zuordnung/Lücke/Schritt eine eigene Zeile; Bezeichner als **fett**).\n\n"
+        "Gib GENAU EINEN Block in diesem Format aus (keine Einleitung, nichts davor/danach):\n"
+        f"Frage {num}\n"
+        "Fragetext: [die Frage wörtlich]\n"
+        "Antwort: [Lösung; bei mehreren Teilen mehrzeilig]\n"
+        "Textgrundlage: [genaues Unterkapitel]\n"
+        "Schlüsselbegriffe: [1-3]\n"
+        "Beleg: [wörtliches Zitat, 5-15 Wörter]\n"
+        "Abdeckung: vollständig / teilweise / nicht enthalten\n\n"
+        f"Wissensbasis:\n{full_kb}\n\n"
+        f"Die EINE zu beantwortende Frage:\n{num}. {question_text}"
+    )
+    resp = call_gemini_with_retry(
+        model_name='gemini-2.5-pro',
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.1),
+    )
+    return resp.text or ""
+
+
 def run_quiz_check(docx_path: str, quiz_chapter_heading: str,
                    output_path: str = None, force: bool = False) -> str:
     """End-to-End: prüft ein Leitfragen-Quiz gegen die Lernunterlage, schreibt Antworten
@@ -3996,7 +4080,11 @@ def run_quiz_check(docx_path: str, quiz_chapter_heading: str,
         raise FileNotFoundError(f"Datei nicht gefunden: {docx_path}")
     if output_path is None:
         output_path = str(src.with_name(f"{src.stem}_Quizgeprueft.docx"))
-    work_dir = src.parent / f".quizcheck_{src.stem}"
+    # Cache-Ordner MUSS auch vom Quiz-Kapitel abhängen: sonst wiederverwendet ein Lauf
+    # für ein anderes Quiz-Kapitel (gleiche .docx, andere Überschrift) fälschlich den
+    # Cache eines vorherigen, andersartigen Quiz-Laufs (unterschiedliche Fragenanzahl!).
+    chapter_slug = re.sub(r'[^A-Za-z0-9]+', '_', quiz_chapter_heading).strip('_')[:60]
+    work_dir = src.parent / f".quizcheck_{src.stem}_{chapter_slug}"
     work_dir.mkdir(parents=True, exist_ok=True)
     if force:
         # load_or_run/OCR-Cache honorieren --force nur teilweise; hier alle Zwischen-
@@ -4004,6 +4092,8 @@ def run_quiz_check(docx_path: str, quiz_chapter_heading: str,
         for f in ("quiz_fragen.json", "quiz_fragen.txt", "quiz_wissensbasis.md",
                   "quiz_qa_ergebnis.md"):
             (work_dir / f).unlink(missing_ok=True)
+        for f in work_dir.glob("quiz_retry_*.md"):
+            f.unlink(missing_ok=True)
 
     print(f"--- Quiz-Prüfung: {src.name} ---")
     doc = Document(str(src))
@@ -4043,7 +4133,43 @@ def run_quiz_check(docx_path: str, quiz_chapter_heading: str,
     items_by_num = {it['num']: it for it in items}
     print(f"   QA geparst: {len(items)} Antwort-Items.")
 
-    # Schritt 5: Antworten in Kapitel 10 einfügen (nur Insert)
+    # Schritt 4b: Whole-Doc-Retry für 'nicht enthalten' — gegen das GESAMTE Dokument
+    # (KE1+KE2) statt nur der umschließenden Kurseinheit, falls die Antwort außerhalb liegt.
+    def _abdeckung_missing(it):
+        levels = [it.get('abdeckung', '')]
+        levels += [s.get('abdeckung', '') for s in it.get('subs', [])]
+        return any('nicht enthalten' in (a or '').lower() for a in levels)
+
+    retry_nums = sorted(it['num'] for it in items if _abdeckung_missing(it))
+    if retry_nums:
+        print(f"   Whole-Doc-Retry für {len(retry_nums)} 'nicht enthalten'-Frage(n): {retry_nums}")
+        full_kb, _ = build_quiz_knowledge_base(doc, (0, len(doc.paragraphs)), quiz_range)
+        updated = 0
+        for num in retry_nums:
+            qtext = ' '.join(ocr_map.get(num, '').split())
+            rpath = work_dir / f"quiz_retry_{num}.md"
+            rtext = load_or_run(
+                rpath,
+                lambda: _retry_single_question(full_kb, num, qtext),
+                f"Quiz-Retry Frage {num}",
+            )
+            parsed = parse_qa_response(rtext)
+            # Guard: genau EIN valider Block, sonst ist die Antwort unzuverlässig (Modell hat
+            # z.B. dokumenteigene Fragen aufgezählt) → Original ('nicht enthalten') behalten.
+            if len(parsed) == 1 and not _abdeckung_missing(parsed[0]):
+                it = parsed[0]
+                it['num'] = num
+                items_by_num[num] = it
+                updated += 1
+            else:
+                print(f"     Frage {num}: kein zuverlässiger Treffer (bleibt 'nicht enthalten').")
+        print(f"   Whole-Doc-Retry: {updated} Frage(n) neu beantwortet.")
+
+    # Schritt 5: Antworten in Kapitel 10 einfügen. Zuvor evtl. vorhandene frühere
+    # Antworten des Tools entfernen (Idempotenz bei Re-Läufen auf bereits geprüften Dateien).
+    stripped = _strip_previous_quiz_answers(doc, quiz_range)
+    if stripped:
+        print(f"   {stripped} frühere Antwort-/Meta-Absätze ersetzt (Idempotenz).")
     inserted = 0
     for q in questions:
         item = items_by_num.get(q['num'])
