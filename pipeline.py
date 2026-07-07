@@ -1344,20 +1344,40 @@ def verify_with_questions(summary_text: str, questions_path: str) -> str:
         "- Bei mehrteiligen Fragen trägt die 'Fragetext:'-Zeile die übergeordnete Frage; jeder "
         "Unterpunkt steht zusätzlich als **fette Überschrift** (sein Fragetext) darüber.\n"
         "- KEINE Kategorie-Überschriften, KEINE Einleitung, KEINE 'Schritt 1/2/3'-Zeilen im "
-        "Ergebnis. Gib NUR die Frage-Blöcke im obigen Format aus.\n\n"
+        "Ergebnis. Gib NUR die Frage-Blöcke im obigen Format aus.\n"
+        "- Beantworte AUSSCHLIESSLICH die unten aufgeführten Fragen. Erfinde KEINE zusätzlichen "
+        "Fragen und übernimm KEINE Fragen aus der Wissensbasis. Gib GENAU so viele Frage-Blöcke "
+        "aus, wie es Eingabefragen gibt, in derselben Reihenfolge.\n\n"
         f"Wissensbasis (Zusammenfassung):\n{summary_text}\n\n"
         f"Fragen:\n{questions}"
     )
-    try:
-        response = call_gemini_with_retry(
-            model_name='gemini-2.5-pro',
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.1)
-        )
-        return response.text
-    except Exception as e:
-        print(f"Fehler bei der Qualitätssicherung: {e}")
-        raise
+    # Gemini liefert gelegentlich eine leere Antwort (response.text is None – z.B. bei
+    # Recitation-/Safety-Filtern oder transienten Fehlern). Das darf NICHT als None
+    # zurückgegeben werden (sonst schreibt load_or_run None und der Lauf bricht ab):
+    # daher mehrfach versuchen und bei anhaltender Leere klar fehlschlagen.
+    last_reason = None
+    for attempt in range(1, 4):
+        try:
+            response = call_gemini_with_retry(
+                model_name='gemini-2.5-pro',
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.1)
+            )
+        except Exception as e:
+            print(f"Fehler bei der Qualitätssicherung: {e}")
+            raise
+        text = getattr(response, "text", None)
+        if text:
+            return text
+        cands = getattr(response, "candidates", None) or []
+        last_reason = (getattr(cands[0], "finish_reason", None) if cands
+                       else getattr(response, "prompt_feedback", None))
+        print(f"      [QA leer] Versuch {attempt}/3 ohne Text "
+              f"(finish_reason={last_reason}). Neuer Versuch …")
+        time.sleep(3)
+    raise ValueError(
+        f"Qualitätssicherung lieferte dreimal keinen Text (letzter Grund: {last_reason})."
+    )
 
 
 _REWORK_LEVELS = {"teilweise", "nicht enthalten"}
@@ -3957,37 +3977,88 @@ def _render_multiline_answer(paragraph, text):
 
 _QA_META_RE = re.compile(r'^Quelle:.*\bAbdeckung:')
 
+# Eindeutiger Absatzstil, mit dem NUR das Tool seine eingefügten Antwort-Absätze markiert.
+# Wichtig: manche Nutzer schreiben ihre EIGENEN Antworten selbst als "Antwort: …" – diese
+# dürfen bei einem Re-Lauf NIEMALS entfernt werden. Deshalb erkennt die Idempotenz-Logik
+# Tool-Absätze am Stil (unzweideutig), nicht am Textpräfix.
+_QUIZ_ANSWER_STYLE = "Quiz Antwort"
+
+
+def _ensure_quiz_answer_style(doc):
+    """Stellt den (auf 'Normal' basierenden, optisch unauffälligen) Markierungsstil bereit."""
+    from docx.enum.style import WD_STYLE_TYPE
+    styles = doc.styles
+    if any(s.name == _QUIZ_ANSWER_STYLE for s in styles):
+        return _QUIZ_ANSWER_STYLE
+    st = styles.add_style(_QUIZ_ANSWER_STYLE, WD_STYLE_TYPE.PARAGRAPH)
+    try:
+        st.base_style = styles['Normal']
+    except Exception:
+        pass
+    try:
+        st.hidden = True
+        st.quick_style = False
+    except Exception:
+        pass
+    return _QUIZ_ANSWER_STYLE
+
 
 def _strip_previous_quiz_answers(doc, quiz_range):
-    """Entfernt frühere, vom Tool eingefügte Antwort-/Meta-Absätze im Quiz-Kapitel
-    (Signatur 'Antwort:' bzw. 'Quelle: … | Abdeckung:'). Macht den Lauf idempotent, falls
-    die Eingabedatei bereits eine frühere Quiz-Prüfung enthält. Auf einer sauberen Basis
-    ein No-op. Rührt ausschließlich diese eindeutig signierten Absätze an – Fragen,
-    Bilder und sonstiger Inhalt bleiben unberührt."""
+    """Entfernt frühere, VOM TOOL eingefügte Antwort-/Meta-Absätze im Quiz-Kapitel und macht
+    den Lauf idempotent. Erkennung primär am eindeutigen Stil `_QUIZ_ANSWER_STYLE`; als
+    Fallback für alte, ungetaggte Einfügungen eine Meta-Zeile ('Quelle: … | Abdeckung:',
+    tool-spezifisch) samt der unmittelbar davor stehenden 'Antwort:'-Zeile. Dadurch werden
+    vom NUTZER selbst geschriebene 'Antwort:'-Zeilen (ohne folgende Meta-Zeile) NIE entfernt.
+    Auf einer sauberen Basis ein No-op; Fragen/Bilder/sonstiger Inhalt bleiben unberührt."""
     lo, hi = quiz_range
-    removed = 0
-    for p in list(doc.paragraphs[lo:hi]):
-        t = p.text.strip()
-        if t.startswith("Antwort:") or _QA_META_RE.match(t):
-            p._p.getparent().remove(p._p)
-            removed += 1
-    return removed
+    block = doc.paragraphs[lo:hi]
+    to_remove = []
+    seen = set()
+
+    def mark(p):
+        if id(p._p) not in seen:
+            seen.add(id(p._p))
+            to_remove.append(p)
+
+    for i, p in enumerate(block):
+        styled = p.style is not None and p.style.name == _QUIZ_ANSWER_STYLE
+        if styled:
+            mark(p)
+        if _QA_META_RE.match(p.text.strip()):
+            mark(p)
+            if i > 0 and block[i - 1].text.strip().startswith("Antwort:"):
+                mark(block[i - 1])
+
+    for p in to_remove:
+        parent = p._p.getparent()
+        if parent is not None:
+            parent.remove(p._p)
+    return len(to_remove)
 
 
 def _insert_qa_answer_before(anchor, item):
-    """Fügt Antwort- und Meta-Absätze VOR dem Anker-Absatz ein (nur Insert, nichts löschen)."""
+    """Fügt Antwort- und Meta-Absätze VOR dem Anker-Absatz ein (nur Insert, nichts löschen).
+    Alle eingefügten Absätze erhalten den Stil `_QUIZ_ANSWER_STYLE`, damit ein Re-Lauf sie
+    eindeutig (ohne Textheuristik) wiederfinden und ersetzen kann."""
+    def _tag(p):
+        try:
+            p.style = _QUIZ_ANSWER_STYLE
+        except Exception:
+            pass
+        return p
+
     def emit(antwort, quelle, schluessel, abdeckung, label=None):
         if label:
-            pl = anchor.insert_paragraph_before()
+            pl = _tag(anchor.insert_paragraph_before())
             pl.add_run(label).bold = True
-        pa = anchor.insert_paragraph_before()
+        pa = _tag(anchor.insert_paragraph_before())
         pa.add_run("Antwort: ").bold = True
         # Mehrzeilige, strukturierte Antworten (Zuordnung/Reihenfolge/Lücken) auf eigener
         # Zeile beginnen; einzeilige Antworten bleiben inline hinter "Antwort: ".
         if antwort and '\n' in antwort:
             pa.add_run().add_break()
         _render_multiline_answer(pa, antwort or "–")
-        pm = anchor.insert_paragraph_before()
+        pm = _tag(anchor.insert_paragraph_before())
         r = pm.add_run(
             f"Quelle: {quelle or '–'}  |  "
             f"Schlüsselbegriffe: {schluessel or '–'}  |  "
@@ -4071,15 +4142,19 @@ def _retry_single_question(full_kb: str, num: int, question_text: str) -> str:
     return resp.text or ""
 
 
-def run_quiz_check(docx_path: str, quiz_chapter_heading: str,
-                   output_path: str = None, force: bool = False) -> str:
-    """End-to-End: prüft ein Leitfragen-Quiz gegen die Lernunterlage, schreibt Antworten
-    in das Quiz-Kapitel und setzt Kommentar-Marker. Speichert eine neue Kopie."""
-    src = Path(docx_path)
-    if not src.exists():
-        raise FileNotFoundError(f"Datei nicht gefunden: {docx_path}")
-    if output_path is None:
-        output_path = str(src.with_name(f"{src.stem}_Quizgeprueft.docx"))
+def _abdeckung_missing(it: dict) -> bool:
+    """True, wenn ein QA-Item (oder eines seiner Unterpunkte) 'nicht enthalten' meldet."""
+    levels = [it.get('abdeckung', '')]
+    levels += [s.get('abdeckung', '') for s in it.get('subs', [])]
+    return any('nicht enthalten' in (a or '').lower() for a in levels)
+
+
+def _analyze_one_quiz(doc, src: Path, quiz_chapter_heading: str, force: bool) -> dict:
+    """Analyse-Phase für EIN Quiz-Kapitel – rein lesend, KEINE Mutation des Dokuments:
+    Fragen extrahieren, Vision-OCR, Wissensbasis (umschließende Heading-1-Kurseinheit),
+    Vollständigkeitsprüfung und Whole-Doc-Retry. Gibt alle Ergebnisse für die spätere
+    Mutations-Phase zurück (questions/items_by_num/heading_map/quiz_range)."""
+    tag = quiz_chapter_heading[:50]
     # Cache-Ordner MUSS auch vom Quiz-Kapitel abhängen: sonst wiederverwendet ein Lauf
     # für ein anderes Quiz-Kapitel (gleiche .docx, andere Überschrift) fälschlich den
     # Cache eines vorherigen, andersartigen Quiz-Laufs (unterschiedliche Fragenanzahl!).
@@ -4094,14 +4169,12 @@ def run_quiz_check(docx_path: str, quiz_chapter_heading: str,
             (work_dir / f).unlink(missing_ok=True)
         for f in work_dir.glob("quiz_retry_*.md"):
             f.unlink(missing_ok=True)
-
-    print(f"--- Quiz-Prüfung: {src.name} ---")
-    doc = Document(str(src))
-    para_count_before = len(doc.paragraphs)
+        for f in work_dir.glob("quiz_single_*.md"):
+            f.unlink(missing_ok=True)
 
     # Schritt 1: Fragen + Bilder extrahieren
     questions, quiz_range = extract_quiz_questions(doc, quiz_chapter_heading)
-    print(f"   {len(questions)} Quizfragen in Kapitel gefunden (Absätze {quiz_range[0]}–{quiz_range[1]}).")
+    print(f"   [{tag}] {len(questions)} Quizfragen (Absätze {quiz_range[0]}–{quiz_range[1]}).")
 
     # Schritt 2: Vision-OCR (Bilder → Fragetext), gecacht
     ocr_map = ocr_quiz_questions(questions, work_dir / "quiz_fragen.json", force=force)
@@ -4113,13 +4186,13 @@ def run_quiz_check(docx_path: str, quiz_chapter_heading: str,
     questions_txt_path.write_text('\n'.join(q_lines), encoding="utf-8")
 
     # Schritt 3: Wissensbasis auf die umschließende Kurseinheit (Heading 1) begrenzen
-    # (thematisch passend: ein Personalauswahl-Quiz wird gegen die KE Personalauswahl
-    # geprüft, nicht gegen fremde Kurseinheiten) und das Quiz-Kapitel selbst ausschließen.
+    # (thematisch passend: ein Quiz wird gegen die eigene Kurseinheit geprüft, nicht gegen
+    # fremde Kurseinheiten) und das Quiz-Kapitel selbst ausschließen.
     kb_path = work_dir / "quiz_wissensbasis.md"
     kb_scope = _enclosing_h1_range(doc, quiz_range[0])
     kb, heading_map = build_quiz_knowledge_base(doc, kb_scope, quiz_range)
     kb_path.write_text(kb, encoding="utf-8")
-    print(f"   Wissensbasis (Absätze {kb_scope[0]}–{kb_scope[1]}): {len(kb)} Zeichen, "
+    print(f"   [{tag}] Wissensbasis (Absätze {kb_scope[0]}–{kb_scope[1]}): {len(kb)} Zeichen, "
           f"{len(heading_map)} Überschrift-Schlüssel.")
 
     # Schritt 4: Vollständigkeitsprüfung (bestehendes QA-Feature wiederverwenden)
@@ -4127,22 +4200,47 @@ def run_quiz_check(docx_path: str, quiz_chapter_heading: str,
     qa_text = load_or_run(
         qa_path,
         lambda: verify_with_questions(kb, str(questions_txt_path)),
-        "Quiz-Vollständigkeitsprüfung",
+        f"Quiz-Vollständigkeitsprüfung [{tag}]",
     )
-    items = parse_qa_response(qa_text)
+    raw_items = parse_qa_response(qa_text)
+    valid_nums = {q['num'] for q in questions}
+    # Auf ECHTE Fragenummern klemmen: bei großer Wissensbasis und wenigen Fragen generiert das
+    # Modell mitunter zusätzliche Blöcke aus KB-Inhalten (halluzinierte Fragen). Diese dürfen
+    # weder als Antwort eingefügt noch als Marker gesetzt werden.
+    items = [it for it in raw_items if it['num'] in valid_nums]
     items_by_num = {it['num']: it for it in items}
-    print(f"   QA geparst: {len(items)} Antwort-Items.")
+    print(f"   [{tag}] QA geparst: {len(raw_items)} Blöcke, {len(items_by_num)}/{len(questions)} gültig.")
+
+    # Schritt 4a: Ausrichtungs-/Über-Generierungs-Check. Lieferte der Batch deutlich mehr Blöcke
+    # als Fragen (Modell abgedriftet) oder fehlen Fragen, sind die Batch-Antworten unzuverlässig
+    # (Fehlausrichtung: 'Frage k' ≠ k-te Eingabefrage). Dann betroffene Fragen EINZELN und STRIKT
+    # gegen die Kapitel-Wissensbasis neu beantworten (bewährter Anti-Halluzinations-Pfad).
+    overgenerated = len(raw_items) > len(questions) + max(2, len(questions) // 5)
+    missing = valid_nums - set(items_by_num)
+    if overgenerated or missing:
+        targets = sorted(valid_nums) if overgenerated else sorted(missing)
+        reason = (f"Über-Generierung (parsed={len(raw_items)} ≫ Fragen={len(questions)})"
+                  if overgenerated else f"{len(missing)} fehlende Antwort(en)")
+        print(f"   [{tag}] Batch-QA unzuverlässig – {reason}; {len(targets)} Frage(n) einzeln neu.")
+        for num in targets:
+            qtext = ' '.join(ocr_map.get(num, '').split())
+            spath = work_dir / f"quiz_single_{num}.md"
+            stext = load_or_run(
+                spath,
+                lambda: _retry_single_question(kb, num, qtext),
+                f"Einzel-QA Frage {num} [{tag}]",
+            )
+            parsed = parse_qa_response(stext)
+            if len(parsed) == 1:
+                it = parsed[0]
+                it['num'] = num
+                items_by_num[num] = it
 
     # Schritt 4b: Whole-Doc-Retry für 'nicht enthalten' — gegen das GESAMTE Dokument
-    # (KE1+KE2) statt nur der umschließenden Kurseinheit, falls die Antwort außerhalb liegt.
-    def _abdeckung_missing(it):
-        levels = [it.get('abdeckung', '')]
-        levels += [s.get('abdeckung', '') for s in it.get('subs', [])]
-        return any('nicht enthalten' in (a or '').lower() for a in levels)
-
-    retry_nums = sorted(it['num'] for it in items if _abdeckung_missing(it))
+    # (alle Kurseinheiten) statt nur der umschließenden KE, falls die Antwort außerhalb liegt.
+    retry_nums = sorted(num for num, it in items_by_num.items() if _abdeckung_missing(it))
     if retry_nums:
-        print(f"   Whole-Doc-Retry für {len(retry_nums)} 'nicht enthalten'-Frage(n): {retry_nums}")
+        print(f"   [{tag}] Whole-Doc-Retry für {len(retry_nums)} 'nicht enthalten'-Frage(n): {retry_nums}")
         full_kb, _ = build_quiz_knowledge_base(doc, (0, len(doc.paragraphs)), quiz_range)
         updated = 0
         for num in retry_nums:
@@ -4151,7 +4249,7 @@ def run_quiz_check(docx_path: str, quiz_chapter_heading: str,
             rtext = load_or_run(
                 rpath,
                 lambda: _retry_single_question(full_kb, num, qtext),
-                f"Quiz-Retry Frage {num}",
+                f"Quiz-Retry Frage {num} [{tag}]",
             )
             parsed = parse_qa_response(rtext)
             # Guard: genau EIN valider Block, sonst ist die Antwort unzuverlässig (Modell hat
@@ -4163,28 +4261,89 @@ def run_quiz_check(docx_path: str, quiz_chapter_heading: str,
                 updated += 1
             else:
                 print(f"     Frage {num}: kein zuverlässiger Treffer (bleibt 'nicht enthalten').")
-        print(f"   Whole-Doc-Retry: {updated} Frage(n) neu beantwortet.")
+        print(f"   [{tag}] Whole-Doc-Retry: {updated} Frage(n) neu beantwortet.")
 
-    # Schritt 5: Antworten in Kapitel 10 einfügen. Zuvor evtl. vorhandene frühere
-    # Antworten des Tools entfernen (Idempotenz bei Re-Läufen auf bereits geprüften Dateien).
-    stripped = _strip_previous_quiz_answers(doc, quiz_range)
+    return {
+        'heading': quiz_chapter_heading,
+        'questions': questions,
+        'items_by_num': items_by_num,
+        'heading_map': heading_map,
+        'quiz_range': quiz_range,
+    }
+
+
+def _mutate_one_quiz(doc, analysis: dict):
+    """Mutations-Phase für EIN Quiz-Kapitel: frühere Tool-Antworten entfernen (Idempotenz),
+    Antworten je Frage einfügen (nur Insert), Kommentar-Marker setzen/erweitern."""
+    tag = analysis['heading'][:50]
+    questions = analysis['questions']
+    items_by_num = analysis['items_by_num']
+
+    # Zuvor evtl. vorhandene frühere Antworten DES TOOLS entfernen (Signatur-basiert;
+    # eigene manuelle Notizen des Nutzers bleiben unangetastet).
+    stripped = _strip_previous_quiz_answers(doc, analysis['quiz_range'])
     if stripped:
-        print(f"   {stripped} frühere Antwort-/Meta-Absätze ersetzt (Idempotenz).")
+        print(f"   [{tag}] {stripped} frühere Antwort-/Meta-Absätze ersetzt (Idempotenz).")
+
     inserted = 0
     for q in questions:
         item = items_by_num.get(q['num'])
-        if item and q['anchor'] is not None:
-            _insert_qa_answer_before(q['anchor'], item)
-            inserted += 1
-    print(f"   Antworten eingefügt: {inserted}/{len(questions)}.")
+        if not item:
+            continue
+        anchor = q['anchor']
+        if anchor is None:
+            # Letzte Frage am Dokumentende hat keinen nachfolgenden Absatz: einen leeren
+            # Sentinel-Absatz am Ende anhängen und die Antwort davor einfügen. Sentinel wird
+            # getaggt, damit ein Re-Lauf ihn mitentfernt (sonst wüchse das Dokument je Lauf).
+            anchor = doc.add_paragraph()
+            try:
+                anchor.style = _QUIZ_ANSWER_STYLE
+            except Exception:
+                pass
+        _insert_qa_answer_before(anchor, item)
+        inserted += 1
+    print(f"   [{tag}] Antworten eingefügt: {inserted}/{len(questions)}.")
 
-    # Schritt 6: Kommentar-Marker an Quellkapiteln
-    _apply_quiz_markers(doc, items_by_num, heading_map)
+    # Kommentar-Marker an Quellkapiteln
+    _apply_quiz_markers(doc, items_by_num, analysis['heading_map'])
 
-    # Schritt 7: neue Kopie speichern
+
+def run_quiz_check(docx_path: str, quiz_chapter_headings,
+                   output_path: str = None, force: bool = False) -> str:
+    """End-to-End: prüft EIN ODER MEHRERE Leitfragen-Quizzes derselben Lernunterlage,
+    schreibt Antworten in die jeweiligen Quiz-Kapitel und setzt Kommentar-Marker.
+    Speichert EINE neue Kopie. `quiz_chapter_headings` ist ein Kapitel-String oder eine
+    Liste von Kapitel-Strings."""
+    src = Path(docx_path)
+    if not src.exists():
+        raise FileNotFoundError(f"Datei nicht gefunden: {docx_path}")
+    if isinstance(quiz_chapter_headings, str):
+        quiz_chapter_headings = [quiz_chapter_headings]
+    if not quiz_chapter_headings:
+        raise ValueError("Kein Quiz-Kapitel angegeben.")
+    if output_path is None:
+        output_path = str(src.with_name(f"{src.stem}_Quizgeprueft.docx"))
+
+    print(f"--- Quiz-Prüfung: {src.name}  ({len(quiz_chapter_headings)} Quiz-Kapitel) ---")
+    doc = Document(str(src))
+    para_count_before = len(doc.paragraphs)
+    _ensure_quiz_answer_style(doc)  # Markierungsstil für Tool-Einfügungen bereitstellen
+
+    # Analyse-Phase: ALLE Kapitel auf dem UNVERÄNDERTEN Dokument prüfen (keine Mutation),
+    # damit keine eingefügte Antwort eines Quiz die Wissensbasis eines anderen verunreinigt.
+    analyses = [_analyze_one_quiz(doc, src, h, force) for h in quiz_chapter_headings]
+
+    # Mutations-Phase: von unten nach oben (größter Startindex zuerst), damit die in der
+    # Analyse-Phase bestimmten Absatz-Indizes gültig bleiben – Einfügungen liegen dann stets
+    # UNTERHALB bereits verarbeiteter Kapitel und verschieben deren Bereiche nicht.
+    for analysis in sorted(analyses, key=lambda a: a['quiz_range'][0], reverse=True):
+        _mutate_one_quiz(doc, analysis)
+
+    # Neue Kopie speichern
     doc.save(output_path)
     added = len(doc.paragraphs) - para_count_before
-    print(f"Fertig: {output_path}  (+{added} Absätze eingefügt, Originalinhalt unverändert)")
+    print(f"Fertig: {output_path}  (+{added} Absätze eingefügt, "
+          f"{len(analyses)} Quiz-Kapitel, Originalinhalt unverändert)")
     return output_path
 
 
@@ -4203,6 +4362,8 @@ if __name__ == "__main__":
             "  python pipeline.py dok.pdf --chapter 4.2 --parent-chapter 2.4.1.2\n"
             "  python pipeline.py dok.pdf --no-translate --no-summary\n"
             "  python pipeline.py dok.pdf --force   # alle Zwischenergebnisse neu berechnen\n"
+            "  python pipeline.py --quiz-docx unterlage.docx --quiz-chapter \"Quiz Kapitel 1 …\" \\\n"
+            "                     --quiz-chapter \"Quiz Kapitel 2 …\"   # mehrere Quizzes, eine Ausgabe\n"
         ),
     )
     parser.add_argument("pdf_path", type=str, nargs="?", default=None, help="Pfad zur Quell-PDF-Datei")
@@ -4212,11 +4373,12 @@ if __name__ == "__main__":
                              ".docx-Lernunterlage (Fragen als Screenshots) gegen den Dokumenttext, "
                              "schreibt Antworten + Abdeckungsgrad in das Quiz-Kapitel und setzt "
                              "Kommentar-Marker an den Quellkapiteln. Ausgabe: '<name>_Quizgeprueft.docx'.")
-    parser.add_argument("--quiz-chapter", type=str, default=None,
+    parser.add_argument("--quiz-chapter", type=str, action="append", default=None,
                         help="PFLICHT bei --quiz-docx: Überschrift des Quiz-Kapitels (beliebige "
-                             "Ebene/Position). Der Abgleich ist nummern-tolerant – der stabile "
-                             "Textteil ohne Kapitelnummer genügt, z.B. "
-                             "\"Leitfragen-Quiz zum Kurs Personalauswahl\".")
+                             "Ebene/Position). MEHRFACH angebbar, um mehrere Quizzes derselben "
+                             "Datei in EINEM Lauf/EINER Ausgabedatei zu prüfen. Der Abgleich ist "
+                             "nummern-tolerant – der stabile Textteil ohne Kapitelnummer genügt, "
+                             "z.B. --quiz-chapter \"Leitfragen-Quiz zum Kurs Personalauswahl\".")
     parser.add_argument("--force", action="store_true", help="Alle Schritte neu berechnen (kein Resume)")
     parser.add_argument("--parent-chapter", type=str, default=None,
                         help="Elternkapitel im Zieldokument, z.B. '4.2.1.2'. "
@@ -4280,7 +4442,7 @@ if __name__ == "__main__":
                     "--quiz-chapter \"Leitfragen-Quiz zum Kurs Personalauswahl\". "
                     "Der Abgleich ist nummern-tolerant; der stabile Textteil ohne Nummer genügt."
                 )
-            run_quiz_check(args.quiz_docx, quiz_chapter_heading=args.quiz_chapter, force=args.force)
+            run_quiz_check(args.quiz_docx, args.quiz_chapter, force=args.force)
             sys.exit(0)
 
         if not args.pdf_path:
