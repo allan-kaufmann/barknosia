@@ -2878,17 +2878,20 @@ def collapse_duplicate_title(text: str) -> str:
     (z.B. "Literaturverzeichnis") weiterscannen – mit dem Risiko, ganze Artikel fälschlich als
     "Front-Matter-Dublette" zu verwerfen."""
     lines = text.split('\n')
+    # Gegen den BEREINIGTEN Text prüfen (ohne HTML-Anker wie <span id="page-…">, die Marker-OCR
+    # praktisch vor jede Überschrift setzt) – sonst matcht '^\d' nie und der Front-Matter-Abbruch
+    # feuert nicht, wodurch die Schleife bis weit in den Kapitelinhalt hinein weiterläuft.
     content_re = re.compile(
-        r'(?i)^#{1,6}\s.*(ZUSAMMENFASSUNG|ABSTRACT|SCHLÜSSELWÖRTER|KEYWORDS|EINLEITUNG)\b'
-        r'|^#{1,6}\s+\d')
+        r'(?i)^(ZUSAMMENFASSUNG|ABSTRACT|SCHLÜSSELWÖRTER|KEYWORDS|EINLEITUNG)\b'
+        r'|^\d')
     seen: dict = {}
     last_dup = None
     for idx, ln in enumerate(lines):
-        if content_re.match(ln):
-            break                                   # Front-Bereich endet bei erstem Inhalt
         if not re.match(r'^#{1,6}\s+\S', ln):
             continue
         norm_text = _clean_heading_text(ln)
+        if content_re.match(norm_text):
+            break                                   # Front-Bereich endet bei erstem Inhalt
         if _ROMAN_LABEL_RE.match(norm_text) or _DIGIT_LABEL_RE.match(norm_text):
             break                                   # Artikel-/Kapitelüberschrift (Sammelband) = Inhalt
         norm = normalize_heading(norm_text)
@@ -4080,35 +4083,148 @@ def _insert_qa_answer_before(anchor, item):
              item.get('schluessel'), item.get('abdeckung'))
 
 
-def _apply_quiz_markers(doc, items_by_num, heading_map):
-    """Setzt je Quizfrage einen Kommentar-Marker am relevanten Quellabschnitt.
-    Bereits kommentierte Stellen werden erweitert statt doppelt markiert."""
-    marked = extended = skipped = 0
-    for num, item in sorted(items_by_num.items()):
-        tgs = ([s.get('textgrundlage', '') for s in item['subs']]
-               if item.get('subs') else [item.get('textgrundlage', '')])
-        targets = {}
-        for tg in tgs:
-            para = _resolve_tg_para(tg, heading_map)
-            if para is not None:
-                targets[id(para._p)] = para
-        if not targets:
-            skipped += 1
-            continue
-        label = f"Quizfrage {num}"
-        for para in targets.values():
-            existing = _existing_comment_id(para)
-            if existing is not None:
-                c = doc.comments.get(existing)
-                if c is not None:
-                    c.add_paragraph(label)
-                    extended += 1
+def _quiz_short_name(heading: str) -> str:
+    """Kompakter Quizname für Kommentar-Zeilen, z.B. „Quiz Kapitel 1" oder „Leitfragen-Lernquiz".
+    Schneidet Untertitel (' - …'), ' zum Kurs …' und eine führende Kapitelnummer ab."""
+    h = (heading or '').strip().strip('"„“”»«')
+    h = re.split(r'\s+[-–—]\s+', h)[0].strip()
+    h = re.split(r'\s+zum\s+Kurs\b', h, flags=re.IGNORECASE)[0].strip()
+    h = re.sub(r'^\d+(?:\.\d+)*\.?\s+', '', h).strip()
+    return h or (heading or '').strip()
+
+
+def _remove_quiz_comments(doc) -> int:
+    """Entfernt ALLE vom Tool (Autor „Quiz") gesetzten Kommentare samt ihrer Range-Marker
+    (`w:commentRangeStart/End` + Referenz-Run) und lässt Nutzer-/Lernfragen-Kommentare
+    unberührt. Macht das Neusetzen der Marker idempotent (kein Mix aus alt und neu)."""
+    try:
+        comments_elm = doc.comments._comments_elm
+    except Exception:
+        return 0
+    quiz_ids = set()
+    for c_elm in list(comments_elm.comment_lst):
+        if (c_elm.author or "") == "Quiz":
+            quiz_ids.add(str(c_elm.id))
+            c_elm.getparent().remove(c_elm)
+    if not quiz_ids:
+        return 0
+    body = doc.element.body
+    for tag in ('w:commentRangeStart', 'w:commentRangeEnd'):
+        for el in list(body.iter(qn(tag))):
+            if el.get(qn('w:id')) in quiz_ids:
+                parent = el.getparent()
+                if parent is not None:
+                    parent.remove(el)
+    # Referenz-Runs (der Run, der w:commentReference enthält) komplett entfernen
+    for ref in list(body.iter(qn('w:commentReference'))):
+        if ref.get(qn('w:id')) in quiz_ids:
+            run = ref.getparent()
+            if run is not None and run.getparent() is not None:
+                run.getparent().remove(run)
+    return len(quiz_ids)
+
+
+def _apply_quiz_markers(doc, analyses) -> int:
+    """Setzt Kommentar-Marker an den KONKRETEN Textstellen (Beleg-verankert), NIEMALS innerhalb
+    eines Quiz-Kapitels. Kommt eine Stelle in mehreren Quizfragen vor, sammeln sich die Quellen
+    in EINEM „Quiz"-Kommentar (Mehrfach-Vorkommen = interessantes Signal). Bestehende Nutzer-/
+    Lernfragen-Kommentare bleiben unberührt (separater Quiz-Kommentar koexistiert).
+    MUSS VOR der Mutations-Phase laufen (pristine Absatz-Indizes)."""
+    paras = doc.paragraphs
+    n = len(paras)
+
+    # Vereinigung ALLER Quiz-Kapitel-Bereiche → dort wird nie markiert (auch nicht auf
+    # Quizfragen eines anderen Quiz).
+    excluded = set()
+    for a in analyses:
+        lo, hi = a['quiz_range']
+        excluded.update(range(lo, hi))
+
+    def _markable(i):
+        if i in excluded:
+            return False
+        p = paras[i]
+        return not (p.style is not None and p.style.name == _QUIZ_ANSWER_STYLE)
+
+    markable_idx = [i for i in range(n) if _markable(i)]
+    # Normalisierten Absatztext EINMAL vorberechnen (statt je Frage erneut) – sonst wird die
+    # Beleg-Suche über zehntausende Absätze × hunderte Fragen extrem langsam.
+    entries = [(i, paras[i], _normalize_quote(paras[i].text)) for i in markable_idx]
+
+    def _find_beleg(cands, beleg):
+        """Zielabsatz per Beleg-Zitat aus vorbereiteten (idx, para, norm)-Einträgen."""
+        nq = _normalize_quote(beleg)
+        if len(nq) < 8:
+            return None
+        needle = nq[:60]
+        for _i, p, nt in cands:
+            if nt and needle in nt:
+                return p
+        return None
+
+    # Heading-Map NUR aus markierbarem Korpus (für den Überschrift-Fallback).
+    heading_map = {}
+    for i, p, _nt in entries:
+        st = p.style.name if p.style else ""
+        if re.match(r'Heading (\d)', st):
+            for key in _heading_match_keys(p.text):
+                heading_map.setdefault(key, p)
+
+    groups = {}   # id(p._p) -> {'para': p, 'refs': [str, ...]}
+    order = []
+
+    def _add(target, ref):
+        k = id(target._p)
+        if k not in groups:
+            groups[k] = {'para': target, 'refs': []}
+            order.append(k)
+        if ref not in groups[k]['refs']:
+            groups[k]['refs'].append(ref)
+
+    beleg_hits = heading_fallback = unresolved = 0
+    for a in analyses:
+        qname = _quiz_short_name(a['heading'])
+        lo, hi = a['kb_scope']
+        section = [e for e in entries if lo <= e[0] < hi]
+        for num in sorted(a['items_by_num']):
+            item = a['items_by_num'][num]
+            units = item['subs'] if item.get('subs') else [item]
+            for u in units:
+                beleg = (u.get('beleg') or '').strip()
+                target = _find_beleg(section, beleg) if beleg else None
+                if target is None and beleg:
+                    target = _find_beleg(entries, beleg)
+                via_beleg = target is not None
+                if target is None:
+                    target = _resolve_tg_para(u.get('textgrundlage', ''), heading_map)
+                if target is None:
+                    unresolved += 1
                     continue
-            runs = para.runs or [para.add_run("")]
-            doc.add_comment(runs, text=label, author="Quiz", initials="QZ")
-            marked += 1
-    print(f"   Marker: {marked} neu, {extended} erweitert, {skipped} ohne Fundstelle.")
-    return marked, extended, skipped
+                if via_beleg:
+                    beleg_hits += 1
+                else:
+                    heading_fallback += 1
+                label = u.get('label')
+                ref = f"»{qname}« – Frage {num}" + (f" ({label})" if label else "")
+                _add(target, ref)
+
+    multi = 0
+    for k in order:
+        para = groups[k]['para']
+        refs = groups[k]['refs']
+        if len(refs) > 1:
+            multi += 1
+        runs = para.runs or [para.add_run("")]
+        if len(refs) == 1:
+            body = f"In einem Quiz behandelt: {refs[0]}"
+        else:
+            body = "In Quizzes behandelt:\n" + "\n".join(f"• {r}" for r in refs)
+        doc.add_comment(runs, text=body, author="Quiz", initials="QZ")
+
+    print(f"   Marker (Beleg-verankert): {len(order)} Textstellen markiert "
+          f"({beleg_hits} per Beleg, {heading_fallback} per Überschrift-Fallback, "
+          f"{multi} mehrfach belegt, {unresolved} ohne Fundstelle).")
+    return len(order)
 
 
 def _retry_single_question(full_kb: str, num: int, question_text: str) -> str:
@@ -4269,12 +4385,14 @@ def _analyze_one_quiz(doc, src: Path, quiz_chapter_heading: str, force: bool) ->
         'items_by_num': items_by_num,
         'heading_map': heading_map,
         'quiz_range': quiz_range,
+        'kb_scope': kb_scope,
     }
 
 
 def _mutate_one_quiz(doc, analysis: dict):
-    """Mutations-Phase für EIN Quiz-Kapitel: frühere Tool-Antworten entfernen (Idempotenz),
-    Antworten je Frage einfügen (nur Insert), Kommentar-Marker setzen/erweitern."""
+    """Mutations-Phase für EIN Quiz-Kapitel: frühere Tool-Antworten entfernen (Idempotenz)
+    und Antworten je Frage einfügen (nur Insert). Marker werden separat und global gesetzt
+    (siehe _apply_quiz_markers), nicht hier."""
     tag = analysis['heading'][:50]
     questions = analysis['questions']
     items_by_num = analysis['items_by_num']
@@ -4304,9 +4422,6 @@ def _mutate_one_quiz(doc, analysis: dict):
         inserted += 1
     print(f"   [{tag}] Antworten eingefügt: {inserted}/{len(questions)}.")
 
-    # Kommentar-Marker an Quellkapiteln
-    _apply_quiz_markers(doc, items_by_num, analysis['heading_map'])
-
 
 def run_quiz_check(docx_path: str, quiz_chapter_headings,
                    output_path: str = None, force: bool = False) -> str:
@@ -4332,6 +4447,14 @@ def run_quiz_check(docx_path: str, quiz_chapter_headings,
     # Analyse-Phase: ALLE Kapitel auf dem UNVERÄNDERTEN Dokument prüfen (keine Mutation),
     # damit keine eingefügte Antwort eines Quiz die Wissensbasis eines anderen verunreinigt.
     analyses = [_analyze_one_quiz(doc, src, h, force) for h in quiz_chapter_headings]
+
+    # Marker-Phase: auf dem NOCH UNVERÄNDERTEN Dokument (pristine Absatz-Indizes). Zuvor eigene
+    # frühere „Quiz"-Kommentare entfernen (kein Mix aus alt/neu); Nutzer-/Lernfragen-Kommentare
+    # bleiben unberührt. Marker sitzen an der konkreten Beleg-Stelle, nie in einem Quiz-Kapitel.
+    removed_c = _remove_quiz_comments(doc)
+    if removed_c:
+        print(f"   {removed_c} frühere „Quiz\"-Kommentare entfernt (Idempotenz).")
+    _apply_quiz_markers(doc, analyses)
 
     # Mutations-Phase: von unten nach oben (größter Startindex zuerst), damit die in der
     # Analyse-Phase bestimmten Absatz-Indizes gültig bleiben – Einfügungen liegen dann stets
