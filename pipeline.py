@@ -4656,8 +4656,12 @@ if __name__ == "__main__":
                 f.unlink()
         # Legacy-Fallback: ältere Läufe legten die Übersetzung direkt in out_dir ab (vor dem
         # work/-Layout). Eine dort vorhandene, bereits verifizierte Übersetzung wiederverwenden,
-        # damit der eingebettete Originaltext deutsch ist statt englisch.
-        if not transl_path.exists():
+        # damit der eingebettete Originaltext deutsch ist statt englisch. NUR beim
+        # Gesamtdokument-Lauf (kein --chapter): die Legacy-Datei deckt das GANZE Dokument (bzw.
+        # einen früheren, ANDEREN --chapter-Lauf) ab – bei --chapter würde sie sonst den gerade
+        # frisch extrahierten Kapiteltext durch falsche Inhalte ersetzen (auch --force hilft dann
+        # nicht, da dieser Pfad davon unberührt bleibt).
+        if not transl_path.exists() and not args.chapter:
             legacy_transl_path = out_dir / "de_uebersetzung.md"
             if legacy_transl_path.exists():
                 transl_path = legacy_transl_path
