@@ -4728,8 +4728,12 @@ def check_mm4_relevance_for_chunk(chunk_text: str, chunk_idx: int, total_chunks:
         "- Melde für jede zutreffende Frage jede zutreffende Option EINZELN.\n\n"
         "Ausgabeformat (nur für Fragen mit mindestens einem Treffer in diesem Ausschnitt):\n"
         "Frage <Nummer>\n"
-        "- <Stamm oder Option A/B/C/...>: Kapitel: <nächstgelegene Überschrift> | "
-        "Zitat: \"<wörtliches Zitat, 5-15 Wörter>\"\n\n"
+        "- <Stamm oder Option A/B/C/...>: Fundstelle: <vollständiger Überschriften-Pfad von der "
+        "obersten bis zur nächstgelegenen Überschrift, getrennt mit \" > \", z.B. \"Kurs 1: Stress "
+        "und Stressbewältigung > 1.1. Stresstheorien > 1.1.2 Situationsbezogene Stresskonzeption\" "
+        "bzw. \"KE 1: Personalauswahl > 3 Qualitätssicherung in der Eignungsdiagnostik > 3.1.1 "
+        "Qualitätssicherung und -optimierung\"> | Zitat: \"<wörtliches Zitat der relevanten Textstelle "
+        "– vollständiger Satz bzw. vollständige Aussage, nicht künstlich gekürzt>\"\n\n"
         "Gibt es in diesem Ausschnitt KEINEN einzigen Treffer über alle Fragen hinweg, "
         "antworte NUR mit: KEINE_TREFFER\n\n"
         f"--- WISSENSTEXT-AUSSCHNITT (Teil {chunk_idx}/{total_chunks} von Modul {modul_label}) ---\n"
@@ -4746,7 +4750,9 @@ def check_mm4_relevance_for_chunk(chunk_text: str, chunk_idx: int, total_chunks:
 
 
 def parse_mm4_relevance_response(text: str) -> dict:
-    """Parst die Ausgabe von check_mm4_relevance_for_chunk. Gibt {uid: [{'teil','kapitel','zitat'}, ...]} zurück."""
+    """Parst die Ausgabe von check_mm4_relevance_for_chunk. Gibt
+    {uid: [{'teil','fundstelle','zitat'}, ...]} zurück. 'fundstelle' ist der
+    vollständige Überschriften-Pfad (Kurseinheit > Kapitel > Unterkapitel)."""
     result = {}
     if not text or 'KEINE_TREFFER' in text[:40]:
         return result
@@ -4762,10 +4768,10 @@ def parse_mm4_relevance_response(text: str) -> dict:
         i += 2
         hits = []
         for lm in re.finditer(
-            r'(?m)^-\s*(Stamm|Option\s*[A-Z]+)\s*:\s*Kapitel:\s*(.+?)\s*\|\s*Zitat:\s*"(.+?)"\s*$',
+            r'(?m)^-\s*(Stamm|Option\s*[A-Z]+)\s*:\s*Fundstelle:\s*(.+?)\s*\|\s*Zitat:\s*"(.+?)"\s*$',
             block,
         ):
-            hits.append({'teil': lm.group(1).strip(), 'kapitel': lm.group(2).strip(), 'zitat': lm.group(3).strip()})
+            hits.append({'teil': lm.group(1).strip(), 'fundstelle': lm.group(2).strip(), 'zitat': lm.group(3).strip()})
         if hits:
             result.setdefault(uid, []).extend(hits)
     return result
@@ -4837,7 +4843,7 @@ def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict, modul
         doc.add_paragraph(f"Relevant für Modul {modul_label}:").runs[0].bold = True
         for hit in hits:
             doc.add_paragraph(
-                f"  {hit['teil']} – Kapitel: {hit['kapitel']} – Zitat: „{hit['zitat']}“",
+                f"  {hit['teil']} – Fundstelle: {hit['fundstelle']} – Zitat: „{hit['zitat']}“",
                 style='List Bullet 2',
             )
         doc.add_paragraph('')  # Abstand zur nächsten Frage
