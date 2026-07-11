@@ -4501,12 +4501,89 @@ def collect_mm4_exam_files(folder: str) -> list:
     return exams
 
 
+def _format_mm4_raw_question_list(raw_questions: list) -> str:
+    lines = []
+    for i, q in enumerate(raw_questions):
+        lines.append(f"[{i}] (Klausur {q['exam_label']}, Nr. {q.get('aufgabe_num')}): {q['fragetext']}")
+        for idx, opt in enumerate(q['optionen']):
+            lines.append(f"     {_mm4_option_letter(idx)}) {opt}")
+    return '\n'.join(lines)
+
+
+def group_duplicate_mm4_questions_llm(raw_questions: list) -> str:
+    """Ein LLM-Call: gruppiert ALLE Rohfragen über alle Klausuren hinweg nach
+    inhaltlicher Gleichheit (auch bei unterschiedlichem Wortlaut/Format, z.B.
+    A-E-Optionen vs. Wahr/Falsch-Aussagenliste) und liefert pro Gruppe einen kurzen
+    Themen-Titel. Reines String-Matching (normalisiert) reicht nicht, da die
+    Fragenextraktion per LLM läuft und identische Fragen zwischen Klausurjahrgängen
+    leicht unterschiedlich formuliert werden können. Gibt die rohe JSON-Antwort zurück."""
+    prompt = (
+        "Rolle:\nDu erhältst alle Prüfungsfragen aus mehreren Klausurjahrgängen desselben "
+        "Moduls, durchnummeriert. Manche Fragen wiederholen sich inhaltlich über die "
+        "Jahrgänge hinweg, jedoch teils mit leicht unterschiedlichem Wortlaut oder "
+        "anderem Format (z.B. Antwortoptionen A-E vs. Wahr/Falsch-Aussagenliste).\n\n"
+        "Aufgabe:\n"
+        "1. Gruppiere alle Fragen, die INHALTLICH DIESELBE Frage sind (gleicher "
+        "Fragestamm bzw. gleiche geprüfte Aussagen), auch wenn Wortlaut oder Format "
+        "abweichen. Nur wirklich identische Fragen gruppieren, NICHT nur gleiches Thema.\n"
+        "2. Vergib pro Gruppe einen kurzen, sprechenden Themen-Titel (3-6 Wörter, "
+        "Substantiv-Stil, z.B. \"Sicherheit und Gesundheit am Arbeitsplatz\").\n\n"
+        "Jeder Fragen-Index MUSS in genau einer Gruppe vorkommen (auch Fragen ohne "
+        "Duplikat -> eigene Gruppe mit nur einem Index).\n\n"
+        "Gib AUSSCHLIESSLICH ein valides JSON-Array zurück, keine Erklärung, keinen "
+        "Markdown-Codeblock:\n"
+        "[{\"gruppe\": [0, 5, 12], \"titel\": \"...\"}, ...]\n\n"
+        "--- FRAGEN ---\n"
+        f"{_format_mm4_raw_question_list(raw_questions)}\n"
+    )
+    response = call_gemini_with_retry(
+        model_name='gemini-2.5-pro',
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.0, response_mime_type='application/json'),
+    )
+    return response.text or ''
+
+
+def parse_mm4_grouping_response(raw: str, n_questions: int) -> list:
+    """Parst die Antwort von group_duplicate_mm4_questions_llm. Gibt eine Liste von
+    {'indices': [...], 'titel': str} zurück. Indizes, die die Antwort nicht (oder
+    doppelt) erwähnt, werden robust als Singleton-Gruppe ergänzt/ignoriert, damit
+    keine Frage verloren geht bzw. doppelt gezählt wird."""
+    text = (raw or '').strip()
+    text = re.sub(r'^```(?:json)?\s*', '', text)
+    text = re.sub(r'\s*```$', '', text)
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        data = []
+
+    groups = []
+    seen = set()
+    for item in data:
+        idxs = [i for i in (item.get('gruppe') or [])
+                if isinstance(i, int) and 0 <= i < n_questions and i not in seen]
+        if not idxs:
+            continue
+        seen.update(idxs)
+        titel = (item.get('titel') or '').strip()
+        groups.append({'indices': idxs, 'titel': titel})
+
+    for i in range(n_questions):
+        if i not in seen:
+            groups.append({'indices': [i], 'titel': ''})
+            seen.add(i)
+    return groups
+
+
 def dedupe_mm4_questions(exams: list, force: bool = False, cache_dir: Path = None) -> list:
-    """Extrahiert Fragen aus allen Klausuren und fasst inhaltlich identische Fragen
-    (normalisierter Fragetext + normalisierte Optionen) zu einem Eintrag mit
-    'occurrences' (Klausur-Labels, absteigend nach Aktualität) zusammen.
-    Gibt eindeutige Fragen zurück, jeweils mit stabiler 'uid' (1..N)."""
-    groups = {}  # norm_key -> merged question dict
+    """Extrahiert Fragen aus allen Klausuren und gruppiert inhaltlich identische
+    Fragen PER LLM (siehe group_duplicate_mm4_questions_llm – normalisiertes
+    String-Matching reicht nicht, da die Fragenextraktion selbst per LLM läuft und
+    Wortlaut/Format zwischen Klausurjahrgängen leicht variieren kann) zu einem
+    Eintrag mit 'titel' und 'occurrences' ((order, label, aufgabe_num), absteigend
+    nach Aktualität) zusammen. Gibt eindeutige Fragen zurück, jeweils mit stabiler
+    'uid' (1..N)."""
+    raw_questions = []
     for exam in exams:
         cache_path = None
         if cache_dir is not None:
@@ -4520,16 +4597,39 @@ def dedupe_mm4_questions(exams: list, force: bool = False, cache_dir: Path = Non
                 cache_path.write_text(json.dumps(qs, ensure_ascii=False, indent=2), encoding='utf-8')
         print(f"   [{exam['label']}] {len(qs)} Fragen extrahiert.")
         for q in qs:
-            key = _normalize_quote(q['fragetext']) + '||' + '|'.join(_normalize_quote(o) for o in q['optionen'])
-            if key not in groups:
-                groups[key] = {
-                    'fragetext': q['fragetext'],
-                    'optionen': q['optionen'],
-                    'occurrences': [],
-                }
-            groups[key]['occurrences'].append((exam['order'], exam['label']))
+            raw_questions.append({
+                'fragetext': q['fragetext'],
+                'optionen': q['optionen'],
+                'aufgabe_num': q.get('aufgabe_num'),
+                'exam_order': exam['order'],
+                'exam_label': exam['label'],
+            })
 
-    unique = list(groups.values())
+    if cache_dir is not None:
+        grouping_cache = cache_dir / "gruppierung.json"
+        raw_response = load_or_run(
+            grouping_cache,
+            lambda: group_duplicate_mm4_questions_llm(raw_questions),
+            "Fragen-Gruppierung (Deduplizierung)",
+        )
+    else:
+        raw_response = group_duplicate_mm4_questions_llm(raw_questions)
+
+    groups = parse_mm4_grouping_response(raw_response, len(raw_questions))
+
+    unique = []
+    for g in groups:
+        members = [raw_questions[i] for i in g['indices']]
+        members.sort(key=lambda m: m['exam_order'], reverse=True)
+        rep = members[0]
+        titel = g['titel'] or rep['fragetext'][:60]
+        unique.append({
+            'fragetext': rep['fragetext'],
+            'optionen': rep['optionen'],
+            'titel': titel,
+            'occurrences': [(m['exam_order'], m['exam_label'], m['aufgabe_num']) for m in members],
+        })
+
     for u in unique:
         u['occurrences'].sort(key=lambda oc: oc[0], reverse=True)
         u['max_order'] = u['occurrences'][0][0]
@@ -4697,13 +4797,12 @@ def check_mm4_relevance_module(unique_questions: list, docx_path: str, modul_lab
     return aggregated
 
 
-def build_mm4_report_docx(unique_questions: list, treffer_by_modul: dict, output_path: str):
-    """Erstellt die Ergebnis-.docx: alle relevanten Fragen, chronologisch absteigend
-    (neueste Klausur zuerst), mit Fragetext, Antwortoptionen, Vorkommen und den pro
-    Modul gefundenen Fundstellen."""
-    relevant = [q for q in unique_questions
-                if treffer_by_modul.get('36633', {}).get(q['uid'])
-                or treffer_by_modul.get('36634', {}).get(q['uid'])]
+def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict, modul_label: str, output_path: str):
+    """Erstellt die Ergebnis-.docx für EIN Modul: alle relevanten Fragen, chronologisch
+    absteigend (neueste Klausur zuerst), mit sprechendem Themen-Titel als Überschrift,
+    Fragetext, Antwortoptionen, nummerierten Vorkommen (Klausur + dortige Fragenummer)
+    und den gefundenen Fundstellen."""
+    relevant = [q for q in unique_questions if treffer_for_modul.get(q['uid'])]
     relevant.sort(key=lambda q: q['max_order'], reverse=True)
 
     doc = Document()
@@ -4711,16 +4810,19 @@ def build_mm4_report_docx(unique_questions: list, treffer_by_modul: dict, output
     style.font.name = 'Arial'
     style.font.size = Pt(11)
 
-    doc.add_heading('MM4 – Relevanzprüfung gegen Module 36633 / 36634', level=1)
+    doc.add_heading(f'MM4 – Relevanzprüfung gegen Modul {modul_label}', level=1)
     doc.add_paragraph(
         f"{len(relevant)} von {len(unique_questions)} eindeutigen Fragen sind relevant "
-        f"für mindestens eines der beiden Module. Sortierung: chronologisch absteigend "
+        f"für Modul {modul_label}. Sortierung: chronologisch absteigend "
         f"(neueste Klausur zuerst)."
     )
 
     for q in relevant:
-        occ = ', '.join(label for _, label in q['occurrences'])
-        h = doc.add_heading(f"Frage (zuletzt: {q['occurrences'][0][1]})", level=2)
+        occ = ', '.join(
+            f"{label} Nr. {num}" if num is not None else label
+            for _, label, num in q['occurrences']
+        )
+        h = doc.add_heading(f'Frage „{q["titel"]}“', level=2)
         _set_heading_color(h, MM_HEADING_COLORS[2])
 
         p = doc.add_paragraph()
@@ -4729,18 +4831,15 @@ def build_mm4_report_docx(unique_questions: list, treffer_by_modul: dict, output
         for idx, opt in enumerate(q['optionen']):
             doc.add_paragraph(f"{_mm4_option_letter(idx)}) {opt}", style='List Bullet')
 
-        doc.add_paragraph(f"Vorkommen in Klausuren: {occ}")
+        doc.add_paragraph(f"Vorkommen: {occ}")
 
-        for modul in ('36633', '36634'):
-            hits = treffer_by_modul.get(modul, {}).get(q['uid'])
-            if not hits:
-                continue
-            doc.add_paragraph(f"Relevant für Modul {modul}:").runs[0].bold = True
-            for hit in hits:
-                doc.add_paragraph(
-                    f"  {hit['teil']} – Kapitel: {hit['kapitel']} – Zitat: „{hit['zitat']}“",
-                    style='List Bullet 2',
-                )
+        hits = treffer_for_modul.get(q['uid'])
+        doc.add_paragraph(f"Relevant für Modul {modul_label}:").runs[0].bold = True
+        for hit in hits:
+            doc.add_paragraph(
+                f"  {hit['teil']} – Kapitel: {hit['kapitel']} – Zitat: „{hit['zitat']}“",
+                style='List Bullet 2',
+            )
         doc.add_paragraph('')  # Abstand zur nächsten Frage
 
     doc.save(output_path)
@@ -4749,9 +4848,11 @@ def build_mm4_report_docx(unique_questions: list, treffer_by_modul: dict, output
 
 
 def run_mm4_check(folder: str, ref_36633: str = None, ref_36634: str = None,
-                   output_path: str = None, force: bool = False) -> str:
+                   output_path: str = None, force: bool = False) -> tuple:
     """End-to-End: liest alle Klausur-PDFs im Ordner, dedupliziert die Fragen, prüft
-    sie gegen beide Referenzmodule und schreibt das Ergebnis-.docx."""
+    sie gegen beide Referenzmodule und schreibt je EIN Ergebnis-.docx pro Modul
+    (36633 und 36634 getrennt, damit sie direkt in die jeweilige Lernunterlage
+    übernommen werden können). Gibt (pfad_36633, pfad_36634) zurück."""
     folder_path = Path(folder)
     if not folder_path.is_dir():
         raise FileNotFoundError(f"Ordner nicht gefunden: {folder}")
@@ -4769,7 +4870,11 @@ def run_mm4_check(folder: str, ref_36633: str = None, ref_36634: str = None,
                                      "(erwarte Dateinamen mit '36634'). --mm4-ref-36634 angeben.")
         ref_36634 = str(cands[0])
     if output_path is None:
-        output_path = str(folder_path / "MM4_Relevanzpruefung_36633_36634.docx")
+        base = folder_path / "MM4_Relevanzpruefung.docx"
+    else:
+        base = Path(output_path)
+    output_36633 = str(base.with_name(f"{base.stem}_36633{base.suffix}"))
+    output_36634 = str(base.with_name(f"{base.stem}_36634{base.suffix}"))
 
     cache_dir = folder_path / ".mm4check"
     if force and cache_dir.exists():
@@ -4786,12 +4891,12 @@ def run_mm4_check(folder: str, ref_36633: str = None, ref_36634: str = None,
     unique_questions = dedupe_mm4_questions(exams, force=force, cache_dir=cache_dir)
     print(f"   {len(unique_questions)} eindeutige Fragen nach Deduplizierung.")
 
-    treffer_by_modul = {
-        '36633': check_mm4_relevance_module(unique_questions, ref_36633, '36633', cache_dir, force=force),
-        '36634': check_mm4_relevance_module(unique_questions, ref_36634, '36634', cache_dir, force=force),
-    }
+    treffer_36633 = check_mm4_relevance_module(unique_questions, ref_36633, '36633', cache_dir, force=force)
+    treffer_36634 = check_mm4_relevance_module(unique_questions, ref_36634, '36634', cache_dir, force=force)
 
-    return build_mm4_report_docx(unique_questions, treffer_by_modul, output_path)
+    path_36633 = build_mm4_report_docx(unique_questions, treffer_36633, '36633', output_36633)
+    path_36634 = build_mm4_report_docx(unique_questions, treffer_36634, '36634', output_36634)
+    return path_36633, path_36634
 
 
 def run_quiz_check(docx_path: str, quiz_chapter_headings,
