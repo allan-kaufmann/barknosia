@@ -4505,7 +4505,7 @@ def _mutate_one_quiz(doc, analysis: dict):
 
 
 # ---------------------------------------------------------------------------
-# MM4-Relevanzprüfung (Klausurfragen eines Fremdmoduls gegen 36633/36634 abgleichen)
+# MM4-Relevanzprüfung (Klausurfragen eines Fremdmoduls gegen beliebige Referenzdokumente abgleichen)
 # ---------------------------------------------------------------------------
 #
 # Eigener, getrennter Verarbeitungspfad: liest N Klausur-PDFs mit Multiple-Choice-
@@ -4972,34 +4972,37 @@ def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict, modul
     return output_path
 
 
-def run_mm4_check(folder: str, ref_36633: str = None, ref_36634: str = None,
-                   output_path: str = None, force: bool = False) -> tuple:
+def run_mm4_check(folder: str, ref_docs: list = None,
+                   output_path: str = None, force: bool = False) -> list:
     """End-to-End: liest alle Klausur-PDFs im Ordner, dedupliziert die Fragen, prüft
-    sie gegen beide Referenzmodule und schreibt je EIN Ergebnis-.docx pro Modul
-    (36633 und 36634 getrennt, damit sie direkt in die jeweilige Lernunterlage
-    übernommen werden können). Gibt (pfad_36633, pfad_36634) zurück."""
+    sie gegen beliebig viele Referenzdokumente und schreibt je EIN Ergebnis-.docx pro
+    Referenzdokument (direkt einfügbar in die jeweilige Lernunterlage). ref_docs ist
+    eine Liste von Pfaden zu Referenz-.docx-Dateien und MUSS explizit angegeben werden
+    (keine automatische Dateinamenserkennung – der Ordner kann auch die eigenen,
+    bereits erzeugten Report-Dateien enthalten, die sonst fälschlich als Referenz
+    erkannt würden). Das Label je Referenz (für Reportnamen, Überschriften und
+    Kommentartext) wird automatisch aus dem jeweiligen Dateinamen abgeleitet.
+    Gibt eine Liste der erzeugten Report-Pfade zurück."""
     folder_path = Path(folder)
     if not folder_path.is_dir():
         raise FileNotFoundError(f"Ordner nicht gefunden: {folder}")
 
-    if ref_36633 is None:
-        cands = list(folder_path.glob('*36633*.docx'))
-        if not cands:
-            raise FileNotFoundError("Keine Referenz-.docx für 36633 im Ordner gefunden "
-                                     "(erwarte Dateinamen mit '36633'). --mm4-ref-36633 angeben.")
-        ref_36633 = str(cands[0])
-    if ref_36634 is None:
-        cands = list(folder_path.glob('*36634*.docx'))
-        if not cands:
-            raise FileNotFoundError("Keine Referenz-.docx für 36634 im Ordner gefunden "
-                                     "(erwarte Dateinamen mit '36634'). --mm4-ref-36634 angeben.")
-        ref_36634 = str(cands[0])
+    if not ref_docs:
+        raise FileNotFoundError(
+            "Keine Referenz-.docx angegeben. Mindestens einmal --mm4-ref <Pfad> angeben "
+            "(mehrfach wiederholbar; keine automatische Erkennung, da der Ordner sonst "
+            "auch die eigenen Report-Dateien enthalten kann).")
+
     if output_path is None:
         base = folder_path / "MM4_Relevanzpruefung.docx"
     else:
         base = Path(output_path)
-    output_36633 = str(base.with_name(f"{base.stem}_36633{base.suffix}"))
-    output_36634 = str(base.with_name(f"{base.stem}_36634{base.suffix}"))
+
+    labels = [Path(ref).stem for ref in ref_docs]
+    if len(set(labels)) != len(labels):
+        raise ValueError(
+            f"Mehrdeutige Referenz-Labels (aus Dateinamen abgeleitet): {labels}. "
+            "Referenzdateien müssen unterschiedliche Dateinamen (ohne Endung) haben.")
 
     cache_dir = folder_path / ".mm4check"
     if force and cache_dir.exists():
@@ -5010,22 +5013,20 @@ def run_mm4_check(folder: str, ref_36633: str = None, ref_36634: str = None,
     exams = collect_mm4_exam_files(folder)
     if not exams:
         raise FileNotFoundError(f"Keine Klausur-PDFs (Muster 'N - Label.pdf') in {folder} gefunden.")
-    print(f"--- MM4-Relevanzprüfung: {len(exams)} Klausuren, Referenzen 36633='{Path(ref_36633).name}', "
-          f"36634='{Path(ref_36634).name}' ---")
+    ref_list = ', '.join(f"{label}='{Path(ref).name}'" for label, ref in zip(labels, ref_docs))
+    print(f"--- MM4-Relevanzprüfung: {len(exams)} Klausuren, Referenzen {ref_list} ---")
 
     unique_questions = dedupe_mm4_questions(exams, force=force, cache_dir=cache_dir)
     print(f"   {len(unique_questions)} eindeutige Fragen nach Deduplizierung.")
 
-    treffer_36633 = check_mm4_relevance_module(unique_questions, ref_36633, '36633', cache_dir, force=force)
-    treffer_36634 = check_mm4_relevance_module(unique_questions, ref_36634, '36634', cache_dir, force=force)
+    report_paths = []
+    for label, ref in zip(labels, ref_docs):
+        output_ref = str(base.with_name(f"{base.stem}_{label}{base.suffix}"))
+        treffer = check_mm4_relevance_module(unique_questions, ref, label, cache_dir, force=force)
+        report_paths.append(build_mm4_report_docx(unique_questions, treffer, label, output_ref))
+        _mark_mm4_hits_in_reference(unique_questions, treffer, ref, label)
 
-    path_36633 = build_mm4_report_docx(unique_questions, treffer_36633, '36633', output_36633)
-    path_36634 = build_mm4_report_docx(unique_questions, treffer_36634, '36634', output_36634)
-
-    _mark_mm4_hits_in_reference(unique_questions, treffer_36633, ref_36633, '36633')
-    _mark_mm4_hits_in_reference(unique_questions, treffer_36634, ref_36634, '36634')
-
-    return path_36633, path_36634
+    return report_paths
 
 
 def run_quiz_check(docx_path: str, quiz_chapter_headings,
@@ -5092,7 +5093,8 @@ if __name__ == "__main__":
             "  python pipeline.py dok.pdf --force   # alle Zwischenergebnisse neu berechnen\n"
             "  python pipeline.py --quiz-docx unterlage.docx --quiz-chapter \"Quiz Kapitel 1 …\" \\\n"
             "                     --quiz-chapter \"Quiz Kapitel 2 …\"   # mehrere Quizzes, eine Ausgabe\n"
-            "  python pipeline.py --mm4-check MM4/   # Klausuren im Ordner gegen 36633/36634 prüfen\n"
+            "  python pipeline.py --mm4-check MM4/ --mm4-ref a.docx --mm4-ref b.docx"
+            "   # Klausuren im Ordner gegen beliebig viele Referenzdokumente prüfen\n"
         ),
     )
     parser.add_argument("pdf_path", type=str, nargs="?", default=None, help="Pfad zur Quell-PDF-Datei")
@@ -5111,20 +5113,21 @@ if __name__ == "__main__":
     parser.add_argument("--mm4-check", type=str, default=None, metavar="ORDNER",
                         help="Getrennter Modus: prüft Klausur-PDFs eines Fremdmoduls (Dateimuster "
                              "'N - Label.pdf', N = chronologische Reihenfolge) im angegebenen Ordner "
-                             "gegen die Referenz-.docx der Module 36633/36634 (per Default per "
-                             "Dateinamensmuster '*36633*.docx'/'*36634*.docx' im selben Ordner "
-                             "gefunden, sonst --mm4-ref-36633/--mm4-ref-36634 angeben). Dedupliziert "
-                             "identische Fragen über alle Klausuren hinweg und schreibt eine "
+                             "gegen beliebig viele Referenz-.docx-Dokumente (Pfade zwingend über "
+                             "--mm4-ref angeben, mehrfach wiederholbar – keine automatische Erkennung, "
+                             "da der Ordner auch die eigenen Report-Dateien enthalten kann). Das Label "
+                             "je Referenz wird automatisch aus dem Dateinamen abgeleitet. Dedupliziert "
+                             "identische Fragen über alle Klausuren hinweg und schreibt je Referenz eine "
                              "Ergebnis-.docx mit allen relevanten Fragen (chronologisch absteigend).")
-    parser.add_argument("--mm4-ref-36633", type=str, default=None,
-                        help="Nur mit --mm4-check: Pfad zur Referenz-.docx für Modul 36633 "
-                             "(überschreibt die automatische Dateinamenserkennung).")
-    parser.add_argument("--mm4-ref-36634", type=str, default=None,
-                        help="Nur mit --mm4-check: Pfad zur Referenz-.docx für Modul 36634 "
-                             "(überschreibt die automatische Dateinamenserkennung).")
+    parser.add_argument("--mm4-ref", type=str, action="append", default=None,
+                        help="Nur mit --mm4-check: Pfad zu einer Referenz-.docx, gegen die geprüft "
+                             "werden soll. MEHRFACH angebbar (mind. einmal zwingend erforderlich). "
+                             "Das Label (Reportname, Überschriften, Kommentartext) wird aus dem "
+                             "Dateinamen abgeleitet.")
     parser.add_argument("--mm4-output", type=str, default=None,
-                        help="Nur mit --mm4-check: Pfad der Ergebnis-.docx "
-                             "(Standard: '<ORDNER>/MM4_Relevanzpruefung_36633_36634.docx').")
+                        help="Nur mit --mm4-check: Basis-Pfad der Ergebnis-.docx-Dateien "
+                             "(Standard: '<ORDNER>/MM4_Relevanzpruefung.docx'; je Referenz wird "
+                             "'_<Label>' vor der Endung angehängt).")
     parser.add_argument("--force", action="store_true", help="Alle Schritte neu berechnen (kein Resume)")
     parser.add_argument("--parent-chapter", type=str, default=None,
                         help="Elternkapitel im Zieldokument, z.B. '4.2.1.2'. "
@@ -5180,9 +5183,9 @@ if __name__ == "__main__":
         if not os.getenv("GEMINI_API_KEY"):
             raise ValueError("GEMINI_API_KEY fehlt in der .env-Datei!")
 
-        # --- Getrennter Modus: MM4-Klausurfragen gegen 36633/36634 prüfen ---
+        # --- Getrennter Modus: MM4-Klausurfragen gegen beliebige Referenzdokumente prüfen ---
         if args.mm4_check:
-            run_mm4_check(args.mm4_check, ref_36633=args.mm4_ref_36633, ref_36634=args.mm4_ref_36634,
+            run_mm4_check(args.mm4_check, ref_docs=args.mm4_ref,
                           output_path=args.mm4_output, force=args.force)
             sys.exit(0)
 
