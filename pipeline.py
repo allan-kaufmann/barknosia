@@ -4423,6 +4423,377 @@ def _mutate_one_quiz(doc, analysis: dict):
     print(f"   [{tag}] Antworten eingefügt: {inserted}/{len(questions)}.")
 
 
+# ---------------------------------------------------------------------------
+# MM4-Relevanzprüfung (Klausurfragen eines Fremdmoduls gegen 36633/36634 abgleichen)
+# ---------------------------------------------------------------------------
+#
+# Eigener, getrennter Verarbeitungspfad: liest N Klausur-PDFs mit Multiple-Choice-
+# bzw. Wahr/Falsch-Aufgaben, dedupliziert über alle Klausuren hinweg identische
+# Fragen, und prüft jede eindeutige Frage gegen den Volltext zweier Referenz-.docx
+# (Lernunterlagen). Da die Referenztexte (~750k-1M Token je Modul) das Kontext-
+# fenster sprengen, wird NICHT pro Frage gegen den Volltext geprüft, sondern
+# umgekehrt: der Wissenstext wird in große Chunks zerlegt (Wiederverwendung von
+# _split_at_level/_group_into_chunks) und pro Chunk werden ALLE Fragen auf einmal
+# abgeglichen (ein LLM-Call pro Chunk, nicht pro Frage). Ergebnis: eine neue .docx
+# mit allen relevanten Fragen, chronologisch absteigend (neueste Klausur zuerst),
+# inkl. Fundstellen.
+#
+# Die 12 Klausur-PDFs erwiesen sich als überraschend heterogen (mind. 4 verschiedene
+# Checkbox-Zeichensätze, teils ganz ohne A-E-Beschriftung sondern Wahr/Falsch-
+# Aussagenraster, eine PDF sogar mit kaputter Textebene/Font-Encoding). Ein
+# Regex-Parser auf dem via pypdfium2 extrahierten Rohtext scheiterte an dieser
+# Formatvielfalt (parste nur 1 von 12 Klausuren korrekt). Die Fragenextraktion
+# läuft daher per Gemini direkt auf dem PDF (multimodaler nativer PDF-Input) –
+# das ist robust gegen alle beobachteten Formatvarianten.
+
+
+def extract_mm4_questions(pdf_path: str) -> list:
+    """Extrahiert Fragen + Antwortoptionen aus einer MM4-Klausur-PDF per Gemini
+    (nativer PDF-Input, siehe Moduldoku oben)."""
+    pdf_bytes = Path(pdf_path).read_bytes()
+    prompt = (
+        "Dies ist eine Klausur-PDF mit mehreren Prüfungsfragen (Multiple-Choice mit "
+        "Antwortoptionen A-E oder Wahr/Falsch-Aussagenlisten). Extrahiere ALLE Fragen "
+        "der Klausur wörtlich und vollständig.\n\n"
+        "Für jede Frage:\n"
+        "- \"num\": fortlaufende Nummer der Frage in der Klausur (1, 2, 3, ...)\n"
+        "- \"fragetext\": der vollständige Fragestamm, wörtlich abgeschrieben\n"
+        "- \"optionen\": Liste aller Antwortoptionen bzw. Aussagen, wörtlich abgeschrieben, "
+        "OHNE Buchstaben-Präfix (A/B/C...) und OHNE Checkbox-Symbole\n\n"
+        "Ignoriere Metadaten wie Punktzahl, erreichte Punkte, Bewertung, Status, "
+        "'Richtig'/'Falsch'-Auswertungsergebnisse aus dem Dokument – nur Fragetext und "
+        "Antwortoptionen werden benötigt.\n\n"
+        "Gib AUSSCHLIESSLICH ein valides JSON-Array zurück, keine Erklärung, keinen "
+        "Markdown-Codeblock:\n"
+        "[{\"num\": 1, \"fragetext\": \"...\", \"optionen\": [\"...\", \"...\"]}, ...]"
+    )
+    parts = [types.Part.from_bytes(data=pdf_bytes, mime_type='application/pdf'), prompt]
+    response = call_gemini_with_retry(
+        model_name='gemini-2.5-pro',
+        contents=parts,
+        config=types.GenerateContentConfig(temperature=0.0, response_mime_type='application/json'),
+    )
+    raw = (response.text or '').strip()
+    raw = re.sub(r'^```(?:json)?\s*', '', raw)
+    raw = re.sub(r'\s*```$', '', raw)
+    data = json.loads(raw)
+    questions = []
+    for item in data:
+        fragetext = (item.get('fragetext') or '').strip()
+        optionen = [str(o).strip() for o in (item.get('optionen') or []) if str(o).strip()]
+        if not fragetext or not optionen:
+            continue
+        questions.append({'aufgabe_num': item.get('num'), 'fragetext': fragetext, 'optionen': optionen})
+    return questions
+
+
+def collect_mm4_exam_files(folder: str) -> list:
+    """Findet Klausur-PDFs im Ordner (Dateiname beginnt mit 'N - ', N = führende
+    Nummer = chronologische Reihenfolge, siehe Anforderung). Gibt sortiert
+    [{'order': int, 'label': str, 'path': str}, ...] zurück, aufsteigend."""
+    exams = []
+    for p in Path(folder).glob('*.pdf'):
+        m = re.match(r'^(\d+)\s*-\s*(.+)$', p.stem)
+        if not m:
+            continue
+        exams.append({'order': int(m.group(1)), 'label': m.group(2).strip(), 'path': str(p)})
+    exams.sort(key=lambda e: e['order'])
+    return exams
+
+
+def dedupe_mm4_questions(exams: list, force: bool = False, cache_dir: Path = None) -> list:
+    """Extrahiert Fragen aus allen Klausuren und fasst inhaltlich identische Fragen
+    (normalisierter Fragetext + normalisierte Optionen) zu einem Eintrag mit
+    'occurrences' (Klausur-Labels, absteigend nach Aktualität) zusammen.
+    Gibt eindeutige Fragen zurück, jeweils mit stabiler 'uid' (1..N)."""
+    groups = {}  # norm_key -> merged question dict
+    for exam in exams:
+        cache_path = None
+        if cache_dir is not None:
+            cache_path = cache_dir / f"fragen_{exam['order']:02d}.json"
+        if cache_path is not None and cache_path.exists() and not force:
+            qs = json.loads(cache_path.read_text(encoding='utf-8'))
+        else:
+            qs = extract_mm4_questions(exam['path'])
+            if cache_path is not None:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(json.dumps(qs, ensure_ascii=False, indent=2), encoding='utf-8')
+        print(f"   [{exam['label']}] {len(qs)} Fragen extrahiert.")
+        for q in qs:
+            key = _normalize_quote(q['fragetext']) + '||' + '|'.join(_normalize_quote(o) for o in q['optionen'])
+            if key not in groups:
+                groups[key] = {
+                    'fragetext': q['fragetext'],
+                    'optionen': q['optionen'],
+                    'occurrences': [],
+                }
+            groups[key]['occurrences'].append((exam['order'], exam['label']))
+
+    unique = list(groups.values())
+    for u in unique:
+        u['occurrences'].sort(key=lambda oc: oc[0], reverse=True)
+        u['max_order'] = u['occurrences'][0][0]
+    unique.sort(key=lambda u: u['max_order'], reverse=True)
+    for idx, u in enumerate(unique, start=1):
+        u['uid'] = idx
+    return unique
+
+
+def build_full_knowledge_base(docx_path: str) -> str:
+    """Baut aus einer kompletten Lernunterlage (.docx) eine gegliederte Markdown-
+    Wissensbasis (Überschriften als '#'-Zeilen, Bilder ausgelassen). Verallgemeinerte
+    Variante von build_quiz_knowledge_base ohne Kapitel-Scoping (ganzes Dokument)."""
+    doc = Document(docx_path)
+    lines = []
+    for p in doc.paragraphs:
+        txt = p.text.strip()
+        if not txt:
+            continue
+        st = p.style.name if p.style else ""
+        m = re.match(r'Heading (\d)', st)
+        if m:
+            lvl = int(m.group(1))
+            lines.append('#' * min(lvl, 6) + ' ' + txt)
+        else:
+            lines.append(txt)
+    return '\n\n'.join(lines)
+
+
+def _chunk_markdown_by_headings(text: str, max_chars: int) -> list:
+    """Zerlegt einen Markdown-Wissenstext an Überschriften (Level 1, bei Bedarf
+    Level 2) in Chunks <= max_chars. Wiederverwendet die vorhandene Chunking-
+    Maschinerie (_split_at_level/_group_into_chunks) aus der Zusammenfassung."""
+    preamble, l1_sections = _split_at_level(text, 1)
+    leaf_sections = []
+    for sec in l1_sections:
+        if len(sec['text']) <= max_chars:
+            leaf_sections.append(sec)
+            continue
+        sub_pre, l2_sections = _split_at_level(sec['text'], 2)
+        if sub_pre.strip():
+            leaf_sections.append({'heading': sec['heading'], 'text': sub_pre})
+        if l2_sections:
+            for s2 in l2_sections:
+                leaf_sections.append({'heading': s2['heading'], 'text': s2['text']})
+        elif not sub_pre.strip():
+            leaf_sections.append(sec)  # nicht weiter splitbar, als Ganzes übernehmen
+
+    grouped = _group_into_chunks(preamble, leaf_sections, max_chars)
+    chunks = []
+    for g in grouped:
+        body = '\n\n'.join(s['text'] for s in g['sections'])
+        chunk_text = (g['preamble'] + '\n\n' + body).strip() if g['preamble'] else body
+        if chunk_text:
+            chunks.append(chunk_text)
+    return chunks
+
+
+def _mm4_option_letter(idx: int) -> str:
+    """A, B, C, ... Z, AA, AB, ... für Optionsindex idx (0-basiert)."""
+    letters = ''
+    idx += 1
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def _format_mm4_question_list(questions: list) -> str:
+    lines = []
+    for q in questions:
+        lines.append(f"Frage {q['uid']}: {q['fragetext']}")
+        for idx, opt in enumerate(q['optionen']):
+            lines.append(f"  {_mm4_option_letter(idx)}) {opt}")
+    return '\n'.join(lines)
+
+
+def check_mm4_relevance_for_chunk(chunk_text: str, chunk_idx: int, total_chunks: int,
+                                   questions: list, modul_label: str) -> str:
+    """Ein LLM-Call: prüft ALLE Fragen auf einmal gegen EINEN Wissenstext-Chunk.
+    Gibt nur Treffer zurück, die in DIESEM Chunk belegt sind (andere Chunks werden
+    separat geprüft; die Aggregation über alle Chunks erfolgt außerhalb)."""
+    prompt = (
+        f"Rolle:\nDu prüfst, ob Klausurfragen eines anderen Moduls inhaltlich im Modul "
+        f"{modul_label} vorkommen.\n\n"
+        "Aufgabe:\nUnten stehen (1) ein Ausschnitt aus der Wissensbasis des Moduls und "
+        "(2) eine Liste von Prüfungsfragen mit je mehreren Antwortoptionen/Aussagen "
+        "(A, B, C, ...). Prüfe für JEDE Frage, ob deren Fragestamm ODER MINDESTENS EINE der Antwortoptionen "
+        "inhaltlich in DIESEM Textausschnitt behandelt wird. Es genügt bereits eine "
+        "einzelne zutreffende Aussage/Option – nicht das ganze Thema muss abgedeckt sein.\n\n"
+        "Wichtig:\n"
+        "- Nutze AUSSCHLIESSLICH den unten stehenden Textausschnitt als Wissensbasis. "
+        "Nicht raten, nicht aus Allgemeinwissen ergänzen.\n"
+        "- Andere Teile der Wissensbasis werden in separaten Durchläufen geprüft – "
+        "gib NUR Treffer aus diesem Ausschnitt aus.\n"
+        "- Melde für jede zutreffende Frage jede zutreffende Option EINZELN.\n\n"
+        "Ausgabeformat (nur für Fragen mit mindestens einem Treffer in diesem Ausschnitt):\n"
+        "Frage <Nummer>\n"
+        "- <Stamm oder Option A/B/C/...>: Kapitel: <nächstgelegene Überschrift> | "
+        "Zitat: \"<wörtliches Zitat, 5-15 Wörter>\"\n\n"
+        "Gibt es in diesem Ausschnitt KEINEN einzigen Treffer über alle Fragen hinweg, "
+        "antworte NUR mit: KEINE_TREFFER\n\n"
+        f"--- WISSENSTEXT-AUSSCHNITT (Teil {chunk_idx}/{total_chunks} von Modul {modul_label}) ---\n"
+        f"{chunk_text}\n\n"
+        "--- PRÜFUNGSFRAGEN ---\n"
+        f"{_format_mm4_question_list(questions)}\n"
+    )
+    response = call_gemini_with_retry(
+        model_name='gemini-2.5-pro',
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.0),
+    )
+    return response.text
+
+
+def parse_mm4_relevance_response(text: str) -> dict:
+    """Parst die Ausgabe von check_mm4_relevance_for_chunk. Gibt {uid: [{'teil','kapitel','zitat'}, ...]} zurück."""
+    result = {}
+    if not text or 'KEINE_TREFFER' in text[:40]:
+        return result
+    blocks = re.split(r'(?m)^\*{0,2}Frage\s+(\d+)\*{0,2}\s*$', text)
+    i = 1
+    while i < len(blocks) - 1:
+        try:
+            uid = int(blocks[i].strip())
+        except ValueError:
+            i += 2
+            continue
+        block = blocks[i + 1]
+        i += 2
+        hits = []
+        for lm in re.finditer(
+            r'(?m)^-\s*(Stamm|Option\s*[A-Z]+)\s*:\s*Kapitel:\s*(.+?)\s*\|\s*Zitat:\s*"(.+?)"\s*$',
+            block,
+        ):
+            hits.append({'teil': lm.group(1).strip(), 'kapitel': lm.group(2).strip(), 'zitat': lm.group(3).strip()})
+        if hits:
+            result.setdefault(uid, []).extend(hits)
+    return result
+
+
+def check_mm4_relevance_module(unique_questions: list, docx_path: str, modul_label: str,
+                                cache_dir: Path, force: bool = False,
+                                max_chunk_chars: int = 200_000) -> dict:
+    """Prüft alle eindeutigen Fragen gegen EIN Referenzmodul (chunk-weise, siehe
+    Moduldoku oben). Gibt {uid: [{'teil','kapitel','zitat'}, ...]} für dieses Modul zurück."""
+    kb_cache = cache_dir / f"kb_{modul_label}.md"
+    kb_text = load_or_run(kb_cache, lambda: build_full_knowledge_base(docx_path),
+                           f"Wissensbasis {modul_label}")
+    chunks = _chunk_markdown_by_headings(kb_text, max_chunk_chars)
+    print(f"   Modul {modul_label}: Wissensbasis in {len(chunks)} Chunk(s) zerlegt "
+          f"({len(kb_text)} Zeichen gesamt).")
+
+    aggregated = {}
+    for idx, chunk in enumerate(chunks, start=1):
+        chunk_cache = cache_dir / f"treffer_{modul_label}_{idx:02d}.md"
+        raw = load_or_run(
+            chunk_cache,
+            lambda c=chunk, i=idx: check_mm4_relevance_for_chunk(c, i, len(chunks), unique_questions, modul_label),
+            f"Relevanzprüfung {modul_label} Chunk {idx}/{len(chunks)}",
+        )
+        parsed = parse_mm4_relevance_response(raw)
+        for uid, hits in parsed.items():
+            aggregated.setdefault(uid, []).extend(hits)
+    return aggregated
+
+
+def build_mm4_report_docx(unique_questions: list, treffer_by_modul: dict, output_path: str):
+    """Erstellt die Ergebnis-.docx: alle relevanten Fragen, chronologisch absteigend
+    (neueste Klausur zuerst), mit Fragetext, Antwortoptionen, Vorkommen und den pro
+    Modul gefundenen Fundstellen."""
+    relevant = [q for q in unique_questions
+                if treffer_by_modul.get('36633', {}).get(q['uid'])
+                or treffer_by_modul.get('36634', {}).get(q['uid'])]
+    relevant.sort(key=lambda q: q['max_order'], reverse=True)
+
+    doc = Document()
+    style = doc.styles['Normal']
+    style.font.name = 'Arial'
+    style.font.size = Pt(11)
+
+    doc.add_heading('MM4 – Relevanzprüfung gegen Module 36633 / 36634', level=1)
+    doc.add_paragraph(
+        f"{len(relevant)} von {len(unique_questions)} eindeutigen Fragen sind relevant "
+        f"für mindestens eines der beiden Module. Sortierung: chronologisch absteigend "
+        f"(neueste Klausur zuerst)."
+    )
+
+    for q in relevant:
+        occ = ', '.join(label for _, label in q['occurrences'])
+        h = doc.add_heading(f"Frage (zuletzt: {q['occurrences'][0][1]})", level=2)
+        _set_heading_color(h, MM_HEADING_COLORS[2])
+
+        p = doc.add_paragraph()
+        p.add_run(q['fragetext']).bold = True
+
+        for idx, opt in enumerate(q['optionen']):
+            doc.add_paragraph(f"{_mm4_option_letter(idx)}) {opt}", style='List Bullet')
+
+        doc.add_paragraph(f"Vorkommen in Klausuren: {occ}")
+
+        for modul in ('36633', '36634'):
+            hits = treffer_by_modul.get(modul, {}).get(q['uid'])
+            if not hits:
+                continue
+            doc.add_paragraph(f"Relevant für Modul {modul}:").runs[0].bold = True
+            for hit in hits:
+                doc.add_paragraph(
+                    f"  {hit['teil']} – Kapitel: {hit['kapitel']} – Zitat: „{hit['zitat']}“",
+                    style='List Bullet 2',
+                )
+        doc.add_paragraph('')  # Abstand zur nächsten Frage
+
+    doc.save(output_path)
+    print(f"Fertig: {output_path}  ({len(relevant)} relevante Fragen von {len(unique_questions)})")
+    return output_path
+
+
+def run_mm4_check(folder: str, ref_36633: str = None, ref_36634: str = None,
+                   output_path: str = None, force: bool = False) -> str:
+    """End-to-End: liest alle Klausur-PDFs im Ordner, dedupliziert die Fragen, prüft
+    sie gegen beide Referenzmodule und schreibt das Ergebnis-.docx."""
+    folder_path = Path(folder)
+    if not folder_path.is_dir():
+        raise FileNotFoundError(f"Ordner nicht gefunden: {folder}")
+
+    if ref_36633 is None:
+        cands = list(folder_path.glob('*36633*.docx'))
+        if not cands:
+            raise FileNotFoundError("Keine Referenz-.docx für 36633 im Ordner gefunden "
+                                     "(erwarte Dateinamen mit '36633'). --mm4-ref-36633 angeben.")
+        ref_36633 = str(cands[0])
+    if ref_36634 is None:
+        cands = list(folder_path.glob('*36634*.docx'))
+        if not cands:
+            raise FileNotFoundError("Keine Referenz-.docx für 36634 im Ordner gefunden "
+                                     "(erwarte Dateinamen mit '36634'). --mm4-ref-36634 angeben.")
+        ref_36634 = str(cands[0])
+    if output_path is None:
+        output_path = str(folder_path / "MM4_Relevanzpruefung_36633_36634.docx")
+
+    cache_dir = folder_path / ".mm4check"
+    if force and cache_dir.exists():
+        import shutil
+        shutil.rmtree(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    exams = collect_mm4_exam_files(folder)
+    if not exams:
+        raise FileNotFoundError(f"Keine Klausur-PDFs (Muster 'N - Label.pdf') in {folder} gefunden.")
+    print(f"--- MM4-Relevanzprüfung: {len(exams)} Klausuren, Referenzen 36633='{Path(ref_36633).name}', "
+          f"36634='{Path(ref_36634).name}' ---")
+
+    unique_questions = dedupe_mm4_questions(exams, force=force, cache_dir=cache_dir)
+    print(f"   {len(unique_questions)} eindeutige Fragen nach Deduplizierung.")
+
+    treffer_by_modul = {
+        '36633': check_mm4_relevance_module(unique_questions, ref_36633, '36633', cache_dir, force=force),
+        '36634': check_mm4_relevance_module(unique_questions, ref_36634, '36634', cache_dir, force=force),
+    }
+
+    return build_mm4_report_docx(unique_questions, treffer_by_modul, output_path)
+
+
 def run_quiz_check(docx_path: str, quiz_chapter_headings,
                    output_path: str = None, force: bool = False) -> str:
     """End-to-End: prüft EIN ODER MEHRERE Leitfragen-Quizzes derselben Lernunterlage,
@@ -4487,6 +4858,7 @@ if __name__ == "__main__":
             "  python pipeline.py dok.pdf --force   # alle Zwischenergebnisse neu berechnen\n"
             "  python pipeline.py --quiz-docx unterlage.docx --quiz-chapter \"Quiz Kapitel 1 …\" \\\n"
             "                     --quiz-chapter \"Quiz Kapitel 2 …\"   # mehrere Quizzes, eine Ausgabe\n"
+            "  python pipeline.py --mm4-check MM4/   # Klausuren im Ordner gegen 36633/36634 prüfen\n"
         ),
     )
     parser.add_argument("pdf_path", type=str, nargs="?", default=None, help="Pfad zur Quell-PDF-Datei")
@@ -4502,6 +4874,23 @@ if __name__ == "__main__":
                              "Datei in EINEM Lauf/EINER Ausgabedatei zu prüfen. Der Abgleich ist "
                              "nummern-tolerant – der stabile Textteil ohne Kapitelnummer genügt, "
                              "z.B. --quiz-chapter \"Leitfragen-Quiz zum Kurs Personalauswahl\".")
+    parser.add_argument("--mm4-check", type=str, default=None, metavar="ORDNER",
+                        help="Getrennter Modus: prüft Klausur-PDFs eines Fremdmoduls (Dateimuster "
+                             "'N - Label.pdf', N = chronologische Reihenfolge) im angegebenen Ordner "
+                             "gegen die Referenz-.docx der Module 36633/36634 (per Default per "
+                             "Dateinamensmuster '*36633*.docx'/'*36634*.docx' im selben Ordner "
+                             "gefunden, sonst --mm4-ref-36633/--mm4-ref-36634 angeben). Dedupliziert "
+                             "identische Fragen über alle Klausuren hinweg und schreibt eine "
+                             "Ergebnis-.docx mit allen relevanten Fragen (chronologisch absteigend).")
+    parser.add_argument("--mm4-ref-36633", type=str, default=None,
+                        help="Nur mit --mm4-check: Pfad zur Referenz-.docx für Modul 36633 "
+                             "(überschreibt die automatische Dateinamenserkennung).")
+    parser.add_argument("--mm4-ref-36634", type=str, default=None,
+                        help="Nur mit --mm4-check: Pfad zur Referenz-.docx für Modul 36634 "
+                             "(überschreibt die automatische Dateinamenserkennung).")
+    parser.add_argument("--mm4-output", type=str, default=None,
+                        help="Nur mit --mm4-check: Pfad der Ergebnis-.docx "
+                             "(Standard: '<ORDNER>/MM4_Relevanzpruefung_36633_36634.docx').")
     parser.add_argument("--force", action="store_true", help="Alle Schritte neu berechnen (kein Resume)")
     parser.add_argument("--parent-chapter", type=str, default=None,
                         help="Elternkapitel im Zieldokument, z.B. '4.2.1.2'. "
@@ -4556,6 +4945,12 @@ if __name__ == "__main__":
     try:
         if not os.getenv("GEMINI_API_KEY"):
             raise ValueError("GEMINI_API_KEY fehlt in der .env-Datei!")
+
+        # --- Getrennter Modus: MM4-Klausurfragen gegen 36633/36634 prüfen ---
+        if args.mm4_check:
+            run_mm4_check(args.mm4_check, ref_36633=args.mm4_ref_36633, ref_36634=args.mm4_ref_36634,
+                          output_path=args.mm4_output, force=args.force)
+            sys.exit(0)
 
         # --- Getrennter Modus: Leitfragen-Quiz-Prüfung einer bestehenden .docx ---
         if args.quiz_docx:
