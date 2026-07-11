@@ -4227,6 +4227,87 @@ def _apply_quiz_markers(doc, analyses) -> int:
     return len(order)
 
 
+def _apply_mm4_comment_markers(doc, unique_questions: list, treffer: dict, modul_label: str) -> int:
+    """Setzt Kommentar-Marker an den Fundstellen der MM4-Relevanzprüfung, direkt in der
+    Referenz-Lernunterlage. Kommt eine Stelle bereits in einem Kommentar vor (eigener MM4-
+    Kommentar aus einem früheren Lauf ODER ein fremder/manueller Kommentar), wird dieser um die
+    neue Zeile ERWEITERT statt einen zusätzlichen Kommentar danebenzusetzen. Mehrere Treffer auf
+    demselben Absatz landen in EINEM neuen Kommentar, falls dort noch keiner existiert."""
+    paras = doc.paragraphs
+    entries = [(i, p, _normalize_quote(p.text)) for i, p in enumerate(paras)]
+
+    def _find_target(quote):
+        nq = _normalize_quote(quote)
+        if len(nq) < 8:
+            return None
+        needle = nq[:60]
+        for _i, p, nt in entries:
+            if nt and needle in nt:
+                return p
+        return None
+
+    groups = {}   # id(p._p) -> {'para': p, 'lines': [str, ...]}
+    order = []
+
+    def _add(target, line):
+        k = id(target._p)
+        if k not in groups:
+            groups[k] = {'para': target, 'lines': []}
+            order.append(k)
+        if line not in groups[k]['lines']:
+            groups[k]['lines'].append(line)
+
+    unresolved = 0
+    for q in unique_questions:
+        hits = treffer.get(q['uid'])
+        if not hits:
+            continue
+        occ = ', '.join(
+            f"{label} Nr. {num}" if num is not None else label
+            for _, label, num in q['occurrences']
+        )
+        for hit in hits:
+            target = _find_target(hit.get('zitat', ''))
+            if target is None:
+                unresolved += 1
+                continue
+            verdict = _mm4_verdict_label(hit.get('richtig'))
+            line = f"MM4 {modul_label}: „{q['titel']}“ – {occ} ({hit['teil']}: {verdict})"
+            _add(target, line)
+
+    extended = created = 0
+    for k in order:
+        para = groups[k]['para']
+        lines = groups[k]['lines']
+        existing_id = _existing_comment_id(para)
+        if existing_id is not None:
+            comment = doc.comments.get(existing_id)
+            if comment is not None:
+                already = comment.text
+                new_lines = [ln for ln in lines if ln not in already]
+                for ln in new_lines:
+                    comment.add_paragraph(ln)
+                if new_lines:
+                    extended += 1
+                continue
+        runs = para.runs or [para.add_run("")]
+        doc.add_comment(runs, text="\n".join(lines), author="MM4", initials="M4")
+        created += 1
+
+    print(f"   MM4-Marker {modul_label}: {created} neue Kommentare, {extended} bestehende "
+          f"Kommentare erweitert, {unresolved} Treffer ohne auffindbare Fundstelle.")
+    return created + extended
+
+
+def _mark_mm4_hits_in_reference(unique_questions: list, treffer: dict, ref_docx_path: str, modul_label: str) -> int:
+    """Öffnet die Referenz-Lernunterlage frisch, setzt MM4-Fundstellen-Kommentare und speichert
+    direkt in dieselbe Datei zurück (kein separates Ausgabedokument)."""
+    doc = Document(ref_docx_path)
+    count = _apply_mm4_comment_markers(doc, unique_questions, treffer, modul_label)
+    doc.save(ref_docx_path)
+    return count
+
+
 def _retry_single_question(full_kb: str, num: int, question_text: str) -> str:
     """Beantwortet GENAU EINE Quizfrage gegen eine (große) Wissensbasis – strikt, damit das
     Modell nicht die dokumenteigenen Folien-/Übungsfragen aufzählt. Gibt Roh-QA-Text zurück."""
@@ -4725,15 +4806,25 @@ def check_mm4_relevance_for_chunk(chunk_text: str, chunk_idx: int, total_chunks:
         "Nicht raten, nicht aus Allgemeinwissen ergänzen.\n"
         "- Andere Teile der Wissensbasis werden in separaten Durchläufen geprüft – "
         "gib NUR Treffer aus diesem Ausschnitt aus.\n"
-        "- Melde für jede zutreffende Frage jede zutreffende Option EINZELN.\n\n"
+        "- Prüfe METHODISCH: gehe bei jeder Frage alle Optionen (Stamm, A, B, C, ...) einzeln "
+        "und vollständig durch. Höre NICHT auf, sobald eine Option einen Treffer hatte – bei "
+        "Fragen mit mehreren richtigen Antworten ist es die Regel, nicht die Ausnahme, dass "
+        "mehrere Optionen im selben Ausschnitt belegt sind.\n"
+        "- Melde JEDE zutreffende Option einzeln als eigene Zeile, auch wenn eine andere Option "
+        "derselben Frage bereits einen Treffer hatte.\n"
+        "- Gib für jede gemeldete Option zusätzlich an, ob der Textausschnitt die Aussage "
+        "BESTÄTIGT (RICHTIG), WIDERLEGT (FALSCH) oder das Thema zwar berührt, aber keine "
+        "eindeutige Wahr/Falsch-Entscheidung zulässt (UNKLAR). Auch dieses Urteil AUSSCHLIESSLICH "
+        "aus dem Textausschnitt ableiten, nicht raten.\n\n"
         "Ausgabeformat (nur für Fragen mit mindestens einem Treffer in diesem Ausschnitt):\n"
         "Frage <Nummer>\n"
-        "- <Stamm oder Option A/B/C/...>: Fundstelle: <vollständiger Überschriften-Pfad von der "
-        "obersten bis zur nächstgelegenen Überschrift, getrennt mit \" > \", z.B. \"Kurs 1: Stress "
-        "und Stressbewältigung > 1.1. Stresstheorien > 1.1.2 Situationsbezogene Stresskonzeption\" "
-        "bzw. \"KE 1: Personalauswahl > 3 Qualitätssicherung in der Eignungsdiagnostik > 3.1.1 "
-        "Qualitätssicherung und -optimierung\"> | Zitat: \"<wörtliches Zitat der relevanten Textstelle "
-        "– vollständiger Satz bzw. vollständige Aussage, nicht künstlich gekürzt>\"\n\n"
+        "- <Stamm oder Option A/B/C/...>: <RICHTIG|FALSCH|UNKLAR> | Fundstelle: <vollständiger "
+        "Überschriften-Pfad von der obersten bis zur nächstgelegenen Überschrift, getrennt mit "
+        "\" > \", z.B. \"Kurs 1: Stress und Stressbewältigung > 1.1. Stresstheorien > 1.1.2 "
+        "Situationsbezogene Stresskonzeption\" bzw. \"KE 1: Personalauswahl > 3 Qualitätssicherung "
+        "in der Eignungsdiagnostik > 3.1.1 Qualitätssicherung und -optimierung\"> | Zitat: "
+        "\"<wörtliches Zitat der relevanten Textstelle – vollständiger Satz bzw. vollständige "
+        "Aussage, nicht künstlich gekürzt>\"\n\n"
         "Gibt es in diesem Ausschnitt KEINEN einzigen Treffer über alle Fragen hinweg, "
         "antworte NUR mit: KEINE_TREFFER\n\n"
         f"--- WISSENSTEXT-AUSSCHNITT (Teil {chunk_idx}/{total_chunks} von Modul {modul_label}) ---\n"
@@ -4751,8 +4842,9 @@ def check_mm4_relevance_for_chunk(chunk_text: str, chunk_idx: int, total_chunks:
 
 def parse_mm4_relevance_response(text: str) -> dict:
     """Parst die Ausgabe von check_mm4_relevance_for_chunk. Gibt
-    {uid: [{'teil','fundstelle','zitat'}, ...]} zurück. 'fundstelle' ist der
-    vollständige Überschriften-Pfad (Kurseinheit > Kapitel > Unterkapitel)."""
+    {uid: [{'teil','richtig','fundstelle','zitat'}, ...]} zurück. 'fundstelle' ist der
+    vollständige Überschriften-Pfad (Kurseinheit > Kapitel > Unterkapitel). 'richtig' ist
+    True/False/None (None = UNKLAR laut Referenztext)."""
     result = {}
     if not text or 'KEINE_TREFFER' in text[:40]:
         return result
@@ -4768,10 +4860,18 @@ def parse_mm4_relevance_response(text: str) -> dict:
         i += 2
         hits = []
         for lm in re.finditer(
-            r'(?m)^-\s*(Stamm|Option\s*[A-Z]+)\s*:\s*Fundstelle:\s*(.+?)\s*\|\s*Zitat:\s*"(.+?)"\s*$',
+            r'(?m)^-\s*(Stamm|Option\s*[A-Z]+)\s*:\s*(RICHTIG|FALSCH|UNKLAR)\s*\|\s*'
+            r'Fundstelle:\s*(.+?)\s*\|\s*Zitat:\s*"(.+?)"\s*$',
             block,
         ):
-            hits.append({'teil': lm.group(1).strip(), 'fundstelle': lm.group(2).strip(), 'zitat': lm.group(3).strip()})
+            verdict_raw = lm.group(2).strip().upper()
+            richtig = True if verdict_raw == 'RICHTIG' else (False if verdict_raw == 'FALSCH' else None)
+            hits.append({
+                'teil': lm.group(1).strip(),
+                'richtig': richtig,
+                'fundstelle': lm.group(3).strip(),
+                'zitat': lm.group(4).strip(),
+            })
         if hits:
             result.setdefault(uid, []).extend(hits)
     return result
@@ -4801,6 +4901,24 @@ def check_mm4_relevance_module(unique_questions: list, docx_path: str, modul_lab
         for uid, hits in parsed.items():
             aggregated.setdefault(uid, []).extend(hits)
     return aggregated
+
+
+def _mm4_verdict_symbol(richtig) -> str:
+    """Kurzes, sichtbares Symbol für den Wahrheitsgehalt eines Treffers im Report."""
+    if richtig is True:
+        return "✓ Richtig"
+    if richtig is False:
+        return "✗ Falsch"
+    return "(Wahrheitsgehalt unklar)"
+
+
+def _mm4_verdict_label(richtig) -> str:
+    """Kurzes Label für den Wahrheitsgehalt eines Treffers im Word-Kommentar."""
+    if richtig is True:
+        return "richtig"
+    if richtig is False:
+        return "falsch"
+    return "Wahrheitsgehalt unklar"
 
 
 def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict, modul_label: str, output_path: str):
@@ -4842,8 +4960,9 @@ def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict, modul
         hits = treffer_for_modul.get(q['uid'])
         doc.add_paragraph(f"Relevant für Modul {modul_label}:").runs[0].bold = True
         for hit in hits:
+            verdict = _mm4_verdict_symbol(hit.get('richtig'))
             doc.add_paragraph(
-                f"  {hit['teil']} – Fundstelle: {hit['fundstelle']} – Zitat: „{hit['zitat']}“",
+                f"  {hit['teil']} – {verdict} – Fundstelle: {hit['fundstelle']} – Zitat: „{hit['zitat']}“",
                 style='List Bullet 2',
             )
         doc.add_paragraph('')  # Abstand zur nächsten Frage
@@ -4902,6 +5021,10 @@ def run_mm4_check(folder: str, ref_36633: str = None, ref_36634: str = None,
 
     path_36633 = build_mm4_report_docx(unique_questions, treffer_36633, '36633', output_36633)
     path_36634 = build_mm4_report_docx(unique_questions, treffer_36634, '36634', output_36634)
+
+    _mark_mm4_hits_in_reference(unique_questions, treffer_36633, ref_36633, '36633')
+    _mark_mm4_hits_in_reference(unique_questions, treffer_36634, ref_36634, '36634')
+
     return path_36633, path_36634
 
 
