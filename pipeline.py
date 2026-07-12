@@ -4227,89 +4227,6 @@ def _apply_quiz_markers(doc, analyses) -> int:
     return len(order)
 
 
-def _apply_mm4_comment_markers(doc, unique_questions: list, aussagen: dict, modul_label: str) -> int:
-    """Setzt Kommentar-Marker an den Fundstellen der MM4-Aussagen-Prüfung (Stufe B), direkt in
-    der Referenz-Lernunterlage. Kommt eine Stelle bereits in einem Kommentar vor (eigener MM4-
-    Kommentar aus einem früheren Lauf ODER ein fremder/manueller Kommentar), wird dieser um die
-    neue Zeile ERWEITERT statt einen zusätzlichen Kommentar danebenzusetzen. Mehrere Treffer auf
-    demselben Absatz landen in EINEM neuen Kommentar, falls dort noch keiner existiert."""
-    paras = doc.paragraphs
-    entries = [(i, p, _normalize_quote(p.text)) for i, p in enumerate(paras)]
-
-    def _find_target(quote):
-        nq = _normalize_quote(quote)
-        if len(nq) < 8:
-            return None
-        needle = nq[:60]
-        for _i, p, nt in entries:
-            if nt and needle in nt:
-                return p
-        return None
-
-    groups = {}   # id(p._p) -> {'para': p, 'lines': [str, ...]}
-    order = []
-
-    def _add(target, line):
-        k = id(target._p)
-        if k not in groups:
-            groups[k] = {'para': target, 'lines': []}
-            order.append(k)
-        if line not in groups[k]['lines']:
-            groups[k]['lines'].append(line)
-
-    unresolved = 0
-    for q in unique_questions:
-        hits = aussagen.get(q['uid'])
-        if not hits:
-            continue
-        occ = ', '.join(
-            f"{label} Nr. {num}" if num is not None else label
-            for _, label, num in q['occurrences']
-        )
-        for hit in hits:
-            target = _find_target(hit.get('zitat', ''))
-            if target is None:
-                unresolved += 1
-                continue
-            urteil = _mm4_verdict_label(hit.get('urteil'))
-            begruendung = hit.get('begruendung', '').strip()
-            line = (f"MM4 {modul_label}: „{q['titel']}“ – {occ} – {hit['teil']}: {urteil}"
-                    f" – Begründung: {begruendung}")
-            _add(target, line)
-
-    extended = created = 0
-    for k in order:
-        para = groups[k]['para']
-        lines = groups[k]['lines']
-        existing_id = _existing_comment_id(para)
-        if existing_id is not None:
-            comment = doc.comments.get(existing_id)
-            if comment is not None:
-                already = comment.text
-                new_lines = [ln for ln in lines if ln not in already]
-                for ln in new_lines:
-                    comment.add_paragraph(ln)
-                if new_lines:
-                    extended += 1
-                continue
-        runs = para.runs or [para.add_run("")]
-        doc.add_comment(runs, text="\n".join(lines), author="MM4", initials="M4")
-        created += 1
-
-    print(f"   MM4-Marker {modul_label}: {created} neue Kommentare, {extended} bestehende "
-          f"Kommentare erweitert, {unresolved} Treffer ohne auffindbare Fundstelle.")
-    return created + extended
-
-
-def _mark_mm4_hits_in_reference(unique_questions: list, aussagen: dict, ref_docx_path: str, modul_label: str) -> int:
-    """Öffnet die Referenz-Lernunterlage frisch, setzt MM4-Aussagen-Kommentare und speichert
-    direkt in dieselbe Datei zurück (kein separates Ausgabedokument)."""
-    doc = Document(ref_docx_path)
-    count = _apply_mm4_comment_markers(doc, unique_questions, aussagen, modul_label)
-    doc.save(ref_docx_path)
-    return count
-
-
 def _retry_single_question(full_kb: str, num: int, question_text: str) -> str:
     """Beantwortet GENAU EINE Quizfrage gegen eine (große) Wissensbasis – strikt, damit das
     Modell nicht die dokumenteigenen Folien-/Übungsfragen aufzählt. Gibt Roh-QA-Text zurück."""
@@ -4771,12 +4688,6 @@ def _chunk_markdown_by_headings(text: str, max_chars: int) -> list:
     return chunks
 
 
-# Bei jeder Änderung am Ausgabeformat der Stufe-A/B-Prompts (check_mm4_relevance_for_chunk,
-# verify_statement_truth) oder deren Parsern hochzählen, damit veraltete treffer_*/aussagen_*
-# Caches automatisch verworfen und neu berechnet werden – kb_*.md/gruppierung.json bleiben
-# davon unberührt (deren Format ändert sich dadurch nicht), sodass kein --force nötig ist.
-MM4_CACHE_VERSION = "2"
-
 
 def _mm4_option_letter(idx: int) -> str:
     """A, B, C, ... Z, AA, AB, ... für Optionsindex idx (0-basiert)."""
@@ -4827,69 +4738,6 @@ def _mm4_teil_text(teil: str, q: dict) -> str:
         if 0 <= idx < len(q['optionen']):
             return q['optionen'][idx]
     return teil
-
-
-def _kb_paragraphs(kb_text: str) -> list:
-    """Zerlegt eine von build_full_knowledge_base erzeugte Markdown-Wissensbasis
-    wieder in ihre einzelnen Absätze (inkl. '#'-Überschriften), passend zu deren
-    Konstruktion über '\\n\\n'.join(lines)."""
-    return kb_text.split('\n\n')
-
-
-def _context_around_quote(paragraphs: list, zitat: str, radius: int = 2) -> str:
-    """Findet den Absatz, der 'zitat' enthält, und liefert ihn plus radius
-    Nachbarabsätze davor/danach als fokussierten Kontext-Ausschnitt für die
-    Aussagen-Wahrheitsprüfung (Stufe B)."""
-    nq = _normalize_quote(zitat)
-    if len(nq) < 8:
-        return ''
-    needle = nq[:60]
-    normalized = [_normalize_quote(p) for p in paragraphs]
-    for i, np_ in enumerate(normalized):
-        if np_ and needle in np_:
-            lo = max(0, i - radius)
-            hi = min(len(paragraphs), i + radius + 1)
-            return '\n\n'.join(paragraphs[lo:hi])
-    return ''
-
-
-def _section_context_for_quote(paragraphs: list, zitat: str) -> str:
-    """Wie _context_around_quote, liefert aber den GANZEN umschließenden Abschnitt
-    (von der nächsten vorangehenden Überschrift bis zur nächsten Überschrift
-    gleicher oder höherer Ebene) statt nur weniger Nachbarabsätze – für den
-    UNKLAR-Retry mit erweitertem Kontext."""
-    nq = _normalize_quote(zitat)
-    if len(nq) < 8:
-        return ''
-    needle = nq[:60]
-    normalized = [_normalize_quote(p) for p in paragraphs]
-    target = None
-    for i, np_ in enumerate(normalized):
-        if np_ and needle in np_:
-            target = i
-            break
-    if target is None:
-        return ''
-
-    def _heading_level(p: str):
-        m = re.match(r'(#{1,6})\s', p)
-        return len(m.group(1)) if m else None
-
-    start = target
-    start_level = None
-    while start > 0:
-        lvl = _heading_level(paragraphs[start])
-        if lvl is not None:
-            start_level = lvl
-            break
-        start -= 1
-    end = target + 1
-    while end < len(paragraphs):
-        lvl = _heading_level(paragraphs[end])
-        if lvl is not None and (start_level is None or lvl <= start_level):
-            break
-        end += 1
-    return '\n\n'.join(paragraphs[start:end])
 
 
 def check_mm4_relevance_for_chunk(chunk_text: str, chunk_idx: int, total_chunks: int,
@@ -4976,155 +4824,12 @@ def parse_mm4_relevance_response(text: str) -> dict:
     return result
 
 
-def verify_statement_truth(fragetext: str, context_by_teil: dict, modul_label: str) -> str:
-    """Ein LLM-Call: prüft für EINE Frage alle Aussagen (Stamm/Optionen), für die ein
-    Fundstellen-Kandidat vorliegt, einzeln auf Wahrheitsgehalt gegen ihren jeweils
-    fokussierten Referenztext-Ausschnitt. Wiederverwendbare Kernfunktion – unabhängig
-    von MM4-spezifischen Datenstrukturen (uid/occurrences bleiben beim Aufrufer), daher
-    auch für eine spätere Prüfung echter Klausuraufgaben nutzbar.
-
-    context_by_teil: {teil_label: {'text': Aussagetext, 'context': Referenztext-Ausschnitt,
-    'fundstelle': Überschriften-Pfad aus der Voranalyse}}."""
-    parts = []
-    for teil, info in context_by_teil.items():
-        parts.append(
-            f"{teil}: \"{info['text']}\"\n"
-            f"Fundstelle (aus Voranalyse): {info['fundstelle']}\n"
-            f"Referenztext-Ausschnitt:\n{info['context']}\n"
-        )
-    prompt = (
-        "Rolle:\nDu prüfst, ob einzelne Aussagen einer Klausurfrage durch die jeweils "
-        "angegebenen Referenztext-Ausschnitte gestützt werden.\n\n"
-        "Aufgabe:\nFür JEDE unten aufgeführte Aussage (Stamm/Option) ist ein eigener "
-        "Referenztext-Ausschnitt angegeben. Beurteile JEDE Aussage EINZELN und "
-        "AUSSCHLIESSLICH anhand IHRES zugehörigen Ausschnitts, ob sie richtig oder falsch "
-        "ist. Erlaubt der Ausschnitt keine eindeutige Entscheidung, wähle UNKLAR. Nicht "
-        "raten, nicht aus Allgemeinwissen ergänzen.\n\n"
-        "Ausgabeformat (eine Zeile pro Aussage, für JEDE unten aufgeführte Aussage genau "
-        "eine Zeile):\n"
-        "- <Stamm oder Option A/B/C/...>: <RICHTIG|FALSCH|UNKLAR> | Begründung: <1-2 Sätze, "
-        "mit Bezug auf den Ausschnitt> | Fundstelle: <Überschriften-Pfad> | Zitat: "
-        "\"<wörtliches Zitat aus dem Ausschnitt, das die Beurteilung stützt>\"\n\n"
-        f"Frage: {fragetext}\n\n"
-        f"--- ZU PRÜFENDE AUSSAGEN (Modul {modul_label}) ---\n"
-        + '\n'.join(parts)
-    )
-    response = call_gemini_with_retry(
-        model_name='gemini-2.5-pro',
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.0),
-    )
-    return response.text
-
-
-def parse_statement_verdict_response(text: str) -> dict:
-    """Parst die Ausgabe von verify_statement_truth. Gibt
-    {teil: {'teil','urteil','begruendung','fundstelle','zitat'}} zurück. 'urteil' ist
-    True/False/None (None = UNKLAR)."""
-    result = {}
-    if not text:
-        return result
-    for lm in re.finditer(
-        r'(?m)^-?\s*(Stamm|(?:Option\s*)?[A-Z]{1,3})\s*:\s*(RICHTIG|FALSCH|UNKLAR)\s*\|\s*'
-        r'Begründung:\s*(.+?)\s*\|\s*Fundstelle:\s*(.+?)\s*\|\s*Zitat:\s*"(.+?)"\s*$',
-        text,
-    ):
-        teil = _mm4_normalize_teil_label(lm.group(1))
-        verdict_raw = lm.group(2).strip().upper()
-        urteil = True if verdict_raw == 'RICHTIG' else (False if verdict_raw == 'FALSCH' else None)
-        result[teil] = {
-            'teil': teil,
-            'urteil': urteil,
-            'begruendung': lm.group(3).strip(),
-            'fundstelle': lm.group(4).strip(),
-            'zitat': lm.group(5).strip(),
-        }
-    return result
-
-
-def _verify_one_mm4_question(q: dict, hits: list, paragraphs: list, modul_label: str,
-                              wide_context: bool = False) -> str:
-    """Baut den Kontext je betroffener Aussage einer Frage und ruft verify_statement_truth
-    einmal für die gesamte Frage auf. wide_context=True nutzt den ganzen umschließenden
-    Abschnitt statt nur der Zitat-Nachbarschaft (UNKLAR-Retry)."""
-    context_by_teil = {}
-    for h in hits:
-        if wide_context:
-            ctx = _section_context_for_quote(paragraphs, h['zitat'])
-        else:
-            ctx = _context_around_quote(paragraphs, h['zitat'], radius=2)
-        context_by_teil[h['teil']] = {
-            'text': _mm4_teil_text(h['teil'], q),
-            'context': ctx or h['zitat'],
-            'fundstelle': h['fundstelle'],
-        }
-    return verify_statement_truth(q['fragetext'], context_by_teil, modul_label)
-
-
-def verify_mm4_statements(unique_questions: list, treffer: dict, kb_text: str, modul_label: str,
-                           cache_dir: Path, force: bool = False) -> dict:
-    """Stufe B: prüft für jede Frage mit Stufe-A-Kandidaten (treffer) gebündelt alle
-    betroffenen Aussagen auf Wahrheitsgehalt (RICHTIG/FALSCH/UNKLAR) mit Begründung –
-    EIN fokussierter LLM-Call pro Frage statt einem riesigen Call über alle Fragen/Chunks
-    gleichzeitig. Fehlende Urteile werden einmal nachgefragt, UNKLAR-Urteile einmal mit
-    erweitertem Kontext erneut geprüft. Gibt {uid: [{'teil','urteil','begruendung',
-    'fundstelle','zitat'}, ...]} zurück."""
-    paragraphs = _kb_paragraphs(kb_text)
-    q_by_uid = {q['uid']: q for q in unique_questions}
-    result = {}
-    items = [(uid, hits) for uid, hits in treffer.items() if hits and uid in q_by_uid]
-    total = len(items)
-    for i, (uid, hits) in enumerate(items, start=1):
-        q = q_by_uid[uid]
-        cache_path = cache_dir / f"aussagen_{modul_label}_v{MM4_CACHE_VERSION}_{uid:03d}.md"
-        raw = load_or_run(
-            cache_path,
-            lambda q=q, hits=hits: _verify_one_mm4_question(q, hits, paragraphs, modul_label),
-            f"Aussagenprüfung {modul_label} Frage {uid} ({i}/{total})",
-        )
-        parsed = parse_statement_verdict_response(raw)
-
-        missing_hits = [h for h in hits if h['teil'] not in parsed]
-        if missing_hits:
-            print(f"      Frage {uid}: {len(missing_hits)} Urteil(e) fehlten "
-                  f"({', '.join(h['teil'] for h in missing_hits)}) – frage erneut nach.")
-            retry_raw = _verify_one_mm4_question(q, missing_hits, paragraphs, modul_label)
-            parsed.update(parse_statement_verdict_response(retry_raw))
-
-        unklar_teile = {teil for teil, v in parsed.items() if v['urteil'] is None}
-        if unklar_teile:
-            unklar_hits = [h for h in hits if h['teil'] in unklar_teile]
-            print(f"      Frage {uid}: {len(unklar_hits)} UNKLAR-Urteil(e) "
-                  f"({', '.join(h['teil'] for h in unklar_hits)}) – prüfe erneut mit größerem Kontext.")
-            wide_raw = _verify_one_mm4_question(q, unklar_hits, paragraphs, modul_label, wide_context=True)
-            for teil, v in parse_statement_verdict_response(wide_raw).items():
-                parsed[teil] = v
-
-        still_missing = [h for h in hits if h['teil'] not in parsed]
-        for h in still_missing:
-            print(f"      Frage {uid}, {h['teil']}: auch nach Retry kein auswertbares Urteil "
-                  f"– als 'Prüfung fehlgeschlagen' markiert.")
-            parsed[h['teil']] = {
-                'teil': h['teil'],
-                'urteil': 'FEHLER',
-                'begruendung': 'Automatische Prüfung lieferte kein auswertbares Ergebnis.',
-                'fundstelle': h['fundstelle'],
-                'zitat': h['zitat'],
-            }
-
-        if parsed:
-            result[uid] = list(parsed.values())
-    return result
-
-
 def check_mm4_relevance_module(unique_questions: list, docx_path: str, modul_label: str,
                                 cache_dir: Path, force: bool = False,
                                 max_chunk_chars: int = 200_000) -> tuple:
     """Stufe A: prüft alle eindeutigen Fragen gegen EIN Referenzmodul (chunk-weise) und
-    liefert reine Kandidaten-Fundstellen OHNE Wahrheitsurteil (das übernimmt Stufe B,
-    verify_mm4_statements). Gibt (aggregated, kb_text) zurück: aggregated ist
-    {uid: [{'teil','fundstelle','zitat'}, ...]}, kb_text die vollständige Wissensbasis
-    (wird von Stufe B für den Aussagen-Kontext weiterverwendet)."""
+    liefert reine Kandidaten-Fundstellen als thematische Relevanz-Treffer. Gibt
+    (aggregated, kb_text) zurück: aggregated ist {uid: [{'teil','fundstelle','zitat'}, ...]}."""
     kb_cache = cache_dir / f"kb_{modul_label}.md"
     kb_text = load_or_run(kb_cache, lambda: build_full_knowledge_base(docx_path),
                            f"Wissensbasis {modul_label}")
@@ -5134,7 +4839,7 @@ def check_mm4_relevance_module(unique_questions: list, docx_path: str, modul_lab
 
     aggregated = {}
     for idx, chunk in enumerate(chunks, start=1):
-        chunk_cache = cache_dir / f"treffer_{modul_label}_v{MM4_CACHE_VERSION}_{idx:02d}.md"
+        chunk_cache = cache_dir / f"treffer_{modul_label}_{idx:02d}.md"
         raw = load_or_run(
             chunk_cache,
             lambda c=chunk, i=idx: check_mm4_relevance_for_chunk(c, i, len(chunks), unique_questions, modul_label),
@@ -5146,36 +4851,13 @@ def check_mm4_relevance_module(unique_questions: list, docx_path: str, modul_lab
     return aggregated, kb_text
 
 
-def _mm4_verdict_symbol(richtig) -> str:
-    """Kurzes, sichtbares Symbol für den Wahrheitsgehalt eines Treffers im Report."""
-    if richtig is True:
-        return "✓ Richtig"
-    if richtig is False:
-        return "✗ Falsch"
-    if richtig == 'FEHLER':
-        return "⚠ Prüfung fehlgeschlagen"
-    return "(Wahrheitsgehalt unklar)"
-
-
-def _mm4_verdict_label(richtig) -> str:
-    """Kurzes Label für den Wahrheitsgehalt eines Treffers im Word-Kommentar."""
-    if richtig is True:
-        return "richtig"
-    if richtig is False:
-        return "falsch"
-    if richtig == 'FEHLER':
-        return "Prüfung fehlgeschlagen"
-    return "Wahrheitsgehalt unklar"
-
-
-def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict, aussagen_for_modul: dict,
+def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict,
                            modul_label: str, output_path: str):
     """Erstellt die Ergebnis-.docx für EIN Modul: alle relevanten Fragen, chronologisch
     absteigend (neueste Klausur zuerst), mit sprechendem Themen-Titel als Überschrift,
-    Fragetext, Antwortoptionen, nummerierten Vorkommen, EINEM Relevanz-Hinweis pro Frage
-    (Stufe A: kommt Fragestamm/eine Option irgendwo im Modul vor) und einer vollständigen
-    Aussagen-Prüfung je Option (Stufe B: RICHTIG/FALSCH/UNKLAR mit Begründung, oder
-    "nicht in der Referenz gefunden" falls Stufe A keinen Treffer hatte)."""
+    Fragetext, Antwortoptionen, nummerierten Vorkommen, einem Relevanz-Hinweis pro Frage
+    (Stufe A: kommt Fragestamm/eine Option irgendwo im Modul vor) und den gefundenen
+    Fundstellen/Zitaten im Referenztext (rein informativ, ohne Wahr/Falsch-Urteil)."""
     relevant = [q for q in unique_questions if treffer_for_modul.get(q['uid'])]
     relevant.sort(key=lambda q: q['max_order'], reverse=True)
 
@@ -5214,22 +4896,15 @@ def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict, aussa
             rel_line += f" (Kurseinheiten: {', '.join(top_level)})"
         doc.add_paragraph(rel_line).runs[0].bold = True
 
-        doc.add_paragraph("Aussagen-Prüfung:").runs[0].bold = True
-        aussagen_by_teil = {a['teil']: a for a in aussagen_for_modul.get(q['uid'], [])}
-        for idx, opt in enumerate(q['optionen']):
-            teil = f"Option {_mm4_option_letter(idx)}"
-            aussage = aussagen_by_teil.get(teil)
-            if aussage is None:
-                doc.add_paragraph(
-                    f"  {_mm4_option_letter(idx)}) {opt} – (nicht in der Referenz gefunden)",
-                    style='List Bullet 2',
-                )
+        doc.add_paragraph("Fundstellen im Referenztext:").runs[0].bold = True
+        seen = set()
+        for hit in stufe_a_hits:
+            key = (hit['fundstelle'], hit['zitat'])
+            if key in seen:
                 continue
-            verdict = _mm4_verdict_symbol(aussage.get('urteil'))
+            seen.add(key)
             doc.add_paragraph(
-                f"  {_mm4_option_letter(idx)}) {opt} – {verdict} – "
-                f"Begründung: {aussage.get('begruendung', '')} – "
-                f"Fundstelle: {aussage.get('fundstelle', '')} – Zitat: „{aussage.get('zitat', '')}“",
+                f"  {hit['fundstelle']} – Zitat: „{hit['zitat']}“",
                 style='List Bullet 2',
             )
         doc.add_paragraph('')  # Abstand zur nächsten Frage
@@ -5290,9 +4965,7 @@ def run_mm4_check(folder: str, ref_docs: list = None,
     for label, ref in zip(labels, ref_docs):
         output_ref = str(base.with_name(f"{base.stem}_{label}{base.suffix}"))
         treffer, kb_text = check_mm4_relevance_module(unique_questions, ref, label, cache_dir, force=force)
-        aussagen = verify_mm4_statements(unique_questions, treffer, kb_text, label, cache_dir, force=force)
-        report_paths.append(build_mm4_report_docx(unique_questions, treffer, aussagen, label, output_ref))
-        _mark_mm4_hits_in_reference(unique_questions, aussagen, ref, label)
+        report_paths.append(build_mm4_report_docx(unique_questions, treffer, label, output_ref))
 
     return report_paths
 
