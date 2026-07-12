@@ -4855,9 +4855,11 @@ def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict,
                            modul_label: str, output_path: str):
     """Erstellt die Ergebnis-.docx für EIN Modul: alle relevanten Fragen, chronologisch
     absteigend (neueste Klausur zuerst), mit sprechendem Themen-Titel als Überschrift,
-    Fragetext, Antwortoptionen, nummerierten Vorkommen, einem Relevanz-Hinweis pro Frage
-    (Stufe A: kommt Fragestamm/eine Option irgendwo im Modul vor) und den gefundenen
-    Fundstellen/Zitaten im Referenztext (rein informativ, ohne Wahr/Falsch-Urteil)."""
+    Fragetext, Antwortoptionen, nummerierten Vorkommen und einem kompakten Relevanz-Hinweis
+    pro Frage (Stufe A: kommt Fragestamm/eine Option irgendwo im Modul vor, mit den
+    betroffenen Kurseinheiten) – bewusst ohne Detail-Fundstellen/Zitate, da das Ergebnis
+    zum manuellen Kopieren in die MM-Datei gedacht ist und dort ohnehin erneut per
+    Quiz-Funktion geprüft wird."""
     relevant = [q for q in unique_questions if treffer_for_modul.get(q['uid'])]
     relevant.sort(key=lambda q: q['max_order'], reverse=True)
 
@@ -4895,18 +4897,6 @@ def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict,
         if top_level:
             rel_line += f" (Kurseinheiten: {', '.join(top_level)})"
         doc.add_paragraph(rel_line).runs[0].bold = True
-
-        doc.add_paragraph("Fundstellen im Referenztext:").runs[0].bold = True
-        seen = set()
-        for hit in stufe_a_hits:
-            key = (hit['fundstelle'], hit['zitat'])
-            if key in seen:
-                continue
-            seen.add(key)
-            doc.add_paragraph(
-                f"  {hit['fundstelle']} – Zitat: „{hit['zitat']}“",
-                style='List Bullet 2',
-            )
         doc.add_paragraph('')  # Abstand zur nächsten Frage
 
     doc.save(output_path)
