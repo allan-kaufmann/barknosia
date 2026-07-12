@@ -3810,12 +3810,16 @@ def extract_quiz_questions(doc, quiz_chapter_heading: str):
         if heading_level(paras[i]) is not None and m:
             num = int(m.group(1))
             images = []
+            text_lines = []
             j = i + 1
             while j < hi and not is_frage_heading(paras[j]):
                 images.extend(_iter_paragraph_image_blobs(doc, paras[j]))
+                if paras[j].text.strip():
+                    text_lines.append(paras[j].text.strip())
                 j += 1
             anchor = paras[j] if j < len(paras) else None
-            questions.append({'num': num, 'heading_para': paras[i], 'anchor': anchor, 'images': images})
+            questions.append({'num': num, 'heading_para': paras[i], 'anchor': anchor,
+                               'images': images, 'text': '\n'.join(text_lines)})
             i = j
         else:
             i += 1
@@ -3861,8 +3865,12 @@ def ocr_quiz_questions(questions, cache_path: Path, force: bool = False) -> dict
         num = q['num']
         if num in cache and cache[num].strip():
             continue
-        print(f"   [Vision] Frage {num} ({len(q['images'])} Bild(er)) …")
-        cache[num] = _ocr_quiz_image(q['images']) or "(Bild nicht lesbar)"
+        if not q['images'] and q.get('text', '').strip():
+            print(f"   [Text] Frage {num} (kein Bild, Text direkt übernommen) …")
+            cache[num] = q['text'].strip()
+        else:
+            print(f"   [Vision] Frage {num} ({len(q['images'])} Bild(er)) …")
+            cache[num] = _ocr_quiz_image(q['images']) or "(Bild nicht lesbar)"
         updated = True
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -4875,12 +4883,12 @@ def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict,
         f"(neueste Klausur zuerst)."
     )
 
-    for q in relevant:
+    for i, q in enumerate(relevant, start=1):
         occ = ', '.join(
             f"{label} Nr. {num}" if num is not None else label
             for _, label, num in q['occurrences']
         )
-        h = doc.add_heading(f'Frage „{q["titel"]}“', level=2)
+        h = doc.add_heading(f'Frage {i} – „{q["titel"]}“', level=2)
         _set_heading_color(h, MM_HEADING_COLORS[2])
 
         p = doc.add_paragraph()
