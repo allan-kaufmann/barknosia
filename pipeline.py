@@ -4771,6 +4771,13 @@ def _chunk_markdown_by_headings(text: str, max_chars: int) -> list:
     return chunks
 
 
+# Bei jeder Änderung am Ausgabeformat der Stufe-A/B-Prompts (check_mm4_relevance_for_chunk,
+# verify_statement_truth) oder deren Parsern hochzählen, damit veraltete treffer_*/aussagen_*
+# Caches automatisch verworfen und neu berechnet werden – kb_*.md/gruppierung.json bleiben
+# davon unberührt (deren Format ändert sich dadurch nicht), sodass kein --force nötig ist.
+MM4_CACHE_VERSION = "2"
+
+
 def _mm4_option_letter(idx: int) -> str:
     """A, B, C, ... Z, AA, AB, ... für Optionsindex idx (0-basiert)."""
     letters = ''
@@ -4796,6 +4803,18 @@ def _mm4_letter_to_index(letters: str) -> int:
     for ch in letters:
         idx = idx * 26 + (ord(ch) - 64)
     return idx - 1
+
+
+def _mm4_normalize_teil_label(raw: str) -> str:
+    """Normalisiert ein vom LLM gemeldetes Teil-Label auf die kanonische Form ('Stamm'
+    oder 'Option X'). Gemini schreibt Optionen inkonsistent teils als nackten Buchstaben
+    ('A'), teils als 'Option A' – beide Formen müssen auf dasselbe Label abgebildet werden,
+    damit Stufe A/B und der Report dieselben Schlüssel verwenden."""
+    raw = raw.strip()
+    if raw == 'Stamm':
+        return raw
+    m = re.match(r'(?:Option\s*)?([A-Z]{1,3})$', raw)
+    return f"Option {m.group(1)}" if m else raw
 
 
 def _mm4_teil_text(teil: str, q: dict) -> str:
@@ -4944,11 +4963,11 @@ def parse_mm4_relevance_response(text: str) -> dict:
         i += 2
         hits = []
         for lm in re.finditer(
-            r'(?m)^-\s*(Stamm|Option\s*[A-Z]+)\s*:\s*Fundstelle:\s*(.+?)\s*\|\s*Zitat:\s*"(.+?)"\s*$',
+            r'(?m)^-?\s*(Stamm|(?:Option\s*)?[A-Z]{1,3})\s*:\s*Fundstelle:\s*(.+?)\s*\|\s*Zitat:\s*"(.+?)"\s*$',
             block,
         ):
             hits.append({
-                'teil': lm.group(1).strip(),
+                'teil': _mm4_normalize_teil_label(lm.group(1)),
                 'fundstelle': lm.group(2).strip(),
                 'zitat': lm.group(3).strip(),
             })
@@ -5006,11 +5025,11 @@ def parse_statement_verdict_response(text: str) -> dict:
     if not text:
         return result
     for lm in re.finditer(
-        r'(?m)^-\s*(Stamm|Option\s*[A-Z]+)\s*:\s*(RICHTIG|FALSCH|UNKLAR)\s*\|\s*'
+        r'(?m)^-?\s*(Stamm|(?:Option\s*)?[A-Z]{1,3})\s*:\s*(RICHTIG|FALSCH|UNKLAR)\s*\|\s*'
         r'Begründung:\s*(.+?)\s*\|\s*Fundstelle:\s*(.+?)\s*\|\s*Zitat:\s*"(.+?)"\s*$',
         text,
     ):
-        teil = lm.group(1).strip()
+        teil = _mm4_normalize_teil_label(lm.group(1))
         verdict_raw = lm.group(2).strip().upper()
         urteil = True if verdict_raw == 'RICHTIG' else (False if verdict_raw == 'FALSCH' else None)
         result[teil] = {
@@ -5057,7 +5076,7 @@ def verify_mm4_statements(unique_questions: list, treffer: dict, kb_text: str, m
     total = len(items)
     for i, (uid, hits) in enumerate(items, start=1):
         q = q_by_uid[uid]
-        cache_path = cache_dir / f"aussagen_{modul_label}_{uid:03d}.md"
+        cache_path = cache_dir / f"aussagen_{modul_label}_v{MM4_CACHE_VERSION}_{uid:03d}.md"
         raw = load_or_run(
             cache_path,
             lambda q=q, hits=hits: _verify_one_mm4_question(q, hits, paragraphs, modul_label),
@@ -5067,15 +5086,31 @@ def verify_mm4_statements(unique_questions: list, treffer: dict, kb_text: str, m
 
         missing_hits = [h for h in hits if h['teil'] not in parsed]
         if missing_hits:
+            print(f"      Frage {uid}: {len(missing_hits)} Urteil(e) fehlten "
+                  f"({', '.join(h['teil'] for h in missing_hits)}) – frage erneut nach.")
             retry_raw = _verify_one_mm4_question(q, missing_hits, paragraphs, modul_label)
             parsed.update(parse_statement_verdict_response(retry_raw))
 
         unklar_teile = {teil for teil, v in parsed.items() if v['urteil'] is None}
         if unklar_teile:
             unklar_hits = [h for h in hits if h['teil'] in unklar_teile]
+            print(f"      Frage {uid}: {len(unklar_hits)} UNKLAR-Urteil(e) "
+                  f"({', '.join(h['teil'] for h in unklar_hits)}) – prüfe erneut mit größerem Kontext.")
             wide_raw = _verify_one_mm4_question(q, unklar_hits, paragraphs, modul_label, wide_context=True)
             for teil, v in parse_statement_verdict_response(wide_raw).items():
                 parsed[teil] = v
+
+        still_missing = [h for h in hits if h['teil'] not in parsed]
+        for h in still_missing:
+            print(f"      Frage {uid}, {h['teil']}: auch nach Retry kein auswertbares Urteil "
+                  f"– als 'Prüfung fehlgeschlagen' markiert.")
+            parsed[h['teil']] = {
+                'teil': h['teil'],
+                'urteil': 'FEHLER',
+                'begruendung': 'Automatische Prüfung lieferte kein auswertbares Ergebnis.',
+                'fundstelle': h['fundstelle'],
+                'zitat': h['zitat'],
+            }
 
         if parsed:
             result[uid] = list(parsed.values())
@@ -5099,7 +5134,7 @@ def check_mm4_relevance_module(unique_questions: list, docx_path: str, modul_lab
 
     aggregated = {}
     for idx, chunk in enumerate(chunks, start=1):
-        chunk_cache = cache_dir / f"treffer_{modul_label}_{idx:02d}.md"
+        chunk_cache = cache_dir / f"treffer_{modul_label}_v{MM4_CACHE_VERSION}_{idx:02d}.md"
         raw = load_or_run(
             chunk_cache,
             lambda c=chunk, i=idx: check_mm4_relevance_for_chunk(c, i, len(chunks), unique_questions, modul_label),
@@ -5117,6 +5152,8 @@ def _mm4_verdict_symbol(richtig) -> str:
         return "✓ Richtig"
     if richtig is False:
         return "✗ Falsch"
+    if richtig == 'FEHLER':
+        return "⚠ Prüfung fehlgeschlagen"
     return "(Wahrheitsgehalt unklar)"
 
 
@@ -5126,6 +5163,8 @@ def _mm4_verdict_label(richtig) -> str:
         return "richtig"
     if richtig is False:
         return "falsch"
+    if richtig == 'FEHLER':
+        return "Prüfung fehlgeschlagen"
     return "Wahrheitsgehalt unklar"
 
 
@@ -5169,10 +5208,10 @@ def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict, aussa
         doc.add_paragraph(f"Vorkommen: {occ}")
 
         stufe_a_hits = treffer_for_modul.get(q['uid'], [])
-        fundstellen = sorted({hit['fundstelle'] for hit in stufe_a_hits})
+        top_level = sorted({hit['fundstelle'].split(' > ')[0] for hit in stufe_a_hits})
         rel_line = f"Relevant für Modul {modul_label}."
-        if fundstellen:
-            rel_line += f" (Fundstellen in: {', '.join(fundstellen)})"
+        if top_level:
+            rel_line += f" (Kurseinheiten: {', '.join(top_level)})"
         doc.add_paragraph(rel_line).runs[0].bold = True
 
         doc.add_paragraph("Aussagen-Prüfung:").runs[0].bold = True
