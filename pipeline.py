@@ -4101,17 +4101,23 @@ def _quiz_short_name(heading: str) -> str:
     return h or (heading or '').strip()
 
 
-def _remove_quiz_comments(doc) -> int:
-    """Entfernt ALLE vom Tool (Autor „Quiz") gesetzten Kommentare samt ihrer Range-Marker
-    (`w:commentRangeStart/End` + Referenz-Run) und lässt Nutzer-/Lernfragen-Kommentare
-    unberührt. Macht das Neusetzen der Marker idempotent (kein Mix aus alt und neu)."""
+def _remove_quiz_comments(doc, current_qnames: set) -> int:
+    """Entfernt nur die vom Tool (Autor „Quiz") gesetzten Kommentare, die AUSSCHLIESSLICH
+    Fragen aus den in DIESEM Lauf verarbeiteten Quiz-Kapiteln referenzieren (Idempotenz bei
+    Re-Lauf derselben Kapitel). Kommentare, die (auch) ein in diesem Lauf nicht verarbeitetes
+    Kapitel referenzieren, bleiben unangetastet – sonst gehen bei einem Lauf für Kapitel B die
+    bereits gesetzten Kommentare für Kapitel A verloren."""
     try:
         comments_elm = doc.comments._comments_elm
     except Exception:
         return 0
     quiz_ids = set()
     for c_elm in list(comments_elm.comment_lst):
-        if (c_elm.author or "") == "Quiz":
+        if (c_elm.author or "") != "Quiz":
+            continue
+        text = "".join(c_elm.itertext())
+        refs = set(re.findall(r'»([^«]+)«', text))
+        if refs and not (refs - current_qnames):
             quiz_ids.add(str(c_elm.id))
             c_elm.getparent().remove(c_elm)
     if not quiz_ids:
@@ -4996,9 +5002,10 @@ def run_quiz_check(docx_path: str, quiz_chapter_headings,
     # Marker-Phase: auf dem NOCH UNVERÄNDERTEN Dokument (pristine Absatz-Indizes). Zuvor eigene
     # frühere „Quiz"-Kommentare entfernen (kein Mix aus alt/neu); Nutzer-/Lernfragen-Kommentare
     # bleiben unberührt. Marker sitzen an der konkreten Beleg-Stelle, nie in einem Quiz-Kapitel.
-    removed_c = _remove_quiz_comments(doc)
+    current_qnames = {_quiz_short_name(h) for h in quiz_chapter_headings}
+    removed_c = _remove_quiz_comments(doc, current_qnames)
     if removed_c:
-        print(f"   {removed_c} frühere „Quiz\"-Kommentare entfernt (Idempotenz).")
+        print(f"   {removed_c} frühere „Quiz\"-Kommentare entfernt (Idempotenz, nur aktuelle Kapitel).")
     _apply_quiz_markers(doc, analyses)
 
     # Mutations-Phase: von unten nach oben (größter Startindex zuerst), damit die in der
