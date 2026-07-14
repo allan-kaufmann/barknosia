@@ -5,6 +5,7 @@ import sys
 import time
 import re
 import json
+from datetime import date
 from pathlib import Path
 from dotenv import load_dotenv
 import httpx  # transitive Abhängigkeit von google-genai; für Retry auf Netzwerk-Timeouts
@@ -53,9 +54,113 @@ def _get_gemini_client():
         )
     return _gemini_client
 
+# --- Kostenschutz -------------------------------------------------------------
+# Harte Obergrenzen, damit ein Lauf niemals unbemerkt dreistellige API-Kosten erzeugt.
+# Beide per Umgebungsvariable überschreibbar (bewusstes Anheben), Defaults konservativ.
+#  * Pro-Aufruf-Limit: kein einzelner Aufruf darf mehr Input-Tokens senden. Blockt z.B.
+#    den Whole-Doc-Retry (ganzes Dokument ≈ 775k Tokens) strukturell, BEVOR er raus geht.
+#  * Pro-Lauf-Budget: laufende Summe aller Input-Tokens des Prozesses (deckelt Fan-out).
+# Schätzung ist rein lokal (kein API-Call): ~4 Zeichen/Token, Bild-Parts pauschal.
+GEMINI_MAX_INPUT_TOKENS = int(os.getenv("GEMINI_MAX_INPUT_TOKENS", "250000"))
+GEMINI_RUN_TOKEN_BUDGET = int(os.getenv("GEMINI_RUN_TOKEN_BUDGET", "1500000"))
+# Grobe €-Schätzung (bewusst konservativ = eher zu hoch: Gemini 2.5 Pro Long-Input
+# ~2,50 $/Mio., ~0,92 €/$). Über-Schätzung ist Absicht – so greift die Monatsbremse eher zu früh.
+_EUR_PER_INPUT_TOKEN = 2.50 * 0.92 / 1_000_000
+_run_input_tokens = 0
+
+# Standardmodell: das günstige Flash-Modell (~1/8 der Kosten von 2.5 Pro), da fast alle
+# Aufgaben hier reine „steht das im Text?"-Prüfungen sind. Per Umgebungsvariable GEMINI_MODEL
+# global auf ein stärkeres Modell umstellbar, falls die Qualität nicht reicht.
+GEMINI_DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+# Monatsbudget über ALLE Läufe hinweg (persistent). Ergänzt Googles eigenes Spending-Cap als
+# Frühwarnung: übersteigt die geschätzte Monatssumme dieses Limit, wird abgebrochen, BEVOR ein
+# weiterer (kostenpflichtiger) Aufruf rausgeht. Default 30 €, per Umgebungsvariable änderbar.
+GEMINI_MONTHLY_BUDGET_EUR = float(os.getenv("GEMINI_MONTHLY_BUDGET_EUR", "30"))
+_BUDGET_STATE_FILE = Path(__file__).parent / ".gemini_monthly_spend.json"
+
+
+def _month_key() -> str:
+    return date.today().strftime("%Y-%m")
+
+
+def _load_month_spend() -> float:
+    """Bereits geschätzte Ausgaben (€) im laufenden Kalendermonat (0.0, falls keine/defekte Datei)."""
+    try:
+        data = json.loads(_BUDGET_STATE_FILE.read_text(encoding="utf-8"))
+        return float(data.get(_month_key(), 0.0))
+    except Exception:
+        return 0.0
+
+
+def _add_month_spend(eur: float) -> float:
+    """Rechnet `eur` auf die Monatssumme drauf, speichert persistent und gibt die neue Summe zurück."""
+    key = _month_key()
+    try:
+        data = json.loads(_BUDGET_STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    data[key] = float(data.get(key, 0.0)) + eur
+    try:
+        _BUDGET_STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return data[key]
+
+
+def _estimate_input_tokens(contents) -> int:
+    """Schätzt die Input-Tokens eines Aufrufs lokal (ohne API): Text ~ len/4, Bild ~ 260."""
+    def _one(part) -> int:
+        if isinstance(part, str):
+            return len(part) // 4
+        data = getattr(part, 'inline_data', None) or getattr(part, '_inline_data', None)
+        if data is not None or getattr(part, 'from_bytes', None) is not None:
+            return 260  # Pauschale je Bild-Part
+        text = getattr(part, 'text', None)
+        if isinstance(text, str):
+            return len(text) // 4
+        return len(str(part)) // 4
+    if isinstance(contents, (list, tuple)):
+        return sum(_one(p) for p in contents)
+    return _one(contents)
+
+
 def call_gemini_with_retry(model_name: str, contents, config, max_retries: int = 5, delay: int = 5):
     """Hilfsfunktion: Ruft Gemini auf und wiederholt den Versuch bei Serverüberlastung (503/429)
-    sowie bei Netzwerk-Timeouts/Verbindungsfehlern (hängender Socket)."""
+    sowie bei Netzwerk-Timeouts/Verbindungsfehlern (hängender Socket).
+
+    Kostenschutz: Vor dem Aufruf werden die Input-Tokens geschätzt und gegen ein Pro-Aufruf-
+    Limit sowie ein Pro-Lauf-Budget geprüft. Bei Überschreitung wird abgebrochen, BEVOR ein
+    (kostenpflichtiger) Netzwerk-Call erfolgt."""
+    global _run_input_tokens
+    est = _estimate_input_tokens(contents)
+    if est > GEMINI_MAX_INPUT_TOKENS:
+        raise RuntimeError(
+            f"Kostenschutz: Einzelaufruf würde ~{est:,} Input-Tokens senden – über dem "
+            f"Pro-Aufruf-Limit von {GEMINI_MAX_INPUT_TOKENS:,}. Aufruf abgebrochen (keine "
+            f"Kosten). Ursache ist meist ein zu großer (ganzes-Dokument-)Kontext. Limit ggf. "
+            f"bewusst anheben via Umgebungsvariable GEMINI_MAX_INPUT_TOKENS."
+        )
+    if _run_input_tokens + est > GEMINI_RUN_TOKEN_BUDGET:
+        raise RuntimeError(
+            f"Kostenschutz: Lauf-Budget erschöpft (~{_run_input_tokens:,} bereits verbraucht, "
+            f"nächster Aufruf ~{est:,}, Budget {GEMINI_RUN_TOKEN_BUDGET:,} Input-Tokens). "
+            f"Lauf abgebrochen (keine weiteren Kosten). Budget ggf. bewusst anheben via "
+            f"Umgebungsvariable GEMINI_RUN_TOKEN_BUDGET."
+        )
+    est_eur = est * _EUR_PER_INPUT_TOKEN
+    month_spent = _load_month_spend()
+    if month_spent + est_eur > GEMINI_MONTHLY_BUDGET_EUR:
+        raise RuntimeError(
+            f"Kostenschutz: Monatsbudget erreicht (~{month_spent:.2f} € geschätzt in "
+            f"{_month_key()} bereits verbraucht, nächster Aufruf ~{est_eur:.2f} €, Limit "
+            f"{GEMINI_MONTHLY_BUDGET_EUR:.2f} €). Abgebrochen, BEVOR Kosten entstehen. "
+            f"Limit ggf. bewusst anheben via Umgebungsvariable GEMINI_MONTHLY_BUDGET_EUR. "
+            f"(Hinweis: die verlässliche harte Grenze ist zusätzlich Googles eigenes "
+            f"Spending-Cap unter https://ai.studio/spend.)"
+        )
     client = _get_gemini_client()
     for attempt in range(1, max_retries + 1):
         try:
@@ -64,6 +169,11 @@ def call_gemini_with_retry(model_name: str, contents, config, max_retries: int =
                 contents=contents,
                 config=config
             )
+            _run_input_tokens += est
+            month_total = _add_month_spend(est_eur)
+            print(f"      [Kosten] Lauf ~{_run_input_tokens:,} Input-Tokens "
+                  f"(~{_run_input_tokens * _EUR_PER_INPUT_TOKEN:.2f} €) · Monat {_month_key()} "
+                  f"~{month_total:.2f} €/{GEMINI_MONTHLY_BUDGET_EUR:.0f} € (grobe Schätzung)")
             return response
         except APIError as e:
             if e.code in [503, 429] and attempt < max_retries:
@@ -673,7 +783,7 @@ def translate_text(text: str, source_lang: str = "en", target_lang: str = "de",
         print(f"   -> Übersetze Abschnitt {i} von {len(chunks)}...")
         try:
             response = call_gemini_with_retry(
-                model_name='gemini-2.5-pro',
+                model_name=GEMINI_DEFAULT_MODEL,
                 contents=f"Text:\n{chunk}",
                 config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=0.1)
             )
@@ -1049,7 +1159,7 @@ def _summarize_single_chapter(heading: str, chapter_text: str, output_lang: str 
     _out_tokens = 65536 if len(_required) > 50 else 32768
     try:
         response = call_gemini_with_retry(
-            model_name='gemini-2.5-pro',
+            model_name=GEMINI_DEFAULT_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.2,
@@ -1095,7 +1205,7 @@ def _summarize_article_condensed(heading: str, article_text: str, output_lang: s
     )
     try:
         response = call_gemini_with_retry(
-            model_name='gemini-2.5-pro',
+            model_name=GEMINI_DEFAULT_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=8192)
         )
@@ -1359,7 +1469,7 @@ def verify_with_questions(summary_text: str, questions_path: str) -> str:
     for attempt in range(1, 4):
         try:
             response = call_gemini_with_retry(
-                model_name='gemini-2.5-pro',
+                model_name=GEMINI_DEFAULT_MODEL,
                 contents=prompt,
                 config=types.GenerateContentConfig(temperature=0.1)
             )
@@ -1464,7 +1574,7 @@ def rework_partial_answers(qa_text: str, working_text: str, questions_path: str 
         )
         try:
             response = call_gemini_with_retry(
-                model_name='gemini-2.5-pro',
+                model_name=GEMINI_DEFAULT_MODEL,
                 contents=prompt,
                 config=types.GenerateContentConfig(temperature=0.1)
             )
@@ -1563,7 +1673,7 @@ def _classify_box_boundaries(boxes: list) -> list:
     prompt = '\n'.join(lines)
 
     response = call_gemini_with_retry(
-        model_name='gemini-2.5-pro',
+        model_name=GEMINI_DEFAULT_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(temperature=0, response_mime_type='application/json'),
     )
@@ -3848,7 +3958,7 @@ def _ocr_quiz_image(images) -> str:
     )
     parts.append(prompt)
     resp = call_gemini_with_retry(
-        model_name='gemini-2.5-pro',
+        model_name=GEMINI_DEFAULT_MODEL,
         contents=parts,
         config=types.GenerateContentConfig(temperature=0.0),
     )
@@ -4265,7 +4375,7 @@ def _retry_single_question(full_kb: str, num: int, question_text: str) -> str:
         f"Die EINE zu beantwortende Frage:\n{num}. {question_text}"
     )
     resp = call_gemini_with_retry(
-        model_name='gemini-2.5-pro',
+        model_name=GEMINI_DEFAULT_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(temperature=0.1),
     )
@@ -4370,28 +4480,40 @@ def _analyze_one_quiz(doc, src: Path, quiz_chapter_heading: str, force: bool) ->
     # (alle Kurseinheiten) statt nur der umschließenden KE, falls die Antwort außerhalb liegt.
     retry_nums = sorted(num for num, it in items_by_num.items() if _abdeckung_missing(it))
     if retry_nums:
-        print(f"   [{tag}] Whole-Doc-Retry für {len(retry_nums)} 'nicht enthalten'-Frage(n): {retry_nums}")
         full_kb, _ = build_quiz_knowledge_base(doc, (0, len(doc.paragraphs)), quiz_range)
-        updated = 0
-        for num in retry_nums:
-            qtext = ' '.join(ocr_map.get(num, '').split())
-            rpath = work_dir / f"quiz_retry_{num}.md"
-            rtext = load_or_run(
-                rpath,
-                lambda: _retry_single_question(full_kb, num, qtext),
-                f"Quiz-Retry Frage {num} [{tag}]",
-            )
-            parsed = parse_qa_response(rtext)
-            # Guard: genau EIN valider Block, sonst ist die Antwort unzuverlässig (Modell hat
-            # z.B. dokumenteigene Fragen aufgezählt) → Original ('nicht enthalten') behalten.
-            if len(parsed) == 1 and not _abdeckung_missing(parsed[0]):
-                it = parsed[0]
-                it['num'] = num
-                items_by_num[num] = it
-                updated += 1
-            else:
-                print(f"     Frage {num}: kein zuverlässiger Treffer (bleibt 'nicht enthalten').")
-        print(f"   [{tag}] Whole-Doc-Retry: {updated} Frage(n) neu beantwortet.")
+        full_est = _estimate_input_tokens(full_kb)
+        # Wurzelbehebung des teuren 12.07-Falls: NIE das ganze Dokument je Frage versenden.
+        # Ist die Gesamt-Wissensbasis zu groß für einen einzelnen Aufruf, wird der Whole-Doc-
+        # Retry komplett übersprungen (statt N × ~775k-Token-Aufrufe abzusetzen). Das passiert
+        # typischerweise genau dann, wenn die Fragen gar nicht im geprüften Kapitel stehen.
+        if full_est > GEMINI_MAX_INPUT_TOKENS:
+            print(f"   [{tag}] Whole-Doc-Retry ÜBERSPRUNGEN: Gesamt-Wissensbasis ~{full_est:,} "
+                  f"Tokens > Pro-Aufruf-Limit {GEMINI_MAX_INPUT_TOKENS:,}. Es wird NICHT das "
+                  f"ganze Dokument je Frage versendet (das war der teure Fall). Die "
+                  f"{len(retry_nums)} offenen Frage(n) bleiben 'nicht enthalten' – meist ein "
+                  f"Zeichen dafür, dass sie nicht im geprüften Kapitel/der Kurseinheit stehen.")
+        else:
+            print(f"   [{tag}] Whole-Doc-Retry für {len(retry_nums)} 'nicht enthalten'-Frage(n): {retry_nums}")
+            updated = 0
+            for num in retry_nums:
+                qtext = ' '.join(ocr_map.get(num, '').split())
+                rpath = work_dir / f"quiz_retry_{num}.md"
+                rtext = load_or_run(
+                    rpath,
+                    lambda: _retry_single_question(full_kb, num, qtext),
+                    f"Quiz-Retry Frage {num} [{tag}]",
+                )
+                parsed = parse_qa_response(rtext)
+                # Guard: genau EIN valider Block, sonst ist die Antwort unzuverlässig (Modell hat
+                # z.B. dokumenteigene Fragen aufgezählt) → Original ('nicht enthalten') behalten.
+                if len(parsed) == 1 and not _abdeckung_missing(parsed[0]):
+                    it = parsed[0]
+                    it['num'] = num
+                    items_by_num[num] = it
+                    updated += 1
+                else:
+                    print(f"     Frage {num}: kein zuverlässiger Treffer (bleibt 'nicht enthalten').")
+            print(f"   [{tag}] Whole-Doc-Retry: {updated} Frage(n) neu beantwortet.")
 
     return {
         'heading': quiz_chapter_heading,
@@ -4483,7 +4605,7 @@ def extract_mm4_questions(pdf_path: str) -> list:
     )
     parts = [types.Part.from_bytes(data=pdf_bytes, mime_type='application/pdf'), prompt]
     response = call_gemini_with_retry(
-        model_name='gemini-2.5-pro',
+        model_name=GEMINI_DEFAULT_MODEL,
         contents=parts,
         config=types.GenerateContentConfig(temperature=0.0, response_mime_type='application/json'),
     )
@@ -4551,7 +4673,7 @@ def group_duplicate_mm4_questions_llm(raw_questions: list) -> str:
         f"{_format_mm4_raw_question_list(raw_questions)}\n"
     )
     response = call_gemini_with_retry(
-        model_name='gemini-2.5-pro',
+        model_name=GEMINI_DEFAULT_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(temperature=0.0, response_mime_type='application/json'),
     )
@@ -4798,7 +4920,7 @@ def check_mm4_relevance_for_chunk(chunk_text: str, chunk_idx: int, total_chunks:
         f"{_format_mm4_question_list(questions)}\n"
     )
     response = call_gemini_with_retry(
-        model_name='gemini-2.5-pro',
+        model_name=GEMINI_DEFAULT_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(temperature=0.0),
     )
