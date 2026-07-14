@@ -4987,8 +4987,111 @@ def check_mm4_relevance_module(unique_questions: list, docx_path: str, modul_lab
     return aggregated, kb_text
 
 
+# --- Lösungs-Screenshots aus den Original-Klausur-PDFs (rein lokal, KEIN Gemini) -----------
+# Die Klausur-PDFs sind Moodle-Review-Exporte MIT eingezeichneter Lösung (grüne Häkchen).
+# Wir schneiden je Frage den Original-Block heraus und betten ihn als Bild in den Report ein.
+_PDF_RENDER_SCALE = 2.0
+
+
+def _norm_pdf_text(s: str) -> str:
+    return re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', ' ', (s or '').lower())).strip()
+
+
+def _trim_to_block(img, max_gap_px: int = 55, pad: int = 8):
+    """Schneidet ein gerendertes Seitenbild auf den zusammenhängenden Frageblock ab Oberkante:
+    entfernt führenden/folgenden Leerraum und schneidet vor der ersten großen Leerlücke ab
+    (so fallen Seitenfuß und der Anfang der Folgefrage weg). Ohne numpy: unverändert zurück."""
+    try:
+        import numpy as np
+    except Exception:
+        return img
+    arr = np.asarray(img.convert('L'))
+    row_has = (arr < 200).sum(axis=1) >= 3
+    idx = np.where(row_has)[0]
+    if len(idx) == 0:
+        return img
+    top = int(idx[0]); bottom = top; prev = top
+    for y in idx[1:]:
+        if y - prev > max_gap_px:
+            break
+        bottom = int(y); prev = int(y)
+    return img.crop((0, max(0, top - pad), img.width, min(img.height, bottom + pad)))
+
+
+def _pdf_frage_markers(pdf) -> list:
+    """[{'num','page','y','text'}] aller 'Frage N'-Marker (Moodle) in Dokumentreihenfolge.
+    'y' ist die Pixel-Oberkante bei _PDF_RENDER_SCALE, 'text' der Blocktext bis zum nächsten
+    Marker derselben Seite (für den Fragetext-Abgleich)."""
+    markers = []
+    for pi in range(len(pdf)):
+        page = pdf[pi]
+        ph = page.get_height()
+        tp = page.get_textpage()
+        full = tp.get_text_bounded()
+        found = [(mm.group(1), mm.start()) for mm in re.finditer(r'Frage\s+(\d+)', full)]
+        for k, (num, ci) in enumerate(found):
+            try:
+                box = tp.get_charbox(ci)  # (l,b,r,t) in PDF-Punkten, Ursprung unten-links
+            except Exception:
+                continue
+            y_top = round((ph - box[3]) * _PDF_RENDER_SCALE)
+            end = found[k + 1][1] if k + 1 < len(found) else len(full)
+            markers.append({'num': int(num), 'page': pi, 'y': y_top, 'text': full[ci:end]})
+    return markers
+
+
+def _render_question_solution_png(pdf, aufgabe_num, fragetext: str, out_png: str):
+    """Schneidet den Frageblock (inkl. eingezeichneter Lösung) aus dem geöffneten PDF und
+    speichert ihn als PNG. Zielsuche primär per Fragetext-Schnipsel, sonst per 'Frage N'.
+    Gibt den PNG-Pfad zurück oder None, wenn die Frage nicht lokalisierbar war."""
+    markers = _pdf_frage_markers(pdf)
+    if not markers:
+        return None
+    snip = _norm_pdf_text(fragetext)[:40]
+    ti = None
+    if snip:
+        for i, mk in enumerate(markers):
+            if snip in _norm_pdf_text(mk['text']):
+                ti = i
+                break
+    if ti is None and aufgabe_num is not None:
+        try:
+            an = int(aufgabe_num)
+            for i, mk in enumerate(markers):
+                if mk['num'] == an:
+                    ti = i
+                    break
+        except (TypeError, ValueError):
+            pass
+    if ti is None:
+        return None
+    start = markers[ti]
+    nxt = markers[ti + 1] if ti + 1 < len(markers) else None
+    img = pdf[start['page']].render(scale=_PDF_RENDER_SCALE).to_pil()
+    # Untere Grenze: nächster Marker auf DERSELBEN Seite, sonst Seitenende + Trim.
+    y_bottom = nxt['y'] if (nxt and nxt['page'] == start['page']) else img.height
+    crop = _trim_to_block(img.crop((0, start['y'], img.width, y_bottom)))
+    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+    crop.save(out_png)
+    return out_png
+
+
+def _best_solution_occurrence(q: dict, label_to_path: dict):
+    """Wählt aus q['occurrences'] (neueste zuerst) das jüngste Vorkommen, dessen Klausur eine
+    Lösung enthält (Label NICHT 'ohne Lösung'). Gibt (pdf_pfad, aufgabe_num) oder None."""
+    for _order, label, aufgabe_num in q.get('occurrences', []):
+        low = (label or '').lower()
+        if 'ohne lösung' in low or 'ohne loesung' in low:
+            continue
+        path = label_to_path.get(label)
+        if path:
+            return path, aufgabe_num
+    return None
+
+
 def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict,
-                           modul_label: str, output_path: str):
+                           modul_label: str, output_path: str,
+                           label_to_path: dict = None, img_cache_dir: Path = None):
     """Erstellt die Ergebnis-.docx für EIN Modul: alle relevanten Fragen, chronologisch
     absteigend (neueste Klausur zuerst), mit sprechendem Themen-Titel als Überschrift,
     Fragetext, Antwortoptionen, nummerierten Vorkommen und einem kompakten Relevanz-Hinweis
@@ -5001,7 +5104,7 @@ def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict,
 
     doc = Document()
     style = doc.styles['Normal']
-    style.font.name = 'Arial'
+    style.font.name = 'Calibri'
     style.font.size = Pt(11)
 
     doc.add_heading(f'MM4 – Relevanzprüfung gegen Modul {modul_label}', level=1)
@@ -5011,6 +5114,9 @@ def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict,
         f"(neueste Klausur zuerst)."
     )
 
+    grey = RGBColor(0x80, 0x80, 0x80)
+    pdf_cache = {}
+    with_solution = 0
     for i, q in enumerate(relevant, start=1):
         occ = ', '.join(
             f"{label} Nr. {num}" if num is not None else label
@@ -5018,25 +5124,80 @@ def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict,
         )
         h = doc.add_heading(f'Frage {i} – „{q["titel"]}“', level=2)
         _set_heading_color(h, MM_HEADING_COLORS[2])
+        for run in h.runs:
+            run.font.name = 'Calibri'
 
+        # Fragetext: fett, Blocksatz
         p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         p.add_run(q['fragetext']).bold = True
 
+        # Antwortoptionen: ohne Aufzählungszeichen, eingerückt, Blocksatz
         for idx, opt in enumerate(q['optionen']):
-            doc.add_paragraph(f"{_mm4_option_letter(idx)}) {opt}", style='List Bullet')
+            op = doc.add_paragraph(f"{_mm4_option_letter(idx)})  {opt}")
+            op.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            op.paragraph_format.left_indent = Cm(1)
 
-        doc.add_paragraph(f"Vorkommen: {occ}")
+        # Lösungs-Screenshot aus der Original-Klausur (grüne Häkchen), rein lokal.
+        png = None
+        if label_to_path:
+            sel = _best_solution_occurrence(q, label_to_path)
+            if sel:
+                path, aufgabe_num = sel
+                pdf = pdf_cache.get(path)
+                if pdf is None and path not in pdf_cache:
+                    try:
+                        import pypdfium2 as pdfium
+                        pdf = pdfium.PdfDocument(path)
+                    except Exception:
+                        pdf = None
+                    pdf_cache[path] = pdf
+                if pdf is not None:
+                    out_png = str((Path(img_cache_dir) if img_cache_dir else Path(output_path).parent)
+                                  / f"loesung_{modul_label}_{i:03d}.png")
+                    try:
+                        png = _render_question_solution_png(pdf, aufgabe_num, q['fragetext'], out_png)
+                    except Exception:
+                        png = None
+        if png:
+            try:
+                doc.add_picture(png, width=_image_display_width(png))
+                with_solution += 1
+            except Exception:
+                png = None
+        if not png:
+            note = doc.add_paragraph()
+            nr = note.add_run("(keine markierte Lösung im Klausur-PDF gefunden)")
+            nr.italic = True
+            nr.font.size = Pt(8)
+            nr.font.color.rgb = grey
 
+        # Fußzeile: Vorkommen + Relevanz, klein und grau
         stufe_a_hits = treffer_for_modul.get(q['uid'], [])
         top_level = sorted({hit['fundstelle'].split(' > ')[0] for hit in stufe_a_hits})
         rel_line = f"Relevant für Modul {modul_label}."
         if top_level:
             rel_line += f" (Kurseinheiten: {', '.join(top_level)})"
-        doc.add_paragraph(rel_line).runs[0].bold = True
+        foot = doc.add_paragraph()
+        r1 = foot.add_run(f"Vorkommen: {occ}")
+        r1.font.size = Pt(8)
+        r1.font.color.rgb = grey
+        r1.add_break()
+        r2 = foot.add_run(rel_line)
+        r2.font.size = Pt(8)
+        r2.font.color.rgb = grey
         doc.add_paragraph('')  # Abstand zur nächsten Frage
 
+    for pdf in pdf_cache.values():
+        try:
+            if pdf is not None:
+                pdf.close()
+        except Exception:
+            pass
+
     doc.save(output_path)
-    print(f"Fertig: {output_path}  ({len(relevant)} relevante Fragen von {len(unique_questions)})")
+    print(f"Fertig: {output_path}  ({len(relevant)} relevante Fragen von {len(unique_questions)}, "
+          f"{with_solution} mit Lösungs-Screenshot)")
     return output_path
 
 
@@ -5087,11 +5248,18 @@ def run_mm4_check(folder: str, ref_docs: list = None,
     unique_questions = dedupe_mm4_questions(exams, force=force, cache_dir=cache_dir)
     print(f"   {len(unique_questions)} eindeutige Fragen nach Deduplizierung.")
 
+    # Klausur-Label -> PDF-Pfad, damit der Report je Frage den Original-Lösungs-Screenshot
+    # aus der jeweiligen Klausur einbetten kann (rein lokal, keine Gemini-Kosten).
+    label_to_path = {e['label']: e['path'] for e in exams}
+    img_cache_dir = cache_dir / "loesungen"
+
     report_paths = []
     for label, ref in zip(labels, ref_docs):
         output_ref = str(base.with_name(f"{base.stem}_{label}{base.suffix}"))
         treffer, kb_text = check_mm4_relevance_module(unique_questions, ref, label, cache_dir, force=force)
-        report_paths.append(build_mm4_report_docx(unique_questions, treffer, label, output_ref))
+        report_paths.append(build_mm4_report_docx(
+            unique_questions, treffer, label, output_ref,
+            label_to_path=label_to_path, img_cache_dir=img_cache_dir))
 
     return report_paths
 
