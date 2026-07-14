@@ -4997,10 +4997,12 @@ def _norm_pdf_text(s: str) -> str:
     return re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', ' ', (s or '').lower())).strip()
 
 
-def _trim_to_block(img, max_gap_px: int = 55, pad: int = 8):
+def _trim_to_block(img, max_gap_px: int = 100, pad: int = 8):
     """Schneidet ein gerendertes Seitenbild auf den zusammenhängenden Frageblock ab Oberkante:
-    entfernt führenden/folgenden Leerraum und schneidet vor der ersten großen Leerlücke ab
-    (so fallen Seitenfuß und der Anfang der Folgefrage weg). Ohne numpy: unverändert zurück."""
+    entfernt führenden/folgenden Leerraum und schneidet vor der ersten GROSSEN Leerlücke ab
+    (so fallen Seitenfuß und der Anfang der Folgefrage weg). Die Schwelle (100px) liegt über
+    den internen Lücken beider Klausurformate (Moodle ~klein; FernUni Fragetext→Optionen bis
+    ~74px), aber unter den Footer-Lücken (mehrere hundert px). Ohne numpy: unverändert."""
     try:
         import numpy as np
     except Exception:
@@ -5019,16 +5021,17 @@ def _trim_to_block(img, max_gap_px: int = 55, pad: int = 8):
 
 
 def _pdf_frage_markers(pdf) -> list:
-    """[{'num','page','y','text'}] aller 'Frage N'-Marker (Moodle) in Dokumentreihenfolge.
-    'y' ist die Pixel-Oberkante bei _PDF_RENDER_SCALE, 'text' der Blocktext bis zum nächsten
-    Marker derselben Seite (für den Fragetext-Abgleich)."""
+    """[{'num','page','y','text'}] aller Fragemarker in Dokumentreihenfolge. Erkennt beide
+    Klausurformate: Moodle-Export ('Frage N') und FernUni-Aufgabenbogen ('Aufgabe N', Nummer
+    oft in der Folgezeile). 'y' ist die Pixel-Oberkante bei _PDF_RENDER_SCALE, 'text' der
+    Blocktext bis zum nächsten Marker derselben Seite (für den Fragetext-Abgleich)."""
     markers = []
     for pi in range(len(pdf)):
         page = pdf[pi]
         ph = page.get_height()
         tp = page.get_textpage()
         full = tp.get_text_bounded()
-        found = [(mm.group(1), mm.start()) for mm in re.finditer(r'Frage\s+(\d+)', full)]
+        found = [(mm.group(1), mm.start()) for mm in re.finditer(r'\b(?:Frage|Aufgabe)\s+(\d+)', full)]
         for k, (num, ci) in enumerate(found):
             try:
                 box = tp.get_charbox(ci)  # (l,b,r,t) in PDF-Punkten, Ursprung unten-links
@@ -5076,17 +5079,20 @@ def _render_question_solution_png(pdf, aufgabe_num, fragetext: str, out_png: str
     return out_png
 
 
-def _best_solution_occurrence(q: dict, label_to_path: dict):
-    """Wählt aus q['occurrences'] (neueste zuerst) das jüngste Vorkommen, dessen Klausur eine
-    Lösung enthält (Label NICHT 'ohne Lösung'). Gibt (pdf_pfad, aufgabe_num) oder None."""
+def _solution_occurrences(q: dict, label_to_path: dict) -> list:
+    """Alle brauchbaren Vorkommen der Frage in Prioritätsreihenfolge (neueste Klausur zuerst),
+    ausgenommen 'ohne Lösung'-Klausuren. Liste von (pdf_pfad, aufgabe_num, label). Die
+    Aufrufstelle probiert sie der Reihe nach, bis ein Screenshot gelingt – so fängt eine
+    ältere Klausur ab, wenn die neueste keinen lesbaren Textlayer hat (z.B. SS25)."""
+    out = []
     for _order, label, aufgabe_num in q.get('occurrences', []):
         low = (label or '').lower()
         if 'ohne lösung' in low or 'ohne loesung' in low:
             continue
         path = label_to_path.get(label)
         if path:
-            return path, aufgabe_num
-    return None
+            out.append((path, aufgabe_num, label))
+    return out
 
 
 def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict,
@@ -5138,12 +5144,13 @@ def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict,
             op.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             op.paragraph_format.left_indent = Cm(1)
 
-        # Lösungs-Screenshot aus der Original-Klausur (grüne Häkchen), rein lokal.
+        # Lösungs-Screenshot aus der Original-Klausur (grüne Häkchen bzw. gelbe Kästchen),
+        # rein lokal. Vorkommen der Reihe nach durchprobieren, bis eines ein Bild liefert.
         png = None
         if label_to_path:
-            sel = _best_solution_occurrence(q, label_to_path)
-            if sel:
-                path, aufgabe_num = sel
+            out_png = str((Path(img_cache_dir) if img_cache_dir else Path(output_path).parent)
+                          / f"loesung_{modul_label}_{i:03d}.png")
+            for path, aufgabe_num, _label in _solution_occurrences(q, label_to_path):
                 pdf = pdf_cache.get(path)
                 if pdf is None and path not in pdf_cache:
                     try:
@@ -5152,13 +5159,14 @@ def build_mm4_report_docx(unique_questions: list, treffer_for_modul: dict,
                     except Exception:
                         pdf = None
                     pdf_cache[path] = pdf
-                if pdf is not None:
-                    out_png = str((Path(img_cache_dir) if img_cache_dir else Path(output_path).parent)
-                                  / f"loesung_{modul_label}_{i:03d}.png")
-                    try:
-                        png = _render_question_solution_png(pdf, aufgabe_num, q['fragetext'], out_png)
-                    except Exception:
-                        png = None
+                if pdf is None:
+                    continue
+                try:
+                    png = _render_question_solution_png(pdf, aufgabe_num, q['fragetext'], out_png)
+                except Exception:
+                    png = None
+                if png:
+                    break
         if png:
             try:
                 doc.add_picture(png, width=_image_display_width(png))
