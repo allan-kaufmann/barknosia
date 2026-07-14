@@ -5021,58 +5021,74 @@ def _trim_to_block(img, max_gap_px: int = 100, pad: int = 8):
 
 
 def _pdf_frage_markers(pdf) -> list:
-    """[{'num','page','y','text'}] aller Fragemarker in Dokumentreihenfolge. Erkennt beide
-    Klausurformate: Moodle-Export ('Frage N') und FernUni-Aufgabenbogen ('Aufgabe N', Nummer
-    oft in der Folgezeile). 'y' ist die Pixel-Oberkante bei _PDF_RENDER_SCALE, 'text' der
-    Blocktext bis zum nächsten Marker derselben Seite (für den Fragetext-Abgleich)."""
-    markers = []
+    """[{'num','page','y','y_bottom','text'}] aller Fragemarker in visueller Reihenfolge.
+    Erkennt beide Klausurformate: Moodle-Export ('Frage N') und FernUni-Aufgabenbogen
+    ('Aufgabe N'). 'y'/'y_bottom' sind die Pixel-Ober-/Unterkante der SICHTBAREN Region bei
+    _PDF_RENDER_SCALE (y_bottom=None, wenn der nächste Marker auf einer Folgeseite liegt).
+
+    Wichtig: 'text' wird POSITIONSBASIERT über die Bounding-Box der sichtbaren Region
+    ausgelesen (nicht in Textfluss-Reihenfolge). Diese Moodle-PDFs liefern den Textfluss
+    teils verdreht (der Fragekörper erscheint im Text NACH dem nächsten 'Frage N'-Kopf),
+    was sonst zu falscher Frage↔Bild-Zuordnung führt."""
+    raw = []
+    tpages = {}
     for pi in range(len(pdf)):
         page = pdf[pi]
-        ph = page.get_height()
         tp = page.get_textpage()
+        tpages[pi] = (tp, page.get_width(), page.get_height())
         full = tp.get_text_bounded()
-        found = [(mm.group(1), mm.start()) for mm in re.finditer(r'\b(?:Frage|Aufgabe)\s+(\d+)', full)]
-        for k, (num, ci) in enumerate(found):
+        for mm in re.finditer(r'\b(?:Frage|Aufgabe)\s+(\d+)', full):
             try:
-                box = tp.get_charbox(ci)  # (l,b,r,t) in PDF-Punkten, Ursprung unten-links
+                box = tp.get_charbox(mm.start())  # (l,b,r,t) in PDF-Punkten, Ursprung unten-links
             except Exception:
                 continue
-            y_top = round((ph - box[3]) * _PDF_RENDER_SCALE)
-            end = found[k + 1][1] if k + 1 < len(found) else len(full)
-            markers.append({'num': int(num), 'page': pi, 'y': y_top, 'text': full[ci:end]})
+            raw.append({'page': pi, 'y_pt': box[3], 'num': int(mm.group(1))})
+    # Visuelle Reihenfolge: Seite aufsteigend, innerhalb der Seite von oben (großes y_pt) nach unten.
+    raw.sort(key=lambda r: (r['page'], -r['y_pt']))
+
+    markers = []
+    for k, r in enumerate(raw):
+        tp, pw, ph = tpages[r['page']]
+        nxt = raw[k + 1] if k + 1 < len(raw) else None
+        same_page_next = nxt if (nxt and nxt['page'] == r['page']) else None
+        bottom_pt = same_page_next['y_pt'] if same_page_next else 0.0
+        try:
+            region_text = tp.get_text_bounded(left=0, bottom=bottom_pt, right=pw, top=r['y_pt'])
+        except Exception:
+            region_text = ''
+        markers.append({
+            'num': r['num'],
+            'page': r['page'],
+            'y': round((ph - r['y_pt']) * _PDF_RENDER_SCALE),
+            'y_bottom': round((ph - bottom_pt) * _PDF_RENDER_SCALE) if same_page_next else None,
+            'text': region_text,
+        })
     return markers
 
 
 def _render_question_solution_png(pdf, aufgabe_num, fragetext: str, out_png: str):
     """Schneidet den Frageblock (inkl. eingezeichneter Lösung) aus dem geöffneten PDF und
-    speichert ihn als PNG. Zielsuche primär per Fragetext-Schnipsel, sonst per 'Frage N'.
-    Gibt den PNG-Pfad zurück oder None, wenn die Frage nicht lokalisierbar war."""
+    speichert ihn als PNG. Zielsuche AUSSCHLIESSLICH per Fragetext-Schnipsel (positionsbasiert,
+    s.o.) – bewusst KEIN Rückfall auf 'Frage/Aufgabe N', da die extrahierte Aufgabennummer
+    formatabhängig verschoben sein kann und dann den FALSCHEN Block träfe (lieber gar kein Bild
+    als ein falsches). `aufgabe_num` bleibt aus Kompatibilität in der Signatur, ungenutzt.
+    Gibt den PNG-Pfad zurück oder None, wenn der Fragetext nicht eindeutig lokalisierbar war."""
     markers = _pdf_frage_markers(pdf)
     if not markers:
         return None
     snip = _norm_pdf_text(fragetext)[:40]
+    if len(snip) < 12:
+        return None
     ti = None
-    if snip:
-        for i, mk in enumerate(markers):
-            if snip in _norm_pdf_text(mk['text']):
-                ti = i
-                break
-    if ti is None and aufgabe_num is not None:
-        try:
-            an = int(aufgabe_num)
-            for i, mk in enumerate(markers):
-                if mk['num'] == an:
-                    ti = i
-                    break
-        except (TypeError, ValueError):
-            pass
+    for i, mk in enumerate(markers):
+        if snip in _norm_pdf_text(mk['text']):
+            ti = i
+            break
     if ti is None:
         return None
     start = markers[ti]
-    nxt = markers[ti + 1] if ti + 1 < len(markers) else None
     img = pdf[start['page']].render(scale=_PDF_RENDER_SCALE).to_pil()
-    # Untere Grenze: nächster Marker auf DERSELBEN Seite, sonst Seitenende + Trim.
-    y_bottom = nxt['y'] if (nxt and nxt['page'] == start['page']) else img.height
+    y_bottom = start['y_bottom'] if start['y_bottom'] is not None else img.height
     crop = _trim_to_block(img.crop((0, start['y'], img.width, y_bottom)))
     Path(out_png).parent.mkdir(parents=True, exist_ok=True)
     crop.save(out_png)
