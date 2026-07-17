@@ -5288,6 +5288,171 @@ def run_mm4_check(folder: str, ref_docs: list = None,
     return report_paths
 
 
+def _remove_mm4_comments(doc) -> int:
+    """Entfernt ALLE vom Tool (Autor „MM4") gesetzten Kommentare samt Range-Markern/Referenz-Runs
+    – macht das Neusetzen idempotent. Nutzer-/andere Kommentare bleiben unberührt."""
+    try:
+        comments_elm = doc.comments._comments_elm
+    except Exception:
+        return 0
+    ids = set()
+    for c_elm in list(comments_elm.comment_lst):
+        if (c_elm.author or "") == "MM4":
+            ids.add(str(c_elm.id))
+            c_elm.getparent().remove(c_elm)
+    if not ids:
+        return 0
+    body = doc.element.body
+    for tag in ('w:commentRangeStart', 'w:commentRangeEnd'):
+        for el in list(body.iter(qn(tag))):
+            if el.get(qn('w:id')) in ids:
+                parent = el.getparent()
+                if parent is not None:
+                    parent.remove(el)
+    for ref in list(body.iter(qn('w:commentReference'))):
+        if ref.get(qn('w:id')) in ids:
+            run = ref.getparent()
+            if run is not None and run.getparent() is not None:
+                run.getparent().remove(run)
+    return len(ids)
+
+
+def _excluded_chapter_indices(doc, exclude_chapters) -> set:
+    """Absatz-Indizes aller Kapitel-Sections, deren Überschrift einen der Teilstrings aus
+    `exclude_chapters` enthält (case-insensitiv). Eine Section reicht von ihrer Überschrift bis
+    zur nächsten Überschrift gleicher oder höherer Ebene (bzw. Dokumentende)."""
+    paras = doc.paragraphs
+
+    def lvl(p):
+        st = p.style.name if p.style else ""
+        m = re.match(r'Heading (\d)', st)
+        return int(m.group(1)) if m else None
+
+    subs = [s.lower() for s in exclude_chapters]
+    excluded = set()
+    n = len(paras)
+    for i, p in enumerate(paras):
+        L = lvl(p)
+        if L is None:
+            continue
+        text = (p.text or "").lower()
+        if not any(s in text for s in subs):
+            continue
+        end = n
+        for j in range(i + 1, n):
+            lj = lvl(paras[j])
+            if lj is not None and lj <= L:
+                end = j
+                break
+        excluded.update(range(i, end))
+    return excluded
+
+
+def run_mm4_mark(script_path: str, folder: str = "MM4", module_label: str = None,
+                 output_path: str = None,
+                 exclude_chapters=("Übungsfragen", "MM4 – Relevanzprüfung", "MM4-Relevanzprüfung")) -> str:
+    """Markiert die für EIN Modul relevanten MM4-Fragen als Word-Kommentare an den Fundstellen
+    im Kursskript – REIN LOKAL aus dem vorhandenen Cache (Stufe-A-Treffer + Deduplizierung),
+    OHNE jeden Gemini-Aufruf. Kommentar-Referenz „MM4 Frage N: Titel" entspricht der
+    Nummerierung des eingefügten Relevanz-Reports. Das Kapitel „Übungsfragen"/der eingefügte
+    Report werden ausgenommen. Speichert eine neue Kopie und gibt deren Pfad zurück."""
+    src = Path(script_path)
+    if not src.exists():
+        raise FileNotFoundError(f"Kursskript nicht gefunden: {script_path}")
+    if module_label is None:
+        module_label = src.stem
+    cache_dir = Path(folder) / ".mm4check"
+    if not cache_dir.is_dir():
+        raise FileNotFoundError(
+            f"Kein Cache-Ordner {cache_dir}. --mm4-mark nutzt ausschließlich vorhandene "
+            f"Cache-Daten (kein Gemini). Zuerst --mm4-check für dieses Modul laufen lassen.")
+
+    # Stufe-A-Treffer aus dem Cache aggregieren (NUR aktuelle Dateien, keine _v2_-Altlasten).
+    treffer_files = sorted(cache_dir.glob(f"treffer_{module_label}_[0-9][0-9].md"))
+    if not treffer_files:
+        raise FileNotFoundError(
+            f"Keine Treffer-Cachedateien 'treffer_{module_label}_NN.md' in {cache_dir}. "
+            f"Stimmt das Modul-Label? (Ableitung aus Dateiname: '{module_label}')")
+    treffer = {}
+    for f in treffer_files:
+        for uid, hits in parse_mm4_relevance_response(f.read_text(encoding="utf-8")).items():
+            treffer.setdefault(uid, []).extend(hits)
+
+    # Deduplizierte Fragen aus dem Cache (Titel + Report-Nummerierung); kein Gemini (force=False).
+    exams = collect_mm4_exam_files(folder)
+    if not exams:
+        raise FileNotFoundError(f"Keine Klausur-PDFs in {folder} gefunden (für Fragen-Metadaten nötig).")
+    unique = dedupe_mm4_questions(exams, force=False, cache_dir=cache_dir)
+    relevant = [q for q in unique if treffer.get(q['uid'])]
+    num_titel = {q['uid']: (i, q['titel']) for i, q in enumerate(relevant, start=1)}
+    print(f"--- MM4-Markierung: {len(relevant)} relevante Fragen (Modul {module_label}) in {src.name} ---")
+
+    doc = Document(str(src))
+    excluded = _excluded_chapter_indices(doc, exclude_chapters)
+    removed = _remove_mm4_comments(doc)
+    if removed:
+        print(f"   {removed} frühere „MM4\"-Kommentare entfernt (Idempotenz).")
+
+    paras = doc.paragraphs
+    entries = [(i, paras[i], _normalize_quote(paras[i].text))
+               for i in range(len(paras)) if i not in excluded and paras[i].text.strip()]
+
+    def find_beleg(zitat):
+        nq = _normalize_quote(zitat)
+        if len(nq) < 12:
+            return None
+        needle = nq[:50]
+        for _i, p, nt in entries:
+            if nt and needle in nt:
+                return p
+        return None
+
+    groups = {}   # id(p._p) -> {'para': p, 'refs': [...]}
+    order = []
+
+    def add_ref(target, ref):
+        k = id(target._p)
+        if k not in groups:
+            groups[k] = {'para': target, 'refs': []}
+            order.append(k)
+        if ref not in groups[k]['refs']:
+            groups[k]['refs'].append(ref)
+
+    no_beleg = 0
+    for q in relevant:
+        num, titel = num_titel[q['uid']]
+        ref = f"MM4 Frage {num}: {titel}"
+        placed = False
+        seen_z = set()
+        for hit in treffer.get(q['uid'], []):
+            z = hit.get('zitat', '')
+            if not z or z in seen_z:
+                continue
+            seen_z.add(z)
+            target = find_beleg(z)
+            if target is not None:
+                add_ref(target, ref)
+                placed = True
+        if not placed:
+            no_beleg += 1
+
+    for k in order:
+        para = groups[k]['para']
+        refs = groups[k]['refs']
+        runs = para.runs or [para.add_run("")]
+        if len(refs) == 1:
+            body = f"Prüfungsrelevant (MM4): {refs[0]}"
+        else:
+            body = "Prüfungsrelevant (MM4):\n" + "\n".join(f"• {r}" for r in refs)
+        doc.add_comment(runs, text=body, author="MM4", initials="MM")
+
+    out = output_path or str(src.with_name(f"{src.stem}_MM4markiert{src.suffix}"))
+    doc.save(out)
+    print(f"Fertig: {out}  ({len(order)} Fundstellen markiert, "
+          f"{no_beleg} Frage(n) ohne auffindbaren Beleg im Kurstext)")
+    return out
+
+
 def run_quiz_check(docx_path: str, quiz_chapter_headings,
                    output_path: str = None, force: bool = False) -> str:
     """End-to-End: prüft EIN ODER MEHRERE Leitfragen-Quizzes derselben Lernunterlage,
@@ -5387,7 +5552,20 @@ if __name__ == "__main__":
     parser.add_argument("--mm4-output", type=str, default=None,
                         help="Nur mit --mm4-check: Basis-Pfad der Ergebnis-.docx-Dateien "
                              "(Standard: '<ORDNER>/MM4_Relevanzpruefung.docx'; je Referenz wird "
-                             "'_<Label>' vor der Endung angehängt).")
+                             "'_<Label>' vor der Endung angehängt). Bei --mm4-mark: Ausgabepfad "
+                             "der markierten .docx (Standard: '<SKRIPT>_MM4markiert.docx').")
+    parser.add_argument("--mm4-mark", type=str, default=None, metavar="SKRIPT",
+                        help="Getrennter Modus (REIN LOKAL, kein Gemini): setzt in einem "
+                             "Kursskript (.docx) Word-Kommentare an den Fundstellen aller für "
+                             "das Modul relevanten MM4-Fragen. Nutzt ausschließlich den "
+                             "vorhandenen --mm4-check-Cache (Stufe-A-Treffer + Deduplizierung); "
+                             "das Kapitel 'Übungsfragen'/der eingefügte Report werden ausgenommen.")
+    parser.add_argument("--mm4-mark-folder", type=str, default="MM4", metavar="ORDNER",
+                        help="Nur mit --mm4-mark: Ordner mit dem '.mm4check'-Cache und den "
+                             "Klausur-PDFs (Standard: 'MM4').")
+    parser.add_argument("--mm4-module", type=str, default=None,
+                        help="Nur mit --mm4-mark: Modul-Label (Standard: aus dem Skript-"
+                             "Dateinamen abgeleitet, muss zum Treffer-Cache passen).")
     parser.add_argument("--force", action="store_true", help="Alle Schritte neu berechnen (kein Resume)")
     parser.add_argument("--parent-chapter", type=str, default=None,
                         help="Elternkapitel im Zieldokument, z.B. '4.2.1.2'. "
@@ -5447,6 +5625,12 @@ if __name__ == "__main__":
         if args.mm4_check:
             run_mm4_check(args.mm4_check, ref_docs=args.mm4_ref,
                           output_path=args.mm4_output, force=args.force)
+            sys.exit(0)
+
+        # --- Getrennter Modus: MM4-Fragen im Kursskript markieren (rein lokal, kein Gemini) ---
+        if args.mm4_mark:
+            run_mm4_mark(args.mm4_mark, folder=args.mm4_mark_folder,
+                         module_label=args.mm4_module, output_path=args.mm4_output)
             sys.exit(0)
 
         # --- Getrennter Modus: Leitfragen-Quiz-Prüfung einer bestehenden .docx ---
